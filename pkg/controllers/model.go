@@ -15,8 +15,8 @@ import (
 )
 
 const (
-    // Use python alpine to allow installing huggingface_hub and boto3
-    defaultDownloadImage = "python:3.11-alpine"
+	// Use python alpine to allow installing huggingface_hub and boto3
+	defaultDownloadImage = "python:3.11-alpine"
 )
 
 type modelHandler struct {
@@ -255,7 +255,7 @@ func (h *modelHandler) downloadCommand(spec *v1.ModelDownloadSpec) []string {
 	if len(spec.Command) > 0 {
 		return spec.Command
 	}
-    // run a shell to install deps and execute a small Python + boto3 upload workflow
+	// run a shell to install deps and execute a small Python + boto3 upload workflow
 	return []string{"/bin/sh", "-c"}
 }
 
@@ -267,23 +267,23 @@ func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec,
 	bucket := model.Spec.CacheSpec.Bucket
 	endpoint := model.Spec.CacheSpec.Endpoint
 
-    // Construct a script that:
-    // 1) Installs ca-certificates, 2) installs huggingface_hub and boto3,
-    // 3) snapshots HF repo to /tmp/model, 4) uploads files directly to S3 via boto3
-    _ = bucket
-    _ = endpoint
+	// Construct a script that:
+	// 1) Installs ca-certificates, 2) installs huggingface_hub and boto3,
+	// 3) snapshots HF repo to /tmp/model, 4) uploads files directly to S3 via boto3
+	_ = bucket
+	_ = endpoint
 
     script := `set -euo pipefail
 apk add --no-cache ca-certificates
 python -m pip install --no-cache-dir --upgrade pip
-python -m pip install --no-cache-dir huggingface_hub boto3 botocore
+python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests
 
-mkdir -p /tmp/model
 python - <<'PY'
 import os
+import io
 import mimetypes
-from pathlib import Path
-from huggingface_hub import snapshot_download
+import requests
+from huggingface_hub import HfApi, hf_hub_url
 import boto3
 from botocore.config import Config
 
@@ -293,35 +293,35 @@ bucket = os.environ.get('CACHE_BUCKET')
 prefix = os.environ.get('CACHE_OBJECT_KEY', '').strip('/')
 endpoint = os.environ.get('CACHE_ENDPOINT') or None
 
-# Support both repo-id (org/name) and full URL by stripping prefix
-repo_id = repo_url
+# Resolve repo_id from full URL if needed
+repo_id = repo_url or ''
 hf_prefix = 'https://huggingface.co/'
-if repo_id and repo_id.startswith(hf_prefix):
+if repo_id.startswith(hf_prefix):
     repo_id = repo_id[len(hf_prefix):]
-repo_id = (repo_id or '').strip('/')
+repo_id = repo_id.strip('/')
 
-local_dir = '/tmp/model'
-snapshot_download(repo_id=repo_id, local_dir=local_dir, local_dir_use_symlinks=False, token=token)
+api = HfApi()
+files = api.list_repo_files(repo_id=repo_id, repo_type='model')
 
 session = boto3.session.Session()
 client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
 
-def upload_file(full_path: Path, rel_path: str):
-    key = rel_path.replace('\\\\', '/').replace('\\\\', '/')
-    if prefix:
-        key = f"{prefix}/{key}"
-    content_type, _ = mimetypes.guess_type(str(full_path))
-    extra = {'ContentType': content_type} if content_type else None
-    if extra:
-        client.upload_file(str(full_path), bucket, key, ExtraArgs=extra)
-    else:
-        client.upload_file(str(full_path), bucket, key)
+headers = {}
+if token:
+    headers['Authorization'] = f'Bearer {token}'
 
-base = Path(local_dir)
-for p in base.rglob('*'):
-    if p.is_file():
-        rel = str(p.relative_to(base))
-        upload_file(p, rel)
+for path in files:
+    url = hf_hub_url(repo_id=repo_id, filename=path)
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        r.raw.decode_content = True
+        key = f"{prefix}/{path}" if prefix else path
+        content_type = r.headers.get('Content-Type') or mimetypes.guess_type(path)[0]
+        extra = {'ContentType': content_type} if content_type else None
+        if extra:
+            client.upload_fileobj(r.raw, bucket, key, ExtraArgs=extra)
+        else:
+            client.upload_fileobj(r.raw, bucket, key)
 PY
 `
 
