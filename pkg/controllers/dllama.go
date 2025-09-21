@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-    v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
-    "github.com/rancher/wrangler/v3/pkg/apply"
-    "github.com/rancher/wrangler/v3/pkg/generic"
+	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	"github.com/rancher/wrangler/v3/pkg/generic"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -106,9 +106,10 @@ func (h *dllamaHandler) desiredObjects(dllama *v1.Dllama) []runtime.Object {
 	modelLabels := map[string]string{
 		labelDllamaName: dllama.Name,
 		labelComponent:  componentModel,
+		labelModelName:  fmt.Sprintf("%s-model", dllama.Name),
 	}
 
-	model := &v1.Model{
+    model := &v1.Model{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
 			Kind:       "Model",
@@ -119,10 +120,10 @@ func (h *dllamaHandler) desiredObjects(dllama *v1.Dllama) []runtime.Object {
 			Labels:    modelLabels,
 		},
 		Spec: v1.ModelSpec{
-			SourceURI:     dllama.Spec.ModelRef,
-			LocalPath:     fmt.Sprintf("/models/%s", dllama.Spec.ModelRef),
-			CacheSpec:     cloneCacheSpec(dllama.Spec.CacheSpec),
-			LaunchOptions: append([]string{}, dllama.Spec.LaunchArgs...),
+            SourceURL:     dllama.Spec.ModelRef,
+            LocalPath:     fmt.Sprintf("/models/%s", dllama.Spec.ModelRef),
+            CacheSpec:     cloneCacheSpec(dllama.Spec.CacheSpec),
+            LaunchOptions: append([]string{}, dllama.Spec.LaunchArgs...),
 		},
 	}
 	objects = append(objects, model)

@@ -20,7 +20,7 @@ spec:
     schema:
       openAPIV3Schema:
         description: Model represents the lifecycle of downloading and caching a language
-          model artifact.
+          model repository.
         properties:
           apiVersion:
             description: |-
@@ -79,13 +79,12 @@ spec:
                 description: LocalPath is the path on the node filesystem (or cache
                   backend) where the model should reside.
                 type: string
-              sourceURI:
-                description: SourceURI is the original location of the model (e.g.
-                  huggingface URI).
+              sourceUrl:
+                description: SourceURL points to the upstream model source repository (e.g. Hugging Face repo URL).
                 type: string
             required:
             - localPath
-            - sourceURI
+            - sourceUrl
             type: object
           status:
             description: ModelStatus reports whether the model artifact is ready for

@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 
-    koldv1 "github.com/gorizond/kold/pkg/controllers/koldv1"
-    "github.com/rancher/wrangler/v3/pkg/apply"
-    appsv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
-    corev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
-    "github.com/rancher/wrangler/v3/pkg/generic"
-    "github.com/rancher/wrangler/v3/pkg/schemes"
+	koldv1 "github.com/gorizond/kold/pkg/controllers/koldv1"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	appsv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
+	batchv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/batch/v1"
+	corev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/v3/pkg/generic"
+	"github.com/rancher/wrangler/v3/pkg/schemes"
 	"k8s.io/client-go/rest"
 )
 
@@ -18,9 +19,10 @@ type Manager struct {
 	factory *generic.Factory
 	apply   apply.Apply
 
-	Core corev1.Interface
-	Apps appsv1.Interface
-	Kold koldv1.Interface
+	Core  corev1.Interface
+	Apps  appsv1.Interface
+	Batch batchv1.Interface
+	Kold  koldv1.Interface
 }
 
 // NewManager creates all controller factories required by the operator and prepares the reconciliation pipeline.
@@ -37,6 +39,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 	ctrlFactory := factory.ControllerFactory()
 	core := corev1.New(ctrlFactory)
 	apps := appsv1.New(ctrlFactory)
+	batch := batchv1.New(ctrlFactory)
 	kold := koldv1.New(ctrlFactory)
 
 	applier, err := apply.NewForConfig(cfg)
@@ -52,6 +55,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			kold.Root(),
 			kold.Worker(),
 			apps.Deployment(),
+			batch.Job(),
 			core.ConfigMap(),
 			core.Secret(),
 			core.Service(),
@@ -62,6 +66,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		apply:   applier,
 		Core:    core,
 		Apps:    apps,
+		Batch:   batch,
 		Kold:    kold,
 	}, nil
 }

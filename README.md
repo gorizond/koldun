@@ -14,7 +14,7 @@ Kold (kubernetes operator for serverless distributed-llama) Operator manages dis
 All controllers are wired through Wrangler's generic factories and `apply` engine:
 
 - `pkg/controllers/dllama.go` expands Dllama resources into Model/Root/Worker children, applies ownership, and updates the aggregate status once underlying components report ready.
-- `pkg/controllers/model.go` creates a metadata `ConfigMap` and marks the Model as ready (placeholder until a real download pipeline is attached).
+- `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation and a streamed download `Job` that pulls HuggingFace artifacts directly into the configured S3/MinIO cache, driving Model status updates.
 - `pkg/controllers/root.go` renders the coordinator `Deployment` and associated `Service`, watching Kubernetes workloads to reflect readiness and expose a stable endpoint.
 - `pkg/controllers/worker.go` renders worker `Deployments` and tracks pod readiness per slot.
 
@@ -48,3 +48,45 @@ When running in-cluster the operator defaults to `InClusterConfig` and listens f
 - `pkg/controllers/` — Wrangler controllers and shared helpers.
 
 The project currently targets Go 1.21+ and Wrangler v2.1.4.
+
+## Model download from Hugging Face into S3
+
+The operator downloads entire model repositories from Hugging Face using `huggingface_hub` and then syncs them to your S3/MinIO bucket with `rclone`. You provide only a `sourceUrl` and the `localPath` (S3 prefix).
+
+Example `Model` resource:
+
+```yaml
+apiVersion: kold.gorizond.io/v1
+kind: Model
+metadata:
+  name: hf-convert-script
+  namespace: default
+spec:
+  sourceUrl: https://huggingface.co/mistralai/Mistral-7B-v0.3
+  localPath: s3://my-bucket-model/mistralai/Mistral-7B-v0.3
+  cacheSpec:
+    endpoint: https://minio.example.com
+    bucket: my-bucket-model
+    secretRef:
+      name: minio-creds
+  download:
+    image: python:3.11-alpine
+```
+
+Expected Secret for S3/MinIO credentials (env auth, key names are standard for rclone/AWS SDK):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: default
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "..."
+  AWS_SECRET_ACCESS_KEY: "..."
+```
+
+Notes:
+- For private Hugging Face repos, set `download.huggingFaceTokenSecretRef` with a key `token`. The downloader will pass `HF_TOKEN` to `huggingface_hub`.
+- For MinIO endpoints, the operator configures path-style addressing and `--s3-endpoint` accordingly.

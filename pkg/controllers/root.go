@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-    v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
-    "github.com/rancher/wrangler/v3/pkg/apply"
-    "github.com/rancher/wrangler/v3/pkg/generic"
+	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	"github.com/rancher/wrangler/v3/pkg/generic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

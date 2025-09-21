@@ -1,10 +1,10 @@
 package koldv1
 
 import (
-    v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
-    "github.com/rancher/lasso/pkg/controller"
-    "github.com/rancher/wrangler/v3/pkg/generic"
-    "github.com/rancher/wrangler/v3/pkg/schemes"
+	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	"github.com/rancher/lasso/pkg/controller"
+	"github.com/rancher/wrangler/v3/pkg/generic"
+	"github.com/rancher/wrangler/v3/pkg/schemes"
 )
 
 func init() {

@@ -41,6 +41,7 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=dll
 
 // Dllama describes a distributed-llama topology managed by the operator.
 type Dllama struct {
@@ -104,6 +105,7 @@ type DllamaList struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=mdl
 
 // Model represents the lifecycle of downloading and caching a language model artifact.
 type Model struct {
@@ -116,14 +118,18 @@ type Model struct {
 
 // ModelSpec holds the desired model artifact configuration.
 type ModelSpec struct {
-	// SourceURI is the original location of the model (e.g. huggingface URI).
-	SourceURI string `json:"sourceURI"`
-	// LocalPath is the path on the node filesystem (or cache backend) where the model should reside.
+    // SourceURL points to the upstream model source. For Hugging Face, this is the
+    // repository URL like https://huggingface.co/mistralai/Mistral-7B-v0.3. The operator
+    // will download all repository files into the cache backend.
+    SourceURL string `json:"sourceUrl"`
+    // LocalPath is the path/prefix on the cache backend where the artifacts will reside.
 	LocalPath string `json:"localPath"`
 	// CacheSpec optionally overrides the cache information for this model.
 	CacheSpec *CacheSpec `json:"cacheSpec,omitempty"`
 	// LaunchOptions mirror the arguments passed to distributed-llama's download sequence.
 	LaunchOptions []string `json:"launchOptions,omitempty"`
+	// Download contains configuration for how the model artifacts are fetched and prepared.
+	Download *ModelDownloadSpec `json:"download,omitempty"`
 }
 
 // ModelStatus reports whether the model artifact is ready for consumption.
@@ -132,6 +138,10 @@ type ModelStatus struct {
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	// ArtifactSizeBytes records the size of the downloaded artifact, if known.
 	ArtifactSizeBytes int64 `json:"artifactSizeBytes,omitempty"`
+	// DownloadJobName is the name of the Kubernetes Job responsible for downloading the model.
+	DownloadJobName string `json:"downloadJobName,omitempty"`
+	// DownloadState is a high-level state for the downloader pipeline (Pending, Running, Succeeded, Failed).
+	DownloadState string `json:"downloadState,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -145,6 +155,7 @@ type ModelList struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=rt
 
 // Root models the root coordinator that orchestrates distributed-llama workers.
 type Root struct {
@@ -183,6 +194,7 @@ type RootList struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=wrk
 
 // Worker models an individual distributed-llama worker process.
 type Worker struct {
@@ -380,6 +392,10 @@ func (in *ModelSpec) DeepCopy() *ModelSpec {
 		cacheCopy := *in.CacheSpec.DeepCopy()
 		out.CacheSpec = &cacheCopy
 	}
+	if in.Download != nil {
+		downloadCopy := *in.Download.DeepCopy()
+		out.Download = &downloadCopy
+	}
 	return out
 }
 
@@ -562,6 +578,39 @@ func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 	if in.Conditions != nil {
 		out.Conditions = make([]metav1.Condition, len(in.Conditions))
 		copy(out.Conditions, in.Conditions)
+	}
+	return out
+}
+
+// ModelDownloadSpec describes how to acquire model artifacts.
+type ModelDownloadSpec struct {
+	// Image is the container image used for the download Job.
+	Image string `json:"image,omitempty"`
+	// Command overrides the container entrypoint when set.
+	Command []string `json:"command,omitempty"`
+	// Args provides optional arguments for the container entrypoint.
+	Args []string `json:"args,omitempty"`
+	// HuggingFaceTokenSecretRef references a Secret with token for private model download.
+	HuggingFaceTokenSecretRef *SecretReference `json:"huggingFaceTokenSecretRef,omitempty"`
+}
+
+func (in *ModelDownloadSpec) DeepCopy() *ModelDownloadSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(ModelDownloadSpec)
+	*out = *in
+	if in.Command != nil {
+		out.Command = make([]string, len(in.Command))
+		copy(out.Command, in.Command)
+	}
+	if in.Args != nil {
+		out.Args = make([]string, len(in.Args))
+		copy(out.Args, in.Args)
+	}
+	if in.HuggingFaceTokenSecretRef != nil {
+		secretCopy := *in.HuggingFaceTokenSecretRef
+		out.HuggingFaceTokenSecretRef = &secretCopy
 	}
 	return out
 }

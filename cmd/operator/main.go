@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
-    "github.com/gorizond/kold/pkg/controllers"
-    "github.com/rancher/wrangler/v3/pkg/signals"
+	"github.com/gorizond/kold/pkg/controllers"
+	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"

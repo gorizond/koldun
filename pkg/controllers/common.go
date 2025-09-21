@@ -5,16 +5,20 @@ import (
 )
 
 const (
-	labelDllamaName   = "kold.gorizond.io/dllama"
-	labelComponent    = "kold.gorizond.io/component"
-	labelRootName     = "kold.gorizond.io/root"
-	labelWorkerName   = "kold.gorizond.io/worker"
-	componentModel    = "model"
-	componentRoot     = "root"
-	componentWorker   = "worker"
+	labelDllamaName = "kold.gorizond.io/dllama"
+	labelComponent  = "kold.gorizond.io/component"
+	labelRootName   = "kold.gorizond.io/root"
+	labelWorkerName = "kold.gorizond.io/worker"
+	labelModelName  = "kold.gorizond.io/model"
+
+	componentModel  = "model"
+	componentRoot   = "root"
+	componentWorker = "worker"
+
 	annotationSlotKey = "kold.gorizond.io/slot"
 
-	conditionReady = "Ready"
+	conditionReady      = "Ready"
+	conditionDownloaded = "Downloaded"
 )
 
 func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) bool {
@@ -29,13 +33,17 @@ func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) bool {
 			if existing.Status == cond.Status && existing.Reason == cond.Reason && existing.Message == cond.Message {
 				return false
 			}
-			cond.LastTransitionTime = now
+			if cond.LastTransitionTime.IsZero() {
+				cond.LastTransitionTime = now
+			}
 			*existing = cond
 			return true
 		}
 	}
 
-	cond.LastTransitionTime = now
+	if cond.LastTransitionTime.IsZero() {
+		cond.LastTransitionTime = now
+	}
 	*conditions = append(*conditions, cond)
 	return true
 }
@@ -54,4 +62,14 @@ func labelValue(labels map[string]string, key string) string {
 		return ""
 	}
 	return labels[key]
+}
+
+func truncateName(base string, limit int) string {
+	if len(base) <= limit {
+		return base
+	}
+	if limit <= 0 {
+		return ""
+	}
+	return base[:limit]
 }
