@@ -53,6 +53,9 @@ func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
 	if err := h.ensureMetadataConfigMap(obj); err != nil {
 		return obj, err
 	}
+	if err := h.ensureScriptConfigMap(obj); err != nil {
+		return obj, err
+	}
 	if err := h.ensureDownloadJob(obj); err != nil {
 		return obj, err
 	}
@@ -123,6 +126,82 @@ func (h *modelHandler) ensureMetadataConfigMap(obj *v1.Model) error {
 		ApplyObjects(cm)
 }
 
+func (h *modelHandler) ensureScriptConfigMap(obj *v1.Model) error {
+	scriptName := fmt.Sprintf("%s-download-script", obj.Name)
+	cm := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      scriptName,
+			Namespace: obj.Namespace,
+			Labels: map[string]string{
+				labelComponent: componentModel,
+				labelModelName: obj.Name,
+			},
+		},
+		Data: map[string]string{
+			"download.py": `import os
+import io
+import mimetypes
+import requests
+from huggingface_hub import HfApi, hf_hub_url
+import boto3
+from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
+
+repo_url = os.environ.get('SOURCE_URL')
+token = os.environ.get('HF_TOKEN')
+bucket = os.environ.get('CACHE_BUCKET')
+prefix = os.environ.get('CACHE_OBJECT_KEY', '').strip('/')
+endpoint = os.environ.get('CACHE_ENDPOINT') or None
+
+# Resolve repo_id from full URL if needed
+repo_id = repo_url or ''
+hf_prefix = 'https://huggingface.co/'
+if repo_id.startswith(hf_prefix):
+    repo_id = repo_id[len(hf_prefix):]
+repo_id = repo_id.strip('/')
+
+api = HfApi()
+files = api.list_repo_files(repo_id=repo_id, repo_type='model')
+
+session = boto3.session.Session()
+client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
+transfer_config = TransferConfig(
+    multipart_threshold=8*1024*1024,
+    multipart_chunksize=8*1024*1024,
+    max_concurrency=1,
+    use_threads=False,
+)
+
+headers = {}
+if token:
+    headers['Authorization'] = f'Bearer {token}'
+
+for path in files:
+    url = hf_hub_url(repo_id=repo_id, filename=path)
+    with requests.get(url, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        r.raw.decode_content = True
+        key = f"{prefix}/{path}" if prefix else path
+        content_type = r.headers.get('Content-Type') or mimetypes.guess_type(path)[0]
+        extra = {'ContentType': content_type} if content_type else None
+        if extra:
+            client.upload_fileobj(r.raw, bucket, key, ExtraArgs=extra, Config=transfer_config)
+        else:
+            client.upload_fileobj(r.raw, bucket, key, Config=transfer_config)
+`,
+		},
+	}
+
+	return h.apply.WithOwner(obj).
+		WithSetOwnerReference(true, false).
+		WithDefaultNamespace(obj.Namespace).
+		ApplyObjects(cm)
+}
+
 func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" || obj.Spec.SourceURL == "" {
 		return nil
@@ -148,7 +227,14 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 
 	// Build init container: download all artifacts into cache path
 	initContainers := []corev1.Container{}
-	initContainers = append(initContainers, h.buildDownloadContainer(obj, spec, obj.Spec.SourceURL, objectKey))
+	// mount script configmap into the init container
+	downloadContainer := h.buildDownloadContainer(obj, spec, obj.Spec.SourceURL, objectKey)
+	downloadContainer.VolumeMounts = append(downloadContainer.VolumeMounts, corev1.VolumeMount{
+		Name:      "script",
+		MountPath: "/opt/script",
+		ReadOnly:  true,
+	})
+	initContainers = append(initContainers, downloadContainer)
 
 	job := &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{
@@ -170,6 +256,18 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 				Spec: corev1.PodSpec{
 					RestartPolicy:  corev1.RestartPolicyNever,
 					InitContainers: initContainers,
+					Volumes: []corev1.Volume{
+						{
+							Name: "script",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: fmt.Sprintf("%s-download-script", obj.Name),
+									},
+								},
+							},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name:    "model-download-finish",
@@ -290,66 +388,11 @@ func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec,
 	_ = bucket
 	_ = endpoint
 
-	script := `set -euo pipefail
-apk add --no-cache ca-certificates
-python -m pip install --no-cache-dir --upgrade pip
-python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests
+	cmd := "set -euo pipefail\n" +
+		"python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests\n" +
+		"python /opt/script/download.py\n"
 
-python - <<'PY'
-import os
-import io
-import mimetypes
-import requests
-from huggingface_hub import HfApi, hf_hub_url
-import boto3
-from botocore.config import Config
-from boto3.s3.transfer import TransferConfig
-
-repo_url = os.environ.get('SOURCE_URL')
-token = os.environ.get('HF_TOKEN')
-bucket = os.environ.get('CACHE_BUCKET')
-prefix = os.environ.get('CACHE_OBJECT_KEY', '').strip('/')
-endpoint = os.environ.get('CACHE_ENDPOINT') or None
-
-# Resolve repo_id from full URL if needed
-repo_id = repo_url or ''
-hf_prefix = 'https://huggingface.co/'
-if repo_id.startswith(hf_prefix):
-    repo_id = repo_id[len(hf_prefix):]
-repo_id = repo_id.strip('/')
-
-api = HfApi()
-files = api.list_repo_files(repo_id=repo_id, repo_type='model')
-
-session = boto3.session.Session()
-client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
-transfer_config = TransferConfig(
-    multipart_threshold=8*1024*1024,
-    multipart_chunksize=8*1024*1024,
-    max_concurrency=1,
-    use_threads=False,
-)
-
-headers = {}
-if token:
-    headers['Authorization'] = f'Bearer {token}'
-
-for path in files:
-    url = hf_hub_url(repo_id=repo_id, filename=path)
-    with requests.get(url, headers=headers, stream=True) as r:
-        r.raise_for_status()
-        r.raw.decode_content = True
-        key = f"{prefix}/{path}" if prefix else path
-        content_type = r.headers.get('Content-Type') or mimetypes.guess_type(path)[0]
-        extra = {'ContentType': content_type} if content_type else None
-        if extra:
-            client.upload_fileobj(r.raw, bucket, key, ExtraArgs=extra, Config=transfer_config)
-        else:
-            client.upload_fileobj(r.raw, bucket, key, Config=transfer_config)
-PY
-`
-
-	return []string{script}
+	return []string{cmd}
 }
 
 func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
