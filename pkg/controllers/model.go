@@ -172,10 +172,10 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 					InitContainers: initContainers,
 					Containers: []corev1.Container{
 						{
-							Name:            "model-download-finish",
-							Image:           spec.Image,
-							Command:         []string{"/bin/sh", "-c"},
-							Args:            []string{"echo download complete"},
+							Name:    "model-download-finish",
+							Image:   spec.Image,
+							Command: []string{"/bin/sh", "-c"},
+							Args:    []string{"echo download complete"},
 							Resources: corev1.ResourceRequirements{
 								Limits: corev1.ResourceList{
 									corev1.ResourceMemory: resource.MustParse("128Mi"),
@@ -250,20 +250,20 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 		}
 	}
 
-    return corev1.Container{
-		Name:            "model-downloader",
-		Image:           spec.Image,
-		Command:         h.downloadCommand(spec),
-		Args:            h.downloadArgs(model, spec, sourceURL, objectKey),
-		Env:             env,
-        Resources: corev1.ResourceRequirements{
-            Limits: corev1.ResourceList{
-                corev1.ResourceMemory: resource.MustParse("128Mi"),
-            },
-            Requests: corev1.ResourceList{
-                corev1.ResourceMemory: resource.MustParse("128Mi"),
-            },
-        },
+	return corev1.Container{
+		Name:    "model-downloader",
+		Image:   spec.Image,
+		Command: h.downloadCommand(spec),
+		Args:    h.downloadArgs(model, spec, sourceURL, objectKey),
+		Env:     env,
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+			Requests: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		},
 		ImagePullPolicy: corev1.PullIfNotPresent,
 	}
 }
@@ -303,6 +303,7 @@ import requests
 from huggingface_hub import HfApi, hf_hub_url
 import boto3
 from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 
 repo_url = os.environ.get('SOURCE_URL')
 token = os.environ.get('HF_TOKEN')
@@ -322,6 +323,12 @@ files = api.list_repo_files(repo_id=repo_id, repo_type='model')
 
 session = boto3.session.Session()
 client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
+transfer_config = TransferConfig(
+    multipart_threshold=8*1024*1024,
+    multipart_chunksize=8*1024*1024,
+    max_concurrency=1,
+    use_threads=False,
+)
 
 headers = {}
 if token:
@@ -336,9 +343,9 @@ for path in files:
         content_type = r.headers.get('Content-Type') or mimetypes.guess_type(path)[0]
         extra = {'ContentType': content_type} if content_type else None
         if extra:
-            client.upload_fileobj(r.raw, bucket, key, ExtraArgs=extra)
+            client.upload_fileobj(r.raw, bucket, key, ExtraArgs=extra, Config=transfer_config)
         else:
-            client.upload_fileobj(r.raw, bucket, key)
+            client.upload_fileobj(r.raw, bucket, key, Config=transfer_config)
 PY
 `
 
