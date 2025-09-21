@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
@@ -222,8 +223,14 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 		objectKey = fmt.Sprintf("models/%s", obj.Name)
 	}
 
-	backoffLimit := int32(1)
-	ttl := int32(3600)
+	backoffLimit := int32(10)
+	// Keep finished jobs/pods longer to inspect failures; default 24h
+	ttl := int32(86400)
+	if v, ok := obj.Annotations["kold.gorizond.io/ttl-seconds"]; ok {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			ttl = int32(secs)
+		}
+	}
 
 	// Build init container: download all artifacts into cache path
 	initContainers := []corev1.Container{}
