@@ -211,11 +211,23 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	spec := effectiveDownloadSpec(obj.Spec.Download)
 	jobName := jobNameForModel(obj)
 
-	// If the Job already exists, do not update it to avoid restarting pods.
-	// Let it run through backoffLimit attempts and be cleaned up by TTL.
-	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
-		return nil
-	}
+    // Guard against re-creation:
+    // 1) If status says Succeeded -> never create again
+    // 2) If a Job with the expected name exists -> do nothing
+    // 3) If status has a JobName recorded but it's currently missing ->
+    //    only recreate when the last observed state was Failed
+    if strings.EqualFold(obj.Status.DownloadState, "Succeeded") {
+        return nil
+    }
+    if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
+        return nil
+    }
+    if obj.Status.DownloadJobName != "" && obj.Status.DownloadJobName == jobName {
+        if !strings.EqualFold(obj.Status.DownloadState, "Failed") {
+            // Job missing but last state not Failed (e.g., Running/Pending or Unknown) -> skip re-create
+            return nil
+        }
+    }
 	labels := map[string]string{
 		labelComponent: componentModel,
 		labelModelName: obj.Name,
@@ -397,13 +409,12 @@ func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec,
 	endpoint := model.Spec.CacheSpec.Endpoint
 
 	// Construct a script that:
-	// 1) Installs ca-certificates, 2) installs huggingface_hub and boto3,
+	// 1) installs huggingface_hub and boto3,
 	// 3) snapshots HF repo to /tmp/model, 4) uploads files directly to S3 via boto3
 	_ = bucket
 	_ = endpoint
 
-	cmd := "set -euo pipefail\n" +
-		"python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests\n" +
+	cmd := "python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests\n" +
 		"python /opt/script/download.py\n"
 
 	return []string{cmd}
