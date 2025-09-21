@@ -10,6 +10,7 @@ import (
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 )
@@ -175,6 +176,14 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 							Image:           spec.Image,
 							Command:         []string{"/bin/sh", "-c"},
 							Args:            []string{"echo download complete"},
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
 							ImagePullPolicy: corev1.PullIfNotPresent,
 						},
 					},
@@ -241,12 +250,20 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 		}
 	}
 
-	return corev1.Container{
+    return corev1.Container{
 		Name:            "model-downloader",
 		Image:           spec.Image,
 		Command:         h.downloadCommand(spec),
 		Args:            h.downloadArgs(model, spec, sourceURL, objectKey),
 		Env:             env,
+        Resources: corev1.ResourceRequirements{
+            Limits: corev1.ResourceList{
+                corev1.ResourceMemory: resource.MustParse("128Mi"),
+            },
+            Requests: corev1.ResourceList{
+                corev1.ResourceMemory: resource.MustParse("128Mi"),
+            },
+        },
 		ImagePullPolicy: corev1.PullIfNotPresent,
 	}
 }
@@ -273,7 +290,7 @@ func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec,
 	_ = bucket
 	_ = endpoint
 
-    script := `set -euo pipefail
+	script := `set -euo pipefail
 apk add --no-cache ca-certificates
 python -m pip install --no-cache-dir --upgrade pip
 python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests
