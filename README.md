@@ -49,9 +49,9 @@ When running in-cluster the operator defaults to `InClusterConfig` and listens f
 
 The project currently targets Go 1.21+ and Wrangler v2.1.4.
 
-## Model download from Hugging Face into S3
+## Model download from Hugging Face directly to S3
 
-The operator downloads entire model repositories from Hugging Face using `huggingface_hub` and then syncs them to your S3/MinIO bucket with `rclone`. You provide only a `sourceUrl` and the `localPath` (S3 prefix).
+The operator downloads entire model repositories from Hugging Face using `huggingface_hub` and uploads files directly to your S3/MinIO bucket using `boto3`. You provide only a `sourceUrl` and the `localPath` (S3 prefix). Based on the article “Move Your Hugging Face LLM to S3 Like a Pro” [`dev.to/codexmaker/...`](https://dev.to/codexmaker/move-your-hugging-face-llm-to-s3-like-a-pro-without-wasting-local-space-15kp).
 
 Example `Model` resource:
 
@@ -73,7 +73,7 @@ spec:
     image: python:3.11-alpine
 ```
 
-Expected Secret for S3/MinIO credentials (env auth, key names are standard for rclone/AWS SDK):
+Expected Secret for S3/MinIO credentials (AWS SDK standard key names):
 
 ```yaml
 apiVersion: v1
@@ -88,5 +88,5 @@ stringData:
 ```
 
 Notes:
-- For private Hugging Face repos, set `download.huggingFaceTokenSecretRef` with a key `token`. The downloader will pass `HF_TOKEN` to `huggingface_hub`.
-- For MinIO endpoints, the operator configures path-style addressing and `--s3-endpoint` accordingly.
+- For private Hugging Face repos, set `download.huggingFaceTokenSecretRef` with key `token`. The downloader passes `HF_TOKEN` to `huggingface_hub`.
+- For MinIO endpoints, set `cacheSpec.endpoint` (the controller uses path-style addressing via boto3).

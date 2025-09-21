@@ -15,7 +15,7 @@ import (
 )
 
 const (
-    // Use python alpine to allow installing huggingface_hub, and rclone via apk
+    // Use python alpine to allow installing huggingface_hub and boto3
     defaultDownloadImage = "python:3.11-alpine"
 )
 
@@ -102,10 +102,10 @@ func (h *modelHandler) ensureMetadataConfigMap(obj *v1.Model) error {
 				labelModelName: obj.Name,
 			},
 		},
-        Data: map[string]string{
-            "sourceUrl": obj.Spec.SourceURL,
-            "localPath": obj.Spec.LocalPath,
-        },
+		Data: map[string]string{
+			"sourceUrl": obj.Spec.SourceURL,
+			"localPath": obj.Spec.LocalPath,
+		},
 	}
 
 	if obj.Spec.CacheSpec != nil {
@@ -123,7 +123,7 @@ func (h *modelHandler) ensureMetadataConfigMap(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
-    if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" || obj.Spec.SourceURL == "" {
+	if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" || obj.Spec.SourceURL == "" {
 		return nil
 	}
 
@@ -137,17 +137,17 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 		labels[labelDllamaName] = dllama
 	}
 
-    objectKey := modelObjectKey(obj)
+	objectKey := modelObjectKey(obj)
 	if objectKey == "" {
-        objectKey = fmt.Sprintf("models/%s", obj.Name)
+		objectKey = fmt.Sprintf("models/%s", obj.Name)
 	}
 
 	backoffLimit := int32(1)
 	ttl := int32(3600)
 
-    // Build init container: download all artifacts into cache path
-    initContainers := []corev1.Container{}
-    initContainers = append(initContainers, h.buildDownloadContainer(obj, spec, obj.Spec.SourceURL, objectKey))
+	// Build init container: download all artifacts into cache path
+	initContainers := []corev1.Container{}
+	initContainers = append(initContainers, h.buildDownloadContainer(obj, spec, obj.Spec.SourceURL, objectKey))
 
 	job := &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{
@@ -169,10 +169,10 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 				Spec: corev1.PodSpec{
 					RestartPolicy:  corev1.RestartPolicyNever,
 					InitContainers: initContainers,
-                    Containers: []corev1.Container{
+					Containers: []corev1.Container{
 						{
 							Name:            "model-download-finish",
-                            Image:           spec.Image,
+							Image:           spec.Image,
 							Command:         []string{"/bin/sh", "-c"},
 							Args:            []string{"echo download complete"},
 							ImagePullPolicy: corev1.PullIfNotPresent,
@@ -201,7 +201,7 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 	}
 	env = append(env, corev1.EnvVar{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"})
 
-    if spec.HuggingFaceTokenSecretRef != nil {
+	if spec.HuggingFaceTokenSecretRef != nil {
 		if spec.HuggingFaceTokenSecretRef.Namespace != "" && spec.HuggingFaceTokenSecretRef.Namespace != model.Namespace {
 			// cross-namespace secret mounts are not permitted; skip with warning via env comment
 		} else {
@@ -218,8 +218,8 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 		}
 	}
 
-    // Pass SOURCE_URL to container
-    env = append(env, corev1.EnvVar{Name: "SOURCE_URL", Value: sourceURL})
+	// Pass SOURCE_URL to container
+	env = append(env, corev1.EnvVar{Name: "SOURCE_URL", Value: sourceURL})
 
 	if model.Spec.CacheSpec.SecretRef != nil {
 		if model.Spec.CacheSpec.SecretRef.Namespace == "" || model.Spec.CacheSpec.SecretRef.Namespace == model.Namespace {
@@ -229,15 +229,15 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 					Optional:             pointer.Bool(true),
 				},
 			}
-            return corev1.Container{
-                Name:            "model-downloader",
-                Image:           spec.Image,
-                Command:         h.downloadCommand(spec),
-                Args:            h.downloadArgs(model, spec, sourceURL, objectKey),
-                Env:             env,
-                EnvFrom:         []corev1.EnvFromSource{envFrom},
-                ImagePullPolicy: corev1.PullIfNotPresent,
-            }
+			return corev1.Container{
+				Name:            "model-downloader",
+				Image:           spec.Image,
+				Command:         h.downloadCommand(spec),
+				Args:            h.downloadArgs(model, spec, sourceURL, objectKey),
+				Env:             env,
+				EnvFrom:         []corev1.EnvFromSource{envFrom},
+				ImagePullPolicy: corev1.PullIfNotPresent,
+			}
 		}
 	}
 
@@ -252,58 +252,80 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 }
 
 func (h *modelHandler) downloadCommand(spec *v1.ModelDownloadSpec) []string {
-    if len(spec.Command) > 0 {
-        return spec.Command
-    }
-    // run a shell to install deps and execute a small Python + rclone workflow
-    return []string{"/bin/sh", "-c"}
+	if len(spec.Command) > 0 {
+		return spec.Command
+	}
+    // run a shell to install deps and execute a small Python + boto3 upload workflow
+	return []string{"/bin/sh", "-c"}
 }
 
 func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec, sourceURL, objectKey string) []string {
-    if len(spec.Args) > 0 {
-        return spec.Args
-    }
+	if len(spec.Args) > 0 {
+		return spec.Args
+	}
 
-    bucket := model.Spec.CacheSpec.Bucket
-    endpoint := model.Spec.CacheSpec.Endpoint
+	bucket := model.Spec.CacheSpec.Bucket
+	endpoint := model.Spec.CacheSpec.Endpoint
 
     // Construct a script that:
-    // 1) Installs rclone & build deps, 2) installs huggingface_hub,
-    // 3) snapshots HF repo to /tmp/model, 4) rclone sync to s3 remote prefix
-    s3Flags := ""
-    if endpoint != "" {
-        s3Flags = fmt.Sprintf("--s3-endpoint %s --s3-force-path-style", endpoint)
-    }
+    // 1) Installs ca-certificates, 2) installs huggingface_hub and boto3,
+    // 3) snapshots HF repo to /tmp/model, 4) uploads files directly to S3 via boto3
+    _ = bucket
+    _ = endpoint
 
-    script := fmt.Sprintf(`set -euo pipefail
-apk add --no-cache rclone git ca-certificates
+    script := `set -euo pipefail
+apk add --no-cache ca-certificates
 python -m pip install --no-cache-dir --upgrade pip
-python -m pip install --no-cache-dir huggingface_hub
+python -m pip install --no-cache-dir huggingface_hub boto3 botocore
 
 mkdir -p /tmp/model
 python - <<'PY'
 import os
+import mimetypes
+from pathlib import Path
 from huggingface_hub import snapshot_download
+import boto3
+from botocore.config import Config
+
 repo_url = os.environ.get('SOURCE_URL')
-target_dir = '/tmp/model'
-allow_patterns=None
-ignore_patterns=None
+token = os.environ.get('HF_TOKEN')
+bucket = os.environ.get('CACHE_BUCKET')
+prefix = os.environ.get('CACHE_OBJECT_KEY', '').strip('/')
+endpoint = os.environ.get('CACHE_ENDPOINT') or None
+
 # Support both repo-id (org/name) and full URL by stripping prefix
 repo_id = repo_url
-prefix = 'https://huggingface.co/'
-if repo_id.startswith(prefix):
-    repo_id = repo_id[len(prefix):]
-repo_id = repo_id.strip('/')
-token = os.environ.get('HF_TOKEN')
-snapshot_download(repo_id=repo_id, local_dir=target_dir, local_dir_use_symlinks=False, token=token)
+hf_prefix = 'https://huggingface.co/'
+if repo_id and repo_id.startswith(hf_prefix):
+    repo_id = repo_id[len(hf_prefix):]
+repo_id = (repo_id or '').strip('/')
+
+local_dir = '/tmp/model'
+snapshot_download(repo_id=repo_id, local_dir=local_dir, local_dir_use_symlinks=False, token=token)
+
+session = boto3.session.Session()
+client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
+
+def upload_file(full_path: Path, rel_path: str):
+    key = rel_path.replace('\\\\', '/').replace('\\\\', '/')
+    if prefix:
+        key = f"{prefix}/{key}"
+    content_type, _ = mimetypes.guess_type(str(full_path))
+    extra = {'ContentType': content_type} if content_type else None
+    if extra:
+        client.upload_file(str(full_path), bucket, key, ExtraArgs=extra)
+    else:
+        client.upload_file(str(full_path), bucket, key)
+
+base = Path(local_dir)
+for p in base.rglob('*'):
+    if p.is_file():
+        rel = str(p.relative_to(base))
+        upload_file(p, rel)
 PY
+`
 
-# Sync whole folder to S3
-export AWS_S3_FORCE_PATH_STYLE=true
-rclone sync /tmp/model :s3,env_auth=true,acl=private:%s/%s %s --s3-chunk-size 32M --s3-upload-concurrency 4 --transfers 4 --buffer-size 0
-`, bucket, objectKey, s3Flags)
-
-    return []string{script}
+	return []string{script}
 }
 
 func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
