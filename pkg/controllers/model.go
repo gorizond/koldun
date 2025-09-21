@@ -210,6 +210,12 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 
 	spec := effectiveDownloadSpec(obj.Spec.Download)
 	jobName := jobNameForModel(obj)
+
+	// If the Job already exists, do not update it to avoid restarting pods.
+	// Let it run through backoffLimit attempts and be cleaned up by TTL.
+	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
+		return nil
+	}
 	labels := map[string]string{
 		labelComponent: componentModel,
 		labelModelName: obj.Name,
@@ -224,8 +230,8 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	}
 
 	backoffLimit := int32(10)
-	// Keep finished jobs/pods longer to inspect failures; default 24h
-	ttl := int32(86400)
+	// Keep finished jobs/pods longer to inspect failures; default 1minute
+	ttl := int32(60)
 	if v, ok := obj.Annotations["kold.gorizond.io/ttl-seconds"]; ok {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 			ttl = int32(secs)
