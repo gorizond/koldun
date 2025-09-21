@@ -277,6 +277,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 									LocalObjectReference: corev1.LocalObjectReference{
 										Name: fmt.Sprintf("%s-download-script", obj.Name),
 									},
+									Optional: pointer.Bool(true),
 								},
 							},
 						},
