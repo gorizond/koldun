@@ -138,8 +138,8 @@ spec:
                   memory:
                     description: Memory specifies memory limit for the conversion job container.
                     type: string
-                  goofysImage:
-                    description: GoofysImage overrides the image used for S3 FUSE mounting.
+                  rcloneImage:
+                    description: RcloneImage overrides the image used for rclone-based syncing/mounting.
                     type: string
                   toolsImage:
                     description: ToolsImage overrides the image used for lightweight helper init-containers.

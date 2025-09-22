@@ -645,8 +645,8 @@ type ModelConversionSpec struct {
 	OutputPath string `json:"outputPath,omitempty"`
 	// Memory specifies memory limit for the conversion job container.
 	Memory string `json:"memory,omitempty"`
-    // GoofysImage overrides the image used for S3 FUSE mounting (defaults to ghcr.io/kahing/goofys:latest).
-    GoofysImage string `json:"goofysImage,omitempty"`
+	// RcloneImage overrides the image used for rclone-based syncing/mounting (defaults to rclone/rclone:1.67).
+	RcloneImage string `json:"rcloneImage,omitempty"`
 	// ToolsImage overrides the image used for lightweight operations (defaults to alpine:3.18).
 	ToolsImage string `json:"toolsImage,omitempty"`
 }

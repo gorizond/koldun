@@ -14,7 +14,7 @@ Kold (kubernetes operator for serverless distributed-llama) Operator manages dis
 All controllers are wired through Wrangler's generic factories and `apply` engine:
 
 - `pkg/controllers/dllama.go` expands Dllama resources into Model/Root/Worker children, applies ownership, and updates the aggregate status once underlying components report ready.
-- `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation, a streamed download `Job`, and an optional post-processing conversion `Job` (e.g. GGUF export + tokenizer pack) that reads artifacts directly from the S3/MinIO cache via a goofys FUSE sidecar.
+- `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation, a streamed download `Job`, and an optional post-processing conversion `Job` (e.g. GGUF export + tokenizer pack) that reads artifacts directly from the S3/MinIO cache via an rclone FUSE mount sidecar.
 - `pkg/controllers/root.go` renders the coordinator `Deployment` and associated `Service`, watching Kubernetes workloads to reflect readiness and expose a stable endpoint.
 - `pkg/controllers/worker.go` renders worker `Deployments` and tracks pod readiness per slot.
 
@@ -80,7 +80,7 @@ spec:
     weightsFloatType: q40
     outputPath: /converted
     image: python:3.11
-    goofysImage: ghcr.io/kahing/goofys:latest
+    rcloneImage: rclone/rclone:1.67
     toolsImage: alpine:3.18
     memory: "8Gi"
 ```
@@ -102,11 +102,12 @@ stringData:
 Notes:
 - For private Hugging Face repos, set `download.huggingFaceTokenSecretRef` with key `token`. The downloader passes `HF_TOKEN` to `huggingface_hub`.
 - For MinIO endpoints, set `cacheSpec.endpoint` (the controller uses path-style addressing via boto3).
-- When `spec.conversion` is defined, the controller runs a follow-up Job that (a) fetches the converter scripts from GitHub, (b) mounts the cache bucket read-only via a `goofys` sidecar and reads the model directly over FUSE, (c) executes `convert-hf.py`/`convert-tokenizer-hf.py`, and (d) uploads the GGUF + tokenizer bundles back to the target S3 prefix using boto3.
+- When `spec.conversion` is defined, the controller runs a follow-up Job that (a) fetches the converter scripts from GitHub, (b) mounts the cache bucket read-only via an `rclone mount` sidecar and reads the model directly over FUSE, (c) executes `convert-hf.py`/`convert-tokenizer-hf.py`, and (d) uploads the GGUF + tokenizer bundles back to the target S3 prefix using boto3.
 
-### S3 read-only via goofys
+### S3 read-only via rclone mount
 
-- The conversion Job includes a `goofys` sidecar that mounts the bucket at `/mnt/s3`. The main container reads model files from `"/mnt/s3/<localPath-prefix>"`.
-- Credentials are taken from `cacheSpec.secretRef` using standard AWS keys (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optionally `AWS_REGION`). Path-style is enforced with `AWS_S3_FORCE_PATH_STYLE=true`.
-- For custom endpoints (e.g. MinIO), set `spec.cacheSpec.endpoint`.
-- Node must provide `/dev/fuse`; the pod mounts it via `hostPath`. The sidecar requests `SYS_ADMIN` capability and allowPrivilegeEscalation to run FUSE.
+- The conversion Job includes an `rclone` sidecar that FUSE-mounts the bucket at `/mnt/s3`. The main container reads model files from `"/mnt/s3/<localPath-prefix>"`.
+- Read-only flags: `--read-only`, `--vfs-cache-mode=off`, increase `--dir-cache-time` (e.g. `1h`), disable modtimes with `--no-modtime` and reduce polls via `--poll-interval=30m`.
+- Credentials come from `cacheSpec.secretRef` using standard AWS keys (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optionally `AWS_REGION`). Path-style is enforced with `AWS_S3_FORCE_PATH_STYLE=true`.
+- For custom endpoints (e.g. MinIO), set `spec.cacheSpec.endpoint`. The sidecar adds `--s3-endpoint`, `--s3-provider=Minio`, `--s3-env-auth`, `--s3-force-path-style`.
+- Node must provide `/dev/fuse`; the pod mounts it via `hostPath`. The sidecar requests `SYS_ADMIN` capability and `allowPrivilegeEscalation` to run FUSE and uses `preStop` to unmount cleanly.

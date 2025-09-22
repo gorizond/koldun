@@ -565,11 +565,11 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	if toolsImage == "" {
 		toolsImage = defaultToolsImage
 	}
-    // goofys image for S3 FUSE mount
-    goofysImage := spec.GoofysImage
-    if strings.TrimSpace(goofysImage) == "" {
-        goofysImage = defaultGoofysImage
-    }
+	// rclone image for FUSE mount
+	rcloneImage := spec.RcloneImage
+	if strings.TrimSpace(rcloneImage) == "" {
+		rcloneImage = defaultRcloneImage
+	}
 
 	backoffLimit := int32(5)
 	ttl := int32(300)
@@ -628,17 +628,30 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		VolumeMounts: mountsForWorkdir,
 	}
 
-	// Sidecar: mount S3 bucket via goofys (read-only usage by main container)
-	goofysArgs := []string{"-f", "--no-implicit-dir", "--stat-cache-ttl=1h", "--type-cache-ttl=1h"}
-	if ep := strings.TrimSpace(obj.Spec.CacheSpec.Endpoint); ep != "" {
-		goofysArgs = append(goofysArgs, "--endpoint", ep)
+	// Sidecar: mount S3 bucket via rclone mount (read-only)
+	rcloneArgs := []string{
+		"mount",
+		fmt.Sprintf(":s3,%s,%s:%s", "provider=Minio", "env_auth=true", obj.Spec.CacheSpec.Bucket),
+		"/mnt/s3",
+		"--read-only",
+		"--vfs-cache-mode=off",
+		"--dir-cache-time=1h",
+		"--no-modtime",
+		"--poll-interval=30m",
+		"--allow-other",
+		"--uid=1000",
+		"--gid=1000",
 	}
-	goofysArgs = append(goofysArgs, obj.Spec.CacheSpec.Bucket, "/mnt/s3")
+	if ep := strings.TrimSpace(obj.Spec.CacheSpec.Endpoint); ep != "" {
+		rcloneArgs = append(rcloneArgs, "--s3-endpoint="+ep, "--s3-provider=Minio", "--s3-env-auth", "--s3-force-path-style")
+	} else {
+		rcloneArgs = append(rcloneArgs, "--s3-provider=AWS", "--s3-env-auth", "--s3-force-path-style")
+	}
 
-	goofysContainer := corev1.Container{
-		Name:  "goofys",
-		Image: goofysImage,
-		Args:  goofysArgs,
+	rcloneContainer := corev1.Container{
+		Name:  "rclone",
+		Image: rcloneImage,
+		Args:  rcloneArgs,
 		Env: []corev1.EnvVar{
 			{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
 		},
@@ -650,6 +663,9 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 			{Name: "s3mnt", MountPath: "/mnt/s3"},
 			{Name: "devfuse", MountPath: "/dev/fuse"},
 		},
+		Lifecycle: &corev1.Lifecycle{
+			PreStop: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "fusermount -u /mnt/s3 || umount /mnt/s3 || true"}}},
+		},
 	}
 
 	if obj.Spec.CacheSpec.SecretRef != nil {
@@ -660,7 +676,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 					Optional:             pointer.Bool(true),
 				},
 			}
-			goofysContainer.EnvFrom = append(goofysContainer.EnvFrom, envFrom)
+			rcloneContainer.EnvFrom = append(rcloneContainer.EnvFrom, envFrom)
 		}
 	}
 
@@ -698,7 +714,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 				Spec: corev1.PodSpec{
 					RestartPolicy:  corev1.RestartPolicyNever,
 					InitContainers: initContainers,
-					Containers:     []corev1.Container{mainContainer, goofysContainer},
+					Containers:     []corev1.Container{mainContainer, rcloneContainer},
 					Volumes:        volumes,
 				},
 			},
