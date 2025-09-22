@@ -14,7 +14,7 @@ Kold (kubernetes operator for serverless distributed-llama) Operator manages dis
 All controllers are wired through Wrangler's generic factories and `apply` engine:
 
 - `pkg/controllers/dllama.go` expands Dllama resources into Model/Root/Worker children, applies ownership, and updates the aggregate status once underlying components report ready.
-- `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation and a streamed download `Job` that pulls HuggingFace artifacts directly into the configured S3/MinIO cache, driving Model status updates.
+- `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation, a streamed download `Job`, and an optional post-processing conversion `Job` (e.g. GGUF export + tokenizer pack) directly against the configured S3/MinIO cache.
 - `pkg/controllers/root.go` renders the coordinator `Deployment` and associated `Service`, watching Kubernetes workloads to reflect readiness and expose a stable endpoint.
 - `pkg/controllers/worker.go` renders worker `Deployments` and tracks pod readiness per slot.
 
@@ -62,17 +62,27 @@ metadata:
   name: hf-convert-script
   namespace: default
 spec:
-  sourceUrl: https://huggingface.co/mistralai/Mistral-7B-v0.3
-  localPath: s3://my-bucket-model/mistralai/Mistral-7B-v0.3
+  sourceUrl: https://huggingface.co/Qwen/Qwen3-1.7B
+  localPath: s3://my-bucket-model/Qwen/Qwen3-1.7B
   cacheSpec:
-    endpoint: http://192.168.5.15:32090
+    endpoint: http://192.168.205.2:32090
     bucket: my-bucket-model
     secretRef:
       name: minio-creds
   download:
-    image: python:3.11-alpine
+    memory: "2Gi"
+    chunkMaxMiB: 256
+    concurrency: 6
+    image: python:3.11
     huggingFaceTokenSecretRef:
       name: my-hf
+  conversion:
+    weightsFloatType: q40
+    outputPath: /converted
+    image: python:3.11
+    rcloneImage: rclone/rclone:1.67
+    toolsImage: alpine:3.18
+    memory: "8Gi"
 ```
 
 Expected Secret for S3/MinIO credentials (AWS SDK standard key names):
@@ -92,3 +102,4 @@ stringData:
 Notes:
 - For private Hugging Face repos, set `download.huggingFaceTokenSecretRef` with key `token`. The downloader passes `HF_TOKEN` to `huggingface_hub`.
 - For MinIO endpoints, set `cacheSpec.endpoint` (the controller uses path-style addressing via boto3).
+- When `spec.conversion` is defined, the controller runs a follow-up Job that (a) fetches the converter scripts from GitHub, (b) syncs the downloaded model from the cache via `rclone`, (c) executes `convert-hf.py`/`convert-tokenizer-hf.py`, and (d) uploads the GGUF + tokenizer bundles back to the target S3 prefix.

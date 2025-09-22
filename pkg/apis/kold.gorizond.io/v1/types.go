@@ -118,11 +118,11 @@ type Model struct {
 
 // ModelSpec holds the desired model artifact configuration.
 type ModelSpec struct {
-    // SourceURL points to the upstream model source. For Hugging Face, this is the
-    // repository URL like https://huggingface.co/mistralai/Mistral-7B-v0.3. The operator
-    // will download all repository files into the cache backend.
-    SourceURL string `json:"sourceUrl"`
-    // LocalPath is the path/prefix on the cache backend where the artifacts will reside.
+	// SourceURL points to the upstream model source. For Hugging Face, this is the
+	// repository URL like https://huggingface.co/mistralai/Mistral-7B-v0.3. The operator
+	// will download all repository files into the cache backend.
+	SourceURL string `json:"sourceUrl"`
+	// LocalPath is the path/prefix on the cache backend where the artifacts will reside.
 	LocalPath string `json:"localPath"`
 	// CacheSpec optionally overrides the cache information for this model.
 	CacheSpec *CacheSpec `json:"cacheSpec,omitempty"`
@@ -130,6 +130,8 @@ type ModelSpec struct {
 	LaunchOptions []string `json:"launchOptions,omitempty"`
 	// Download contains configuration for how the model artifacts are fetched and prepared.
 	Download *ModelDownloadSpec `json:"download,omitempty"`
+	// Conversion optionally describes how cached artifacts should be converted post-download.
+	Conversion *ModelConversionSpec `json:"conversion,omitempty"`
 }
 
 // ModelStatus reports whether the model artifact is ready for consumption.
@@ -142,6 +144,10 @@ type ModelStatus struct {
 	DownloadJobName string `json:"downloadJobName,omitempty"`
 	// DownloadState is a high-level state for the downloader pipeline (Pending, Running, Succeeded, Failed).
 	DownloadState string `json:"downloadState,omitempty"`
+	// ConversionJobName is the conversion Job associated with this model generation.
+	ConversionJobName string `json:"conversionJobName,omitempty"`
+	// ConversionState mirrors DownloadState for the conversion pipeline.
+	ConversionState string `json:"conversionState,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -396,6 +402,10 @@ func (in *ModelSpec) DeepCopy() *ModelSpec {
 		downloadCopy := *in.Download.DeepCopy()
 		out.Download = &downloadCopy
 	}
+	if in.Conversion != nil {
+		conversionCopy := *in.Conversion.DeepCopy()
+		out.Conversion = &conversionCopy
+	}
 	return out
 }
 
@@ -592,6 +602,12 @@ type ModelDownloadSpec struct {
 	Args []string `json:"args,omitempty"`
 	// HuggingFaceTokenSecretRef references a Secret with token for private model download.
 	HuggingFaceTokenSecretRef *SecretReference `json:"huggingFaceTokenSecretRef,omitempty"`
+	// Memory specifies memory limit for the download job container (e.g. "128Mi", "1Gi").
+	Memory string `json:"memory,omitempty"`
+	// ChunkMaxMiB caps multipart chunk size in MiB (defaults to 64)
+	ChunkMaxMiB int32 `json:"chunkMaxMiB,omitempty"`
+	// Concurrency sets the number of parallel parts used by S3 transfer (defaults to 1)
+	Concurrency int32 `json:"concurrency,omitempty"`
 }
 
 func (in *ModelDownloadSpec) DeepCopy() *ModelDownloadSpec {
@@ -611,6 +627,43 @@ func (in *ModelDownloadSpec) DeepCopy() *ModelDownloadSpec {
 	if in.HuggingFaceTokenSecretRef != nil {
 		secretCopy := *in.HuggingFaceTokenSecretRef
 		out.HuggingFaceTokenSecretRef = &secretCopy
+	}
+	return out
+}
+
+// ModelConversionSpec configures post-download conversion of cached artifacts (e.g. GGUF export).
+type ModelConversionSpec struct {
+	// Image is the container image used for the conversion Job.
+	Image string `json:"image,omitempty"`
+	// Command overrides the container entrypoint when set.
+	Command []string `json:"command,omitempty"`
+	// Args provides optional arguments for the container entrypoint.
+	Args []string `json:"args,omitempty"`
+	// WeightsFloatType dictates the target precision (for example, "q40").
+	WeightsFloatType string `json:"weightsFloatType,omitempty"`
+	// OutputPath optionally overrides the cache destination for converted artifacts (may be s3:// URI).
+	OutputPath string `json:"outputPath,omitempty"`
+	// Memory specifies memory limit for the conversion job container.
+	Memory string `json:"memory,omitempty"`
+    // GoofysImage overrides the image used for S3 FUSE mounting (defaults to ghcr.io/kahing/goofys:latest).
+    GoofysImage string `json:"goofysImage,omitempty"`
+	// ToolsImage overrides the image used for lightweight operations (defaults to alpine:3.18).
+	ToolsImage string `json:"toolsImage,omitempty"`
+}
+
+func (in *ModelConversionSpec) DeepCopy() *ModelConversionSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(ModelConversionSpec)
+	*out = *in
+	if in.Command != nil {
+		out.Command = make([]string, len(in.Command))
+		copy(out.Command, in.Command)
+	}
+	if in.Args != nil {
+		out.Args = make([]string, len(in.Args))
+		copy(out.Args, in.Args)
 	}
 	return out
 }

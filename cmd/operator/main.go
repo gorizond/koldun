@@ -12,12 +12,19 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/klog/v2"
 )
 
 func main() {
 	var kubeconfig string
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig, falls back to in-cluster config")
+
+	// Initialize klog flags
+	klog.InitFlags(nil)
 	flag.Parse()
+
+	// Set klog to output to stderr by default
+	klog.SetOutput(os.Stderr)
 
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
@@ -38,7 +45,9 @@ func main() {
 	}
 
 	logrus.Info("starting kold operator")
+	klog.Info("kold operator is starting up")
 	if err := manager.Start(ctx); err != nil {
+		klog.Errorf("controller manager exited with error: %v", err)
 		logrus.Fatalf("controller manager exited with error: %v", err)
 	}
 }

@@ -19,6 +19,9 @@ const (
 
 	conditionReady      = "Ready"
 	conditionDownloaded = "Downloaded"
+	conditionConverted  = "Converted"
+
+	annotationModelGeneration = "kold.gorizond.io/model-generation"
 )
 
 func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) bool {

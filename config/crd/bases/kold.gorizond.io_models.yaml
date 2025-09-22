@@ -75,6 +75,76 @@ spec:
                 items:
                   type: string
                 type: array
+              download:
+                description: ModelDownloadSpec describes how to acquire model artifacts.
+                properties:
+                  image:
+                    description: Image is the container image used for the download Job.
+                    type: string
+                  command:
+                    description: Command overrides the container entrypoint when set.
+                    items:
+                      type: string
+                    type: array
+                  args:
+                    description: Args provides optional arguments for the container entrypoint.
+                    items:
+                      type: string
+                    type: array
+                  huggingFaceTokenSecretRef:
+                    description: HuggingFaceTokenSecretRef references a Secret with token for private model download.
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  chunkMaxMiB:
+                    description: ChunkMaxMiB caps multipart chunk size in MiB (defaults to 64)
+                    format: int32
+                    type: integer
+                  concurrency:
+                    description: Concurrency sets number of parallel parts for S3 transfer (defaults to 1)
+                    format: int32
+                    type: integer
+                  memory:
+                    description: Memory specifies memory limit for the download job container (e.g. "128Mi", "1Gi").
+                    type: string
+                type: object
+              conversion:
+                description: ModelConversionSpec configures post-download conversion of cached artifacts (e.g. GGUF export).
+                properties:
+                  image:
+                    description: Image is the container image used for the conversion Job.
+                    type: string
+                  command:
+                    description: Command overrides the container entrypoint when set.
+                    items:
+                      type: string
+                    type: array
+                  args:
+                    description: Args provides optional arguments for the container entrypoint.
+                    items:
+                      type: string
+                    type: array
+                  weightsFloatType:
+                    description: WeightsFloatType dictates the target precision (for example, "q40").
+                    type: string
+                  outputPath:
+                    description: OutputPath optionally overrides the cache destination for converted artifacts (may be an s3:// URI).
+                    type: string
+                  memory:
+                    description: Memory specifies memory limit for the conversion job container.
+                    type: string
+                  goofysImage:
+                    description: GoofysImage overrides the image used for S3 FUSE mounting.
+                    type: string
+                  toolsImage:
+                    description: ToolsImage overrides the image used for lightweight helper init-containers.
+                    type: string
+                type: object
               localPath:
                 description: LocalPath is the path on the node filesystem (or cache
                   backend) where the model should reside.
@@ -95,6 +165,18 @@ spec:
                   artifact, if known.
                 format: int64
                 type: integer
+              downloadJobName:
+                description: DownloadJobName is the name of the Kubernetes Job responsible for downloading the model.
+                type: string
+              downloadState:
+                description: DownloadState is a high-level state for the downloader pipeline (Pending, Running, Succeeded, Failed).
+                type: string
+              conversionJobName:
+                description: ConversionJobName is the conversion Job associated with this model generation.
+                type: string
+              conversionState:
+                description: ConversionState mirrors DownloadState for the conversion pipeline.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
