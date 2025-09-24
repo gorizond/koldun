@@ -1,0 +1,53 @@
+name: Publish Helm chart to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'charts/**'
+      - '.github/workflows/gh-pages.yaml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: Package chart
+        shell: bash
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          # Update dependencies if any (ignore if none)
+          helm dependency update charts/koldun || true
+          # Lint chart for basic validation
+          helm lint charts/koldun
+          # Package chart into tgz
+          helm package charts/koldun --destination _site
+          # Build index.yaml with proper absolute URL
+          helm repo index _site --url "https://${OWNER}.github.io/${REPO}/"
+
+      - name: Publish to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: _site
+          publish_branch: gh-pages
+          force_orphan: true
+
+
