@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/gorizond/kold/pkg/controllers"
+	"github.com/gorizond/koldun/pkg/controllers"
 	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/rest"
@@ -44,8 +44,8 @@ func main() {
 		logrus.Fatalf("failed to register controllers: %v", err)
 	}
 
-	logrus.Info("starting kold operator")
-	klog.Info("kold operator is starting up")
+	logrus.Info("starting koldun operator")
+	klog.Info("koldun operator is starting up")
 	if err := manager.Start(ctx); err != nil {
 		klog.Errorf("controller manager exited with error: %v", err)
 		logrus.Fatalf("controller manager exited with error: %v", err)

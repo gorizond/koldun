@@ -22,6 +22,7 @@ jobs:
     steps:
       - name: Determine refs to build
         id: determine
+        shell: bash
         run: |
           parse_refs() {
             local input="$1"
@@ -44,7 +45,12 @@ jobs:
           fi
 
           json=$(printf '%s\n' "$refs" | sort -u | jq -R . | jq -s '{ref: .}')
-          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "matrix<<'EOF'"
+            echo "$json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: Build multi-arch image

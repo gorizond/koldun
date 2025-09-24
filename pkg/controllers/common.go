@@ -5,23 +5,23 @@ import (
 )
 
 const (
-	labelDllamaName = "kold.gorizond.io/dllama"
-	labelComponent  = "kold.gorizond.io/component"
-	labelRootName   = "kold.gorizond.io/root"
-	labelWorkerName = "kold.gorizond.io/worker"
-	labelModelName  = "kold.gorizond.io/model"
+	labelDllamaName = "koldun.gorizond.io/dllama"
+	labelComponent  = "koldun.gorizond.io/component"
+	labelRootName   = "koldun.gorizond.io/root"
+	labelWorkerName = "koldun.gorizond.io/worker"
+	labelModelName  = "koldun.gorizond.io/model"
 
 	componentModel  = "model"
 	componentRoot   = "root"
 	componentWorker = "worker"
 
-	annotationSlotKey = "kold.gorizond.io/slot"
+	annotationSlotKey = "koldun.gorizond.io/slot"
 
 	conditionReady      = "Ready"
 	conditionDownloaded = "Downloaded"
 	conditionConverted  = "Converted"
 
-	annotationModelGeneration = "kold.gorizond.io/model-generation"
+	annotationModelGeneration = "koldun.gorizond.io/model-generation"
 )
 
 func setCondition(conditions *[]metav1.Condition, cond metav1.Condition) bool {

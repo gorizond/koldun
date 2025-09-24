@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: dllamas.kold.gorizond.io
+  name: dllamas.koldun.gorizond.io
 spec:
-  group: kold.gorizond.io
+  group: koldun.gorizond.io
   names:
     kind: Dllama
     listKind: DllamaList

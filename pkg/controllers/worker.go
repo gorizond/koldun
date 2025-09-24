@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,9 +29,9 @@ func registerWorkerController(ctx context.Context, m *Manager) error {
 		deployments: m.Apps.Deployment(),
 	}
 
-	handler.workers.OnChange(ctx, "kold-worker-controller", handler.onChange)
-	handler.workers.OnRemove(ctx, "kold-worker-controller", handler.onRemove)
-	handler.deployments.OnChange(ctx, "kold-worker-deployment-watch", handler.onRelatedDeployment)
+	handler.workers.OnChange(ctx, "koldun-worker-controller", handler.onChange)
+	handler.workers.OnRemove(ctx, "koldun-worker-controller", handler.onRemove)
+	handler.deployments.OnChange(ctx, "koldun-worker-deployment-watch", handler.onRelatedDeployment)
 	return nil
 }
 

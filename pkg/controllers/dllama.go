@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,12 +31,12 @@ func registerDllamaController(ctx context.Context, m *Manager) error {
 		workers: m.Kold.Worker(),
 	}
 
-	handler.dllamas.OnChange(ctx, "kold-dllama-controller", handler.onChange)
-	handler.dllamas.OnRemove(ctx, "kold-dllama-controller", handler.onRemove)
+	handler.dllamas.OnChange(ctx, "koldun-dllama-controller", handler.onChange)
+	handler.dllamas.OnRemove(ctx, "koldun-dllama-controller", handler.onRemove)
 
-	handler.models.OnChange(ctx, "kold-dllama-model-watch", handler.onRelatedModel)
-	handler.roots.OnChange(ctx, "kold-dllama-root-watch", handler.onRelatedRoot)
-	handler.workers.OnChange(ctx, "kold-dllama-worker-watch", handler.onRelatedWorker)
+	handler.models.OnChange(ctx, "koldun-dllama-model-watch", handler.onRelatedModel)
+	handler.roots.OnChange(ctx, "koldun-dllama-root-watch", handler.onRelatedRoot)
+	handler.workers.OnChange(ctx, "koldun-dllama-worker-watch", handler.onRelatedWorker)
 	return nil
 }
 
@@ -109,7 +109,7 @@ func (h *dllamaHandler) desiredObjects(dllama *v1.Dllama) []runtime.Object {
 		labelModelName:  fmt.Sprintf("%s-model", dllama.Name),
 	}
 
-    model := &v1.Model{
+	model := &v1.Model{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
 			Kind:       "Model",
@@ -120,10 +120,10 @@ func (h *dllamaHandler) desiredObjects(dllama *v1.Dllama) []runtime.Object {
 			Labels:    modelLabels,
 		},
 		Spec: v1.ModelSpec{
-            SourceURL:     dllama.Spec.ModelRef,
-            LocalPath:     fmt.Sprintf("/models/%s", dllama.Spec.ModelRef),
-            CacheSpec:     cloneCacheSpec(dllama.Spec.CacheSpec),
-            LaunchOptions: append([]string{}, dllama.Spec.LaunchArgs...),
+			SourceURL:     dllama.Spec.ModelRef,
+			LocalPath:     fmt.Sprintf("/models/%s", dllama.Spec.ModelRef),
+			ObjectStorage: objectStorageFromCache(dllama.Spec.CacheSpec),
+			LaunchOptions: append([]string{}, dllama.Spec.LaunchArgs...),
 		},
 	}
 	objects = append(objects, model)
@@ -209,6 +209,22 @@ func workersForReplicaPower(power int32) int32 {
 		return 0
 	}
 	return total - 1
+}
+
+func objectStorageFromCache(spec *v1.CacheSpec) *v1.ModelObjectStorageSpec {
+	if spec == nil {
+		return nil
+	}
+	storage := &v1.ModelObjectStorageSpec{
+		Endpoint:         spec.Endpoint,
+		BucketForSource:  spec.Bucket,
+		BucketForConvert: spec.Bucket,
+	}
+	if spec.SecretRef != nil {
+		secretCopy := *spec.SecretRef
+		storage.SecretRef = &secretCopy
+	}
+	return storage
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {

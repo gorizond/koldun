@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	koldv1 "github.com/gorizond/kold/pkg/controllers/koldv1"
+	koldv1 "github.com/gorizond/koldun/pkg/controllers/koldunv1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	appsv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
 	batchv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/batch/v1"
@@ -59,6 +59,8 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			core.ConfigMap(),
 			core.Secret(),
 			core.Service(),
+			core.PersistentVolume(),
+			core.PersistentVolumeClaim(),
 		)
 
 	return &Manager{

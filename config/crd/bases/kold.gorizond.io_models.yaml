@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: models.kold.gorizond.io
+  name: models.koldun.gorizond.io
 spec:
-  group: kold.gorizond.io
+  group: koldun.gorizond.io
   names:
     kind: Model
     listKind: ModelList
@@ -42,21 +42,14 @@ spec:
           spec:
             description: ModelSpec holds the desired model artifact configuration.
             properties:
-              cacheSpec:
-                description: CacheSpec optionally overrides the cache information
-                  for this model.
+              objectStorage:
+                description: ObjectStorage describes access to object storage buckets used for downloading and conversion output.
                 properties:
-                  bucket:
-                    description: Bucket is the object store bucket where models are
-                      stored.
-                    type: string
                   endpoint:
-                    description: Endpoint is the URL of the cache backend (e.g. S3
-                      compatible object storage).
+                    description: Endpoint is the URL of the object storage backend (e.g. S3 compatible object storage).
                     type: string
                   secretRef:
-                    description: SecretRef references a Secret containing credentials
-                      for the cache backend.
+                    description: SecretRef references a Secret containing credentials for the storage backend.
                     properties:
                       name:
                         type: string
@@ -65,8 +58,15 @@ spec:
                     required:
                     - name
                     type: object
+                  bucketForSource:
+                    description: BucketForSource holds the original Hugging Face snapshot and downloaded artifacts.
+                    type: string
+                  bucketForConvert:
+                    description: BucketForConvert stores converted artifacts produced by conversion jobs.
+                    type: string
                 required:
-                - bucket
+                - bucketForConvert
+                - bucketForSource
                 - endpoint
                 type: object
               launchOptions:
@@ -113,6 +113,9 @@ spec:
                     description: Memory specifies memory limit for the download job container (e.g. "128Mi", "1Gi").
                     type: string
                 type: object
+              pipProxy:
+                description: Optional HTTP proxy used by pip inside python containers (Dragonfly dfdaemon HTTP proxy).
+                type: string
               conversion:
                 description: ModelConversionSpec configures post-download conversion of cached artifacts (e.g. GGUF export).
                 properties:
@@ -144,6 +147,58 @@ spec:
                   toolsImage:
                     description: ToolsImage overrides the image used for lightweight helper init-containers.
                     type: string
+                  converterVersion:
+                    description: ConverterVersion selects the distributed-llama converter release tag (default v0.16.2).
+                    type: string
+                type: object
+              pv:
+                description: Template for PersistentVolume/PersistentVolumeClaim used to mount S3 via CSI.
+                properties:
+                  storageClassName:
+                    description: StorageClassName for the PV (default csi-s3).
+                    type: string
+                  capacity:
+                    description: PV capacity (e.g. 10Gi). Defaults to 10Gi.
+                    type: string
+                  accessModes:
+                    description: PV access modes. Defaults to [ReadWriteMany].
+                    items:
+                      type: string
+                    type: array
+                  reclaimPolicy:
+                    description: PV reclaim policy. Defaults to Retain.
+                    type: string
+                  csiDriver:
+                    description: CSI driver name. Defaults to ru.yandex.s3.csi.
+                    type: string
+                  csiMounter:
+                    description: CSI mounter (e.g., geesefs) stored in volumeAttributes.mounter.
+                    type: string
+                  csiOptions:
+                    description: CSI options string stored in volumeAttributes.options.
+                    type: string
+                  volumeAttributes:
+                    description: Additional CSI volumeAttributes to merge.
+                    additionalProperties:
+                      type: string
+                    type: object
+                  csiSecretName:
+                    description: CSI secret name (default csi-s3-secret).
+                    type: string
+                  csiSecretNamespace:
+                    description: CSI secret namespace (default kube-system).
+                    type: string
+                  pvcStorageClassName:
+                    description: PVC storageClassName. Default empty for static binding.
+                    type: string
+                  pvcCapacity:
+                    description: PVC requested storage (default same as PV capacity or 10Gi).
+                    type: string
+                  pvcAccessModes:
+                    description: PVC access modes. Defaults to [ReadWriteMany].
+                    items:
+                      type: string
+                    type: array
                 type: object
               localPath:
                 description: LocalPath is the path on the node filesystem (or cache

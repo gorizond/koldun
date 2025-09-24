@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: roots.kold.gorizond.io
+  name: roots.koldun.gorizond.io
 spec:
-  group: kold.gorizond.io
+  group: koldun.gorizond.io
   names:
     kind: Root
     listKind: RootList

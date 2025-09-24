@@ -9,8 +9,9 @@ import (
 	"strings"
 	"time"
 
-	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
+	corectlv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,7 +34,7 @@ const (
 	jobSuffixConvert  = "-convert"
 
 	// Annotation to track when a job was last deleted to prevent immediate recreation
-	annotationJobDeletedAt = "kold.gorizond.io/job-deleted-at"
+	annotationJobDeletedAt = "koldun.gorizond.io/job-deleted-at"
 )
 
 type modelHandler struct {
@@ -41,6 +42,8 @@ type modelHandler struct {
 	apply  apply.Apply
 	models generic.ControllerInterface[*v1.Model, *v1.ModelList]
 	jobs   generic.ControllerInterface[*batchv1.Job, *batchv1.JobList]
+	pvcs   corectlv1.PersistentVolumeClaimController
+	pvs    corectlv1.PersistentVolumeController
 }
 
 func registerModelController(ctx context.Context, m *Manager) error {
@@ -49,12 +52,14 @@ func registerModelController(ctx context.Context, m *Manager) error {
 		apply:  m.Apply(ctx),
 		models: m.Kold.Model(),
 		jobs:   m.Batch.Job(),
+		pvcs:   m.Core.PersistentVolumeClaim(),
+		pvs:    m.Core.PersistentVolume(),
 	}
 
-	handler.models.OnChange(ctx, "kold-model-controller", handler.onChange)
-	handler.models.OnRemove(ctx, "kold-model-controller", handler.onRemove)
-	handler.jobs.OnChange(ctx, "kold-model-job-watch", handler.onRelatedJob)
-	handler.jobs.OnRemove(ctx, "kold-model-job-remove", handler.onRelatedJob)
+	handler.models.OnChange(ctx, "koldun-model-controller", handler.onChange)
+	handler.models.OnRemove(ctx, "koldun-model-controller", handler.onRemove)
+	handler.jobs.OnChange(ctx, "koldun-model-job-watch", handler.onRelatedJob)
+	handler.jobs.OnRemove(ctx, "koldun-model-job-remove", handler.onRelatedJob)
 	return nil
 }
 
@@ -89,6 +94,29 @@ func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
 }
 
 func (h *modelHandler) onRemove(key string, obj *v1.Model) (*v1.Model, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	// Delete PVC then PV created for this model (input and conversion buckets)
+	pvNames := []string{
+		fmt.Sprintf("%s-s3-pv", obj.Name),
+		fmt.Sprintf("%s-s3-output-pv", obj.Name),
+	}
+	pvcNames := []string{
+		fmt.Sprintf("%s-s3-pvc", obj.Name),
+		fmt.Sprintf("%s-s3-output-pvc", obj.Name),
+	}
+	// Best-effort deletion; ignore not found
+	for _, pvcName := range pvcNames {
+		if err := h.pvcs.Delete(obj.Namespace, pvcName, &metav1.DeleteOptions{PropagationPolicy: func() *metav1.DeletionPropagation { p := metav1.DeletePropagationBackground; return &p }()}); err != nil {
+			klog.V(2).Infof("delete PVC %s/%s: %v", obj.Namespace, pvcName, err)
+		}
+	}
+	for _, pvName := range pvNames {
+		if err := h.pvs.Delete(pvName, &metav1.DeleteOptions{PropagationPolicy: func() *metav1.DeletionPropagation { p := metav1.DeletePropagationBackground; return &p }()}); err != nil {
+			klog.V(2).Infof("delete PV %s: %v", pvName, err)
+		}
+	}
 	return obj, nil
 }
 
@@ -184,16 +212,21 @@ func (h *modelHandler) ensureMetadataConfigMap(obj *v1.Model) error {
 		},
 	}
 
-	if obj.Spec.CacheSpec != nil {
-		cm.Data["cacheEndpoint"] = obj.Spec.CacheSpec.Endpoint
-		cm.Data["cacheBucket"] = obj.Spec.CacheSpec.Bucket
-		if obj.Spec.CacheSpec.SecretRef != nil {
-			cm.Data["cacheSecret"] = obj.Spec.CacheSpec.SecretRef.Name
+	if storage := obj.Spec.ObjectStorage; storage != nil {
+		cm.Data["objectStorageEndpoint"] = storage.Endpoint
+		cm.Data["objectStorageBucketForSource"] = storage.BucketForSource
+		cm.Data["objectStorageBucketForConvert"] = storage.BucketForConvert
+		// Preserve legacy keys for backward compatibility with existing consumers.
+		cm.Data["cacheEndpoint"] = storage.Endpoint
+		cm.Data["cacheBucket"] = storage.BucketForSource
+		if storage.SecretRef != nil {
+			cm.Data["objectStorageSecret"] = storage.SecretRef.Name
+			cm.Data["cacheSecret"] = storage.SecretRef.Name
 		}
 	}
 
 	err := h.apply.WithOwner(obj).
-		WithSetID(fmt.Sprintf("kold-model-metadata-%s", obj.Name)).
+		WithSetID(fmt.Sprintf("koldun-model-metadata-%s", obj.Name)).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(obj.Namespace).
 		ApplyObjects(cm)
@@ -229,7 +262,7 @@ func (h *modelHandler) ensureScriptConfigMap(obj *v1.Model) error {
 	}
 
 	err := h.apply.WithOwner(obj).
-		WithSetID(fmt.Sprintf("kold-model-script-%s", obj.Name)).
+		WithSetID(fmt.Sprintf("koldun-model-script-%s", obj.Name)).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(obj.Namespace).
 		ApplyObjects(cm)
@@ -244,8 +277,9 @@ func (h *modelHandler) ensureScriptConfigMap(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
-	if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" || obj.Spec.SourceURL == "" {
-		klog.V(4).Infof("Model %s/%s: skipping download job creation - missing cache spec or source URL", obj.Namespace, obj.Name)
+	storage := obj.Spec.ObjectStorage
+	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
+		klog.V(4).Infof("Model %s/%s: skipping download job creation - missing objectStorage or source URL", obj.Namespace, obj.Name)
 		return nil
 	}
 
@@ -408,7 +442,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	backoffLimit := int32(10)
 	// Keep finished jobs/pods longer to inspect failures; default 5 minutes for Kind clusters
 	ttl := int32(300)
-	if v, ok := obj.Annotations["kold.gorizond.io/ttl-seconds"]; ok {
+	if v, ok := obj.Annotations["koldun.gorizond.io/ttl-seconds"]; ok {
 		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
 			ttl = int32(secs)
 		}
@@ -470,7 +504,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	// Ensure default service account can list secrets if needed.
 	klog.V(2).Infof("Model %s/%s: creating download job %s", obj.Namespace, obj.Name, jobName)
 	return h.apply.WithOwner(obj).
-		WithSetID(fmt.Sprintf("kold-model-job-%s", obj.Name)).
+		WithSetID(fmt.Sprintf("koldun-model-job-%s", obj.Name)).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(obj.Namespace).
 		ApplyObjects(job)
@@ -495,8 +529,13 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	if obj.Spec.Conversion == nil {
 		return nil
 	}
-	if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" {
-		klog.V(2).Infof("Model %s/%s: conversion requested but cacheSpec.bucket missing", obj.Namespace, obj.Name)
+	storage := obj.Spec.ObjectStorage
+	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" {
+		klog.V(2).Infof("Model %s/%s: conversion requested but objectStorage.bucketForSource missing", obj.Namespace, obj.Name)
+		return nil
+	}
+	if strings.TrimSpace(storage.BucketForConvert) == "" {
+		klog.V(2).Infof("Model %s/%s: conversion requested but objectStorage.bucketForConvert missing", obj.Namespace, obj.Name)
 		return nil
 	}
 	if !strings.EqualFold(obj.Status.DownloadState, "Succeeded") || obj.Status.ObservedGeneration != obj.Generation {
@@ -508,6 +547,11 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	spec := effectiveConversionSpec(obj.Spec.Conversion)
 	jobName := conversionJobName(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
+
+	if strings.EqualFold(obj.Status.ConversionState, "Succeeded") && obj.Status.ObservedGeneration == obj.Generation {
+		klog.V(2).Infof("Model %s/%s: conversion already succeeded for generation %s, skipping", obj.Namespace, obj.Name, expectedGeneration)
+		return nil
+	}
 
 	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
 		if existing.DeletionTimestamp != nil {
@@ -565,16 +609,266 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	if toolsImage == "" {
 		toolsImage = defaultToolsImage
 	}
-	// rclone image for FUSE mount
-	rcloneImage := spec.RcloneImage
-	if strings.TrimSpace(rcloneImage) == "" {
-		rcloneImage = defaultRcloneImage
-	}
 
 	backoffLimit := int32(5)
 	ttl := int32(300)
 
-	// Shared volumes
+	// S3 CSI: ensure static PV and PVC, then define volumes
+	s3Bucket := storage.BucketForSource
+	s3Prefix := strings.TrimLeft(inputKey, "/")
+	if b, k, ok := parseS3Path(obj.Spec.LocalPath); ok {
+		if strings.TrimSpace(b) != "" {
+			s3Bucket = b
+		}
+		if strings.TrimSpace(k) != "" {
+			s3Prefix = strings.TrimLeft(k, "/")
+		}
+	}
+	pvName := fmt.Sprintf("%s-s3-pv", obj.Name)
+	pvcName := fmt.Sprintf("%s-s3-pvc", obj.Name)
+	volHandle := fmt.Sprintf("%s/%s", s3Bucket, s3Prefix)
+	// Defaults; may be overridden by Model.Spec.PV
+	pvCapStr := "10Gi"
+	pvClass := "csi-s3"
+	pvAccess := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	pvReclaim := corev1.PersistentVolumeReclaimRetain
+	csiDriver := "ru.yandex.s3.csi"
+	volAttrs := map[string]string{}
+	if obj.Spec.PV != nil {
+		if strings.TrimSpace(obj.Spec.PV.Capacity) != "" {
+			pvCapStr = obj.Spec.PV.Capacity
+		}
+		if strings.TrimSpace(obj.Spec.PV.StorageClassName) != "" {
+			pvClass = obj.Spec.PV.StorageClassName
+		}
+		if strings.TrimSpace(obj.Spec.PV.ReclaimPolicy) != "" {
+			switch strings.ToLower(obj.Spec.PV.ReclaimPolicy) {
+			case "delete":
+				pvReclaim = corev1.PersistentVolumeReclaimDelete
+			case "recycle":
+				pvReclaim = corev1.PersistentVolumeReclaimRecycle
+			default:
+				pvReclaim = corev1.PersistentVolumeReclaimRetain
+			}
+		}
+		if strings.TrimSpace(obj.Spec.PV.CSIDriver) != "" {
+			csiDriver = obj.Spec.PV.CSIDriver
+		}
+		if obj.Spec.PV.AccessModes != nil && len(obj.Spec.PV.AccessModes) > 0 {
+			pvAccess = []corev1.PersistentVolumeAccessMode{}
+			for _, m := range obj.Spec.PV.AccessModes {
+				switch strings.ToLower(m) {
+				case "readwritemany":
+					pvAccess = append(pvAccess, corev1.ReadWriteMany)
+				case "readwriteonce":
+					pvAccess = append(pvAccess, corev1.ReadWriteOnce)
+				case "readonlymany":
+					pvAccess = append(pvAccess, corev1.ReadOnlyMany)
+				}
+			}
+			if len(pvAccess) == 0 {
+				pvAccess = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+			}
+		}
+		if obj.Spec.PV.VolumeAttributes != nil {
+			for k, v := range obj.Spec.PV.VolumeAttributes {
+				volAttrs[k] = v
+			}
+		}
+		if strings.TrimSpace(obj.Spec.PV.CSIMounter) != "" {
+			volAttrs["mounter"] = obj.Spec.PV.CSIMounter
+		}
+		if strings.TrimSpace(obj.Spec.PV.CSIOptions) != "" {
+			volAttrs["options"] = obj.Spec.PV.CSIOptions
+		}
+	}
+	pvCap := resource.MustParse(pvCapStr)
+	fsMode := corev1.PersistentVolumeFilesystem
+	pv := &corev1.PersistentVolume{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolume"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   pvName,
+			Labels: labels,
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:                      corev1.ResourceList{corev1.ResourceStorage: pvCap},
+			AccessModes:                   pvAccess,
+			PersistentVolumeReclaimPolicy: pvReclaim,
+			StorageClassName:              pvClass,
+			VolumeMode:                    &fsMode,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{
+					Driver:       csiDriver,
+					VolumeHandle: volHandle,
+					VolumeAttributes: func() map[string]string {
+						m := map[string]string{"bucket": s3Bucket, "prefix": s3Prefix, "capacity": pvCap.String()}
+						for k, v := range volAttrs {
+							m[k] = v
+						}
+						return m
+					}(),
+				},
+			},
+		},
+	}
+	// Default CSI secret refs: from Model.Spec.PV if set, otherwise csi-s3-secret/kube-system
+	secName := "csi-s3-secret"
+	secNs := "kube-system"
+	if obj.Spec.PV != nil {
+		if strings.TrimSpace(obj.Spec.PV.CSISecretName) != "" {
+			secName = obj.Spec.PV.CSISecretName
+		}
+		if strings.TrimSpace(obj.Spec.PV.CSISecretNamespace) != "" {
+			secNs = obj.Spec.PV.CSISecretNamespace
+		}
+	}
+	pv.Spec.PersistentVolumeSource.CSI.ControllerPublishSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+	pv.Spec.PersistentVolumeSource.CSI.NodePublishSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+	pv.Spec.PersistentVolumeSource.CSI.NodeStageSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+	// Pre-bind PV to PVC for static provisioning
+	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: obj.Namespace, Name: pvcName}
+	if err := h.apply.WithSetOwnerReference(false, false).WithSetID(fmt.Sprintf("kold-model-s3-pv-%s", obj.Name)).ApplyObjects(pv); err != nil {
+		return fmt.Errorf("failed to apply PV: %w", err)
+	}
+	reqCapStr := pvCapStr
+	if obj.Spec.PV != nil && strings.TrimSpace(obj.Spec.PV.PVCCapacity) != "" {
+		reqCapStr = obj.Spec.PV.PVCCapacity
+	}
+	reqCap := resource.MustParse(reqCapStr)
+	emptyClass := ""
+	if obj.Spec.PV != nil && strings.TrimSpace(obj.Spec.PV.PVCStorageClassName) != "" {
+		emptyClass = obj.Spec.PV.PVCStorageClassName
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pvcName,
+			Namespace: obj.Namespace,
+			Labels:    labels,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: func() []corev1.PersistentVolumeAccessMode {
+				if obj.Spec.PV != nil && len(obj.Spec.PV.PVCAccessModes) > 0 {
+					out := []corev1.PersistentVolumeAccessMode{}
+					for _, m := range obj.Spec.PV.PVCAccessModes {
+						switch strings.ToLower(m) {
+						case "readwritemany":
+							out = append(out, corev1.ReadWriteMany)
+						case "readwriteonce":
+							out = append(out, corev1.ReadWriteOnce)
+						case "readonlymany":
+							out = append(out, corev1.ReadOnlyMany)
+						}
+					}
+					if len(out) > 0 {
+						return out
+					}
+				}
+				return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+			}(),
+			VolumeName:       pvName,
+			StorageClassName: &emptyClass,
+			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: reqCap}},
+		},
+	}
+	if err := h.apply.WithOwner(obj).WithSetOwnerReference(true, false).WithDefaultNamespace(obj.Namespace).WithSetID(fmt.Sprintf("kold-model-s3-pvc-%s", obj.Name)).ApplyObjects(pvc); err != nil {
+		return fmt.Errorf("failed to apply PVC: %w", err)
+	}
+
+	outputPVCName := ""
+	outputMountPath := "/mnt/s3-output"
+	convPrefix := strings.TrimLeft(convKey, "/")
+	if convBucket != "" {
+		outputPVName := fmt.Sprintf("%s-s3-output-pv", obj.Name)
+		outputPVCName = fmt.Sprintf("%s-s3-output-pvc", obj.Name)
+		outputVolHandle := convBucket
+		if convPrefix != "" {
+			outputVolHandle = fmt.Sprintf("%s/%s", convBucket, convPrefix)
+		}
+		outputPV := &corev1.PersistentVolume{
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolume"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   outputPVName,
+				Labels: labels,
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				Capacity:                      corev1.ResourceList{corev1.ResourceStorage: pvCap},
+				AccessModes:                   pvAccess,
+				PersistentVolumeReclaimPolicy: pvReclaim,
+				StorageClassName:              pvClass,
+				VolumeMode:                    &fsMode,
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					CSI: &corev1.CSIPersistentVolumeSource{
+						Driver:       csiDriver,
+						VolumeHandle: outputVolHandle,
+						VolumeAttributes: func() map[string]string {
+							attrs := map[string]string{
+								"bucket":   convBucket,
+								"capacity": pvCap.String(),
+							}
+							if convPrefix != "" {
+								attrs["prefix"] = convPrefix
+							}
+							for k, v := range volAttrs {
+								if k == "bucket" || k == "prefix" {
+									continue
+								}
+								attrs[k] = v
+							}
+							return attrs
+						}(),
+					},
+				},
+			},
+		}
+		outputPV.Spec.PersistentVolumeSource.CSI.ControllerPublishSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+		outputPV.Spec.PersistentVolumeSource.CSI.NodePublishSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+		outputPV.Spec.PersistentVolumeSource.CSI.NodeStageSecretRef = &corev1.SecretReference{Name: secName, Namespace: secNs}
+		outputPV.Spec.ClaimRef = &corev1.ObjectReference{Namespace: obj.Namespace, Name: outputPVCName}
+		if err := h.apply.WithSetOwnerReference(false, false).WithSetID(fmt.Sprintf("kold-model-s3-output-pv-%s", obj.Name)).ApplyObjects(outputPV); err != nil {
+			return fmt.Errorf("failed to apply output PV: %w", err)
+		}
+
+		outputPVC := &corev1.PersistentVolumeClaim{
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "PersistentVolumeClaim"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      outputPVCName,
+				Namespace: obj.Namespace,
+				Labels:    labels,
+			},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: func() []corev1.PersistentVolumeAccessMode {
+					if obj.Spec.PV != nil && len(obj.Spec.PV.PVCAccessModes) > 0 {
+						out := []corev1.PersistentVolumeAccessMode{}
+						for _, m := range obj.Spec.PV.PVCAccessModes {
+							switch strings.ToLower(m) {
+							case "readwritemany":
+								out = append(out, corev1.ReadWriteMany)
+							case "readwriteonce":
+								out = append(out, corev1.ReadWriteOnce)
+							case "readonlymany":
+								out = append(out, corev1.ReadOnlyMany)
+							}
+						}
+						if len(out) > 0 {
+							return out
+						}
+					}
+					return []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+				}(),
+				VolumeName:       outputPVName,
+				StorageClassName: &emptyClass,
+				Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: reqCap}},
+			},
+		}
+		if err := h.apply.WithOwner(obj).WithSetOwnerReference(true, false).WithDefaultNamespace(obj.Namespace).WithSetID(fmt.Sprintf("kold-model-s3-output-pvc-%s", obj.Name)).ApplyObjects(outputPVC); err != nil {
+			return fmt.Errorf("failed to apply output PVC: %w", err)
+		}
+
+		// When using a dedicated output PVC, stage work directly on that mount
+		workDir = outputMountPath
+	}
+
 	volumes := []corev1.Volume{
 		{
 			Name: "workspace",
@@ -583,25 +877,25 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 			},
 		},
 		{
-			Name: "s3mnt",
+			Name: "s3",
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-		{
-			Name: "devfuse",
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{
-					Path: "/dev/fuse",
-					Type: func() *corev1.HostPathType { t := corev1.HostPathCharDev; return &t }(),
-				},
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
 			},
 		},
 	}
 
+	if outputPVCName != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "s3-output",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: outputPVCName},
+			},
+		})
+	}
+
 	workspaceMount := corev1.VolumeMount{Name: "workspace", MountPath: "/workspace"}
-	// If workDir is outside of /workspace, also mount the same volume at workDir
-	useAdditionalMount := !strings.HasPrefix(workDir, "/workspace")
+	// If workDir is outside of /workspace, also mount the same volume at workDir (only needed when not using dedicated output PVC)
+	useAdditionalMount := outputPVCName == "" && !strings.HasPrefix(workDir, "/workspace")
 	additionalMount := corev1.VolumeMount{Name: "workspace", MountPath: workDir}
 	mountsForWorkdir := []corev1.VolumeMount{workspaceMount}
 	if useAdditionalMount {
@@ -609,15 +903,16 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	}
 
 	// Init container: fetch converter scripts from GitHub
+	converterVersion := spec.ConverterVersion
 	fetchCmd := strings.Join([]string{
 		"set -euo pipefail",
 		"apk add --no-cache wget curl",
 		"mkdir -p /workspace/converter",
 		"cd /workspace/converter",
-		"wget -q -O convert-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/main/converter/convert-hf.py",
-		"wget -q -O writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/main/converter/writer.py",
-		"wget -q -O convert-tokenizer-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/main/converter/convert-tokenizer-hf.py",
-		"wget -q -O tokenizer-writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/main/converter/tokenizer-writer.py",
+		fmt.Sprintf("wget -q -O convert-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-hf.py", converterVersion),
+		fmt.Sprintf("wget -q -O writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/writer.py", converterVersion),
+		fmt.Sprintf("wget -q -O convert-tokenizer-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-tokenizer-hf.py", converterVersion),
+		fmt.Sprintf("wget -q -O tokenizer-writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/tokenizer-writer.py", converterVersion),
 	}, "\n")
 
 	fetchScripts := corev1.Container{
@@ -628,57 +923,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		VolumeMounts: mountsForWorkdir,
 	}
 
-	// Sidecar: mount S3 bucket via rclone mount (read-only)
-	rcloneArgs := []string{
-		"mount",
-		fmt.Sprintf(":s3,%s,%s:%s", "provider=Minio", "env_auth=true", obj.Spec.CacheSpec.Bucket),
-		"/mnt/s3",
-		"--read-only",
-		"--vfs-cache-mode=off",
-		"--dir-cache-time=1h",
-		"--no-modtime",
-		"--poll-interval=30m",
-		"--allow-other",
-		"--uid=1000",
-		"--gid=1000",
-	}
-	if ep := strings.TrimSpace(obj.Spec.CacheSpec.Endpoint); ep != "" {
-		rcloneArgs = append(rcloneArgs, "--s3-endpoint="+ep, "--s3-provider=Minio", "--s3-env-auth", "--s3-force-path-style")
-	} else {
-		rcloneArgs = append(rcloneArgs, "--s3-provider=AWS", "--s3-env-auth", "--s3-force-path-style")
-	}
-
-	rcloneContainer := corev1.Container{
-		Name:  "rclone",
-		Image: rcloneImage,
-		Args:  rcloneArgs,
-		Env: []corev1.EnvVar{
-			{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: pointer.Bool(true),
-			Capabilities:             &corev1.Capabilities{Add: []corev1.Capability{"SYS_ADMIN"}},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "s3mnt", MountPath: "/mnt/s3"},
-			{Name: "devfuse", MountPath: "/dev/fuse"},
-		},
-		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "fusermount -u /mnt/s3 || umount /mnt/s3 || true"}}},
-		},
-	}
-
-	if obj.Spec.CacheSpec.SecretRef != nil {
-		if obj.Spec.CacheSpec.SecretRef.Namespace == "" || obj.Spec.CacheSpec.SecretRef.Namespace == obj.Namespace {
-			envFrom := corev1.EnvFromSource{
-				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: obj.Spec.CacheSpec.SecretRef.Name},
-					Optional:             pointer.Bool(true),
-				},
-			}
-			rcloneContainer.EnvFrom = append(rcloneContainer.EnvFrom, envFrom)
-		}
-	}
+	// No mount propagation required for PVC
 
 	// Use S3 mounted path as working directory for reading inputs
 	s3WorkDir := filepath.Join("/mnt/s3", inputKey)
@@ -686,11 +931,21 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	if useAdditionalMount {
 		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, additionalMount)
 	}
-	// mount S3 to main container as read-only
-	mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3mnt", MountPath: "/mnt/s3", ReadOnly: true})
+	// mount S3 PVC into main with read-only access
+	mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3", MountPath: "/mnt/s3"})
+	if outputPVCName != "" {
+		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3-output", MountPath: "/mnt/s3-output"})
+		mainContainer.Env = append(mainContainer.Env,
+			corev1.EnvVar{Name: "CONVERSION_OUTPUT_PATH", Value: outputMountPath},
+			corev1.EnvVar{Name: "CONVERSION_OUTPUT_PREFIX", Value: convPrefix},
+		)
+	}
+	mainContainer.SecurityContext = &corev1.SecurityContext{}
 
 	// Optionally warm the workspace dir to ensure it exists
 	initContainers := []corev1.Container{fetchScripts}
+
+	// no rclone sidecar when using S3 CSI PVC
 
 	job := &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{
@@ -714,7 +969,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 				Spec: corev1.PodSpec{
 					RestartPolicy:  corev1.RestartPolicyNever,
 					InitContainers: initContainers,
-					Containers:     []corev1.Container{mainContainer, rcloneContainer},
+					Containers:     []corev1.Container{mainContainer},
 					Volumes:        volumes,
 				},
 			},
@@ -723,21 +978,29 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 
 	klog.V(1).Infof("Model %s/%s: creating conversion job %s", obj.Namespace, obj.Name, jobName)
 	return h.apply.WithOwner(obj).
-		WithSetID(fmt.Sprintf("kold-model-convert-%s", obj.Name)).
+		WithSetID(fmt.Sprintf("koldun-model-convert-%s", obj.Name)).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(obj.Namespace).
 		ApplyObjects(job)
 }
 
 func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDownloadSpec, sourceURL, objectKey, generation string) corev1.Container {
+	storage := model.Spec.ObjectStorage
+	sourceBucket := ""
+	cacheEndpoint := ""
+	if storage != nil {
+		sourceBucket = storage.BucketForSource
+		cacheEndpoint = storage.Endpoint
+	}
+
 	env := []corev1.EnvVar{
 		{Name: "MODEL_NAME", Value: model.Name},
-		{Name: "CACHE_BUCKET", Value: model.Spec.CacheSpec.Bucket},
+		{Name: "CACHE_BUCKET", Value: sourceBucket},
 		{Name: "CACHE_OBJECT_KEY", Value: objectKey},
 		{Name: "MODEL_GENERATION", Value: generation},
 	}
-	if model.Spec.CacheSpec.Endpoint != "" {
-		env = append(env, corev1.EnvVar{Name: "CACHE_ENDPOINT", Value: model.Spec.CacheSpec.Endpoint})
+	if strings.TrimSpace(cacheEndpoint) != "" {
+		env = append(env, corev1.EnvVar{Name: "CACHE_ENDPOINT", Value: cacheEndpoint})
 	}
 	env = append(env, corev1.EnvVar{Name: "AWS_S3_FORCE_PATH_STYLE", Value: "true"})
 
@@ -774,14 +1037,18 @@ func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDow
 		}
 	}
 
-	// Pass SOURCE_URL to container
+	// Pass SOURCE_URL and optional PIP proxy to container
 	env = append(env, corev1.EnvVar{Name: "SOURCE_URL", Value: sourceURL})
+	// Pass PIP_PROXY if set in spec
+	if strings.TrimSpace(model.Spec.PipProxy) != "" {
+		env = append(env, corev1.EnvVar{Name: "PIP_PROXY", Value: model.Spec.PipProxy})
+	}
 
-	if model.Spec.CacheSpec.SecretRef != nil {
-		if model.Spec.CacheSpec.SecretRef.Namespace == "" || model.Spec.CacheSpec.SecretRef.Namespace == model.Namespace {
+	if storage != nil && storage.SecretRef != nil {
+		if storage.SecretRef.Namespace == "" || storage.SecretRef.Namespace == model.Namespace {
 			envFrom := corev1.EnvFromSource{
 				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: model.Spec.CacheSpec.SecretRef.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: storage.SecretRef.Name},
 					Optional:             pointer.Bool(true),
 				},
 			}
@@ -836,28 +1103,34 @@ func (h *modelHandler) downloadArgs(model *v1.Model, spec *v1.ModelDownloadSpec,
 		return spec.Args
 	}
 
-	bucket := model.Spec.CacheSpec.Bucket
-	endpoint := model.Spec.CacheSpec.Endpoint
-
 	// Construct a script that:
 	// 1) installs huggingface_hub and boto3,
 	// 3) snapshots HF repo to /tmp/model, 4) uploads files directly to S3 via boto3
-	_ = bucket
-	_ = endpoint
 	_ = generation
 
-	cmd := "python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests\n" +
-		"python -u /opt/script/download.py\n"
-
-	return []string{cmd}
+	lines := []string{
+		"set -euo pipefail",
+		// Create pip.conf if PIP_PROXY set
+		"if [ -n \"${PIP_PROXY:-}\" ]; then mkdir -p ~/.pip; cat > ~/.pip/pip.conf <<CONF\n[global]\nproxy = ${PIP_PROXY}\nindex-url = https://pypi.org/simple/\n\n[install]\ndefault-timeout = 500\ntrusted-host = pypi.python.org\n               pypi.org\n               files.pythonhosted.org\nCONF\nfi",
+		"python -m pip install --no-cache-dir huggingface_hub boto3 botocore requests",
+		"python -u /opt/script/download.py",
+	}
+	return []string{strings.Join(lines, "\n")}
 }
 
 func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelConversionSpec, workDir, inputKey, outputBucket, outputKey, outputURI, weightsType, generation string) corev1.Container {
+	storage := model.Spec.ObjectStorage
+	sourceBucket := ""
+	cacheEndpoint := ""
+	if storage != nil {
+		sourceBucket = storage.BucketForSource
+		cacheEndpoint = storage.Endpoint
+	}
+
 	env := []corev1.EnvVar{
 		{Name: "MODEL_NAME", Value: model.Name},
-		{Name: "CACHE_BUCKET", Value: model.Spec.CacheSpec.Bucket},
+		{Name: "CACHE_BUCKET", Value: sourceBucket},
 		{Name: "CACHE_OBJECT_KEY", Value: inputKey},
-		{Name: "CACHE_ENDPOINT", Value: model.Spec.CacheSpec.Endpoint},
 		{Name: "CONVERSION_BUCKET", Value: outputBucket},
 		{Name: "CONVERSION_OBJECT_KEY", Value: outputKey},
 		{Name: "CONVERSION_OUTPUT_URI", Value: outputURI},
@@ -866,6 +1139,12 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 		{Name: "CONVERSION_WORK_DIR", Value: workDir},
 		{Name: "PYTHONPATH", Value: "/workspace/converter"},
 		{Name: "PYTHONUNBUFFERED", Value: "1"},
+	}
+	if strings.TrimSpace(cacheEndpoint) != "" {
+		env = append(env, corev1.EnvVar{Name: "CACHE_ENDPOINT", Value: cacheEndpoint})
+	}
+	if strings.TrimSpace(model.Spec.PipProxy) != "" {
+		env = append(env, corev1.EnvVar{Name: "PIP_PROXY", Value: model.Spec.PipProxy})
 	}
 
 	memoryQuantity := resource.MustParse("2Gi")
@@ -887,6 +1166,7 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 		Image:           image,
 		Command:         spec.Command,
 		Args:            spec.Args,
+		WorkingDir:      "/mnt/s3-output",
 		Env:             env,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Resources: corev1.ResourceRequirements{
@@ -907,11 +1187,11 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 		container.Args = h.conversionArgs(model, spec, model.Spec.SourceURL, inputKey, outputKey, weightsType)
 	}
 
-	if model.Spec.CacheSpec.SecretRef != nil {
-		if model.Spec.CacheSpec.SecretRef.Namespace == "" || model.Spec.CacheSpec.SecretRef.Namespace == model.Namespace {
+	if storage != nil && storage.SecretRef != nil {
+		if storage.SecretRef.Namespace == "" || storage.SecretRef.Namespace == model.Namespace {
 			container.EnvFrom = append(container.EnvFrom, corev1.EnvFromSource{
 				SecretRef: &corev1.SecretEnvSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: model.Spec.CacheSpec.SecretRef.Name},
+					LocalObjectReference: corev1.LocalObjectReference{Name: storage.SecretRef.Name},
 					Optional:             pointer.Bool(true),
 				},
 			})
@@ -932,15 +1212,13 @@ func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionS
 
 	cmdLines := []string{
 		"set -euo pipefail",
-		"cd /workspace",
+		// create pip.conf if proxy provided (PIP_PROXY comes from spec.pipProxy via envFrom later if needed)
+		"if [ -n \"${PIP_PROXY:-}\" ]; then mkdir -p ~/.pip; cat > ~/.pip/pip.conf <<CONF\n[global]\nproxy = ${PIP_PROXY}\nindex-url = https://pypi.org/simple/\n\n[install]\ndefault-timeout = 500\ntrusted-host = pypi.python.org\n               pypi.org\n               files.pythonhosted.org\nCONF\nfi",
+
 		"pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython",
-		"export MODEL_DIR=${CONVERSION_WORK_DIR}",
-		"export CONVERTER_DIR=/workspace/converter",
-		"cd ${CONVERTER_DIR}",
-		"python -u convert-hf.py ${MODEL_DIR} ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}",
-		"python -u convert-tokenizer-hf.py ${MODEL_DIR} ${MODEL_NAME}",
-		"cd /workspace",
-		"python -u <<'PY'\nimport os\nimport boto3\nfrom botocore.config import Config\n\nbucket = os.environ[\"CONVERSION_BUCKET\"]\nkey_prefix = os.environ.get(\"CONVERSION_OBJECT_KEY\", \"\").strip('/')\nendpoint = os.environ.get(\"CACHE_ENDPOINT\") or None\nmodel_name = os.environ[\"MODEL_NAME\"]\nweights = os.environ[\"CONVERSION_WEIGHTS_TYPE\"]\nout_model = f'dllama_model_{model_name}_{weights}.m'\nout_tokenizer = f'dllama_tokenizer_{model_name}.t'\nclient = boto3.client(\"s3\", endpoint_url=endpoint, config=Config(s3={\"addressing_style\": \"path\"}))\n\ndef upload(local, suffix):\n    if not os.path.exists(local):\n        raise FileNotFoundError(local)\n    key = f\"{key_prefix}/{os.path.basename(local)}\" if key_prefix else os.path.basename(local)\n    print(f\"[kold] uploading {local} to s3://{bucket}/{key}\")\n    client.upload_file(local, bucket, key)\n\nupload(out_model, \"model\")\nupload(out_tokenizer, \"tokenizer\")\nPY",
+
+		"python -u /workspace/converter/convert-hf.py /mnt/s3 ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}",
+		"python -u /workspace/converter/convert-tokenizer-hf.py /mnt/s3 ${MODEL_NAME}",
 	}
 
 	return []string{strings.Join(cmdLines, "\n")}
@@ -980,9 +1258,10 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	updated.Status.DownloadJobName = ""
 	updated.Status.ConversionJobName = ""
 
-	if obj.Spec.CacheSpec == nil || obj.Spec.CacheSpec.Bucket == "" || obj.Spec.SourceURL == "" {
+	storage := obj.Spec.ObjectStorage
+	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
 		downloadCond.Reason = "ConfigurationMissing"
-		downloadCond.Message = "Model requires sourceUrl and cacheSpec.bucket"
+		downloadCond.Message = "Model requires sourceUrl and objectStorage.bucketForSource"
 	} else {
 		if job, err := h.jobs.Cache().Get(obj.Namespace, downloadJobName); err == nil && job != nil {
 			updated.Status.DownloadJobName = job.Name
@@ -1169,6 +1448,9 @@ func effectiveConversionSpec(spec *v1.ModelConversionSpec) *v1.ModelConversionSp
 	if out.Memory == "" {
 		out.Memory = "2Gi"
 	}
+	if out.ConverterVersion == "" {
+		out.ConverterVersion = "v0.16.2"
+	}
 	return out
 }
 
@@ -1242,10 +1524,16 @@ func modelObjectKey(model *v1.Model) string {
 
 func conversionPaths(model *v1.Model, spec *v1.ModelConversionSpec, defaultInputKey string) (workDir string, bucket string, key string, uri string) {
 	workDir = "/workspace/hf"
-	bucket = model.Spec.CacheSpec.Bucket
-	key = strings.TrimLeft(path.Join(defaultInputKey, "converted", spec.WeightsFloatType), "/")
+	storage := model.Spec.ObjectStorage
+	if storage != nil {
+		bucket = strings.TrimSpace(storage.BucketForConvert)
+		if bucket == "" {
+			bucket = storage.BucketForSource
+		}
+	}
+	baseKey := strings.TrimLeft(path.Join(defaultInputKey, "converted", spec.WeightsFloatType), "/")
 	if spec.WeightsFloatType == "" {
-		key = strings.TrimLeft(path.Join(defaultInputKey, "converted", defaultWeightsType), "/")
+		baseKey = strings.TrimLeft(path.Join(defaultInputKey, "converted", defaultWeightsType), "/")
 	}
 
 	if strings.TrimSpace(spec.OutputPath) != "" {
@@ -1254,9 +1542,9 @@ func conversionPaths(model *v1.Model, spec *v1.ModelConversionSpec, defaultInput
 				bucket = b
 			}
 			if k != "" {
-				key = strings.TrimLeft(k, "/")
+				baseKey = strings.TrimLeft(k, "/")
 			} else {
-				key = ""
+				baseKey = ""
 			}
 		} else {
 			clean := spec.OutputPath
@@ -1267,12 +1555,20 @@ func conversionPaths(model *v1.Model, spec *v1.ModelConversionSpec, defaultInput
 		}
 	}
 
-	if key == "" {
-		key = strings.TrimLeft(path.Join(defaultInputKey, "converted"), "/")
+	key = strings.TrimLeft(baseKey, "/")
+	if key != "" {
+		key = strings.TrimLeft(path.Join(key, model.Name), "/")
+	} else {
+		key = strings.TrimLeft(path.Join(defaultInputKey, "converted", model.Name), "/")
 	}
 
-	uri = fmt.Sprintf("s3://%s/%s", bucket, strings.TrimLeft(key, "/"))
-	return workDir, bucket, strings.TrimLeft(key, "/"), uri
+	trimmedKey := strings.TrimLeft(key, "/")
+	if bucket != "" && trimmedKey != "" {
+		uri = fmt.Sprintf("s3://%s/%s", bucket, trimmedKey)
+	} else if bucket != "" {
+		uri = fmt.Sprintf("s3://%s", bucket)
+	}
+	return workDir, bucket, trimmedKey, uri
 }
 
 func splitKey(key string) (string, string) {

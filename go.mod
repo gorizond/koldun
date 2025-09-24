@@ -1,4 +1,4 @@
-module github.com/gorizond/kold
+module github.com/gorizond/koldun
 
 go 1.24.0
 

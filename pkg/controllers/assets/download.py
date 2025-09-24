@@ -27,19 +27,19 @@ if repo_id.startswith(hf_prefix):
     repo_id = repo_id[len(hf_prefix):]
 repo_id = repo_id.strip('/')
 
-print('[kold] starting download script')
-print(f"[kold] SOURCE_URL={repo_url}")
-print(f"[kold] repo_id={repo_id}")
-print(f"[kold] CACHE_BUCKET={bucket}")
-print(f"[kold] CACHE_OBJECT_KEY={prefix}")
-print(f"[kold] CACHE_ENDPOINT={endpoint}")
-print(f"[kold] HF_TOKEN={'set' if bool(token) else 'not set'}")
+print('[koldun] starting download script')
+print(f"[koldun] SOURCE_URL={repo_url}")
+print(f"[koldun] repo_id={repo_id}")
+print(f"[koldun] CACHE_BUCKET={bucket}")
+print(f"[koldun] CACHE_OBJECT_KEY={prefix}")
+print(f"[koldun] CACHE_ENDPOINT={endpoint}")
+print(f"[koldun] HF_TOKEN={'set' if bool(token) else 'not set'}")
 
 api = HfApi()
 files = api.list_repo_files(repo_id=repo_id, repo_type='model')
-print(f"[kold] files to fetch: {len(files)}")
+print(f"[koldun] files to fetch: {len(files)}")
 if not files:
-    print('[kold] no files returned by HF API, exiting')
+    print('[koldun] no files returned by HF API, exiting')
 
 session = boto3.session.Session()
 client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
@@ -55,7 +55,7 @@ chunk_cap = _safe_int(os.environ.get('CHUNK_MAX_MIB'), 64) * 1024 * 1024
 conc = max(1, _safe_int(os.environ.get('CONCURRENCY'), 1))
 per_worker_mem = max(1, mem_bytes // conc)
 chunk = max(8*1024*1024, min(chunk_cap, per_worker_mem // 8))
-print(f"[kold] memory_limit={mem_limit_str} ({mem_bytes} bytes), chunk_cap={chunk_cap}, chosen multipart_chunksize={chunk}, workers={conc}")
+print(f"[koldun] memory_limit={mem_limit_str} ({mem_bytes} bytes), chunk_cap={chunk_cap}, chosen multipart_chunksize={chunk}, workers={conc}")
 transfer_config = TransferConfig(
     multipart_threshold=chunk,
     multipart_chunksize=chunk,
@@ -122,7 +122,7 @@ class ProgressReader:
                     if self.total_bytes and self.total_bytes > 0:
                         percent = f" ({(self.bytes/self.total_bytes)*100:.1f}%)"
                     stalled = '' if delta_b > 0 else ' (stalled)'
-                    print(f"[kold] [{self.idx}/{self.total}] {self.path}: {_fmt_bytes(self.bytes)}{percent} at {_fmt_bytes(inst_speed)}/s avg {_fmt_bytes(avg_speed)}/s{stalled}")
+                    print(f"[koldun] [{self.idx}/{self.total}] {self.path}: {_fmt_bytes(self.bytes)}{percent} at {_fmt_bytes(inst_speed)}/s avg {_fmt_bytes(avg_speed)}/s{stalled}")
                     self.last_t = now
                     self.last_b = self.bytes
 
@@ -145,7 +145,7 @@ class ProgressReader:
                 percent = ''
                 if self.total_bytes and self.total_bytes > 0:
                     percent = f" ({(self.bytes/self.total_bytes)*100:.1f}%)"
-                print(f"[kold] [{self.idx}/{self.total}] {self.path}: {_fmt_bytes(self.bytes)}{percent} at {_fmt_bytes(speed)}/s avg {_fmt_bytes(total_speed)}/s (final)")
+                print(f"[koldun] [{self.idx}/{self.total}] {self.path}: {_fmt_bytes(self.bytes)}{percent} at {_fmt_bytes(speed)}/s avg {_fmt_bytes(total_speed)}/s (final)")
                 self._stop = True
         return chunk
 
@@ -176,7 +176,7 @@ def _get_s3_size(bucket, key):
         code = e.response.get('Error', {}).get('Code')
         if code in ('404', 'NoSuchKey', 'NotFound'):
             return None
-        print(f"[kold] head_object error for s3://{bucket}/{key}: {e}")
+        print(f"[koldun] head_object error for s3://{bucket}/{key}: {e}")
         return None
 
 def _process_one(idx, total, path):
@@ -187,27 +187,27 @@ def _process_one(idx, total, path):
         remote_size = _get_remote_size(url)
         existing_size = _get_s3_size(bucket, key)
         if remote_size and existing_size and remote_size == existing_size:
-            print(f"[kold] [{idx}/{total}] skip {path}: already exists with same size {_fmt_bytes(existing_size)}")
+            print(f"[koldun] [{idx}/{total}] skip {path}: already exists with same size {_fmt_bytes(existing_size)}")
             return None
-        print(f"[kold] [{idx}/{total}] GET {url}")
+        print(f"[koldun] [{idx}/{total}] GET {url}")
         with requests.get(url, headers=headers, stream=True) as r:
             r.raise_for_status()
             size = r.headers.get('Content-Length')
             ctype = r.headers.get('Content-Type')
-            print(f"[kold] [{idx}/{total}] status={r.status_code} content_length={size} content_type={ctype}")
+            print(f"[koldun] [{idx}/{total}] status={r.status_code} content_length={size} content_type={ctype}")
             r.raw.decode_content = True
             content_type = ctype or mimetypes.guess_type(path)[0]
             extra = {'ContentType': content_type} if content_type else None
-            print(f"[kold] [{idx}/{total}] uploading to s3://{bucket}/{key} extra={bool(extra)}")
+            print(f"[koldun] [{idx}/{total}] uploading to s3://{bucket}/{key} extra={bool(extra)}")
             src = ProgressReader(r.raw, idx, total, path, total_bytes=size, interval_sec=5)
             if extra:
                 client.upload_fileobj(src, bucket, key, ExtraArgs=extra, Config=transfer_config)
             else:
                 client.upload_fileobj(src, bucket, key, Config=transfer_config)
-            print(f"[kold] [{idx}/{total}] uploaded {path} -> s3://{bucket}/{key}")
+            print(f"[koldun] [{idx}/{total}] uploaded {path} -> s3://{bucket}/{key}")
         return None
     except Exception as e:
-        print(f"[kold] [{idx}/{total}] ERROR {path}: {e}")
+        print(f"[koldun] [{idx}/{total}] ERROR {path}: {e}")
         return e
 
 errors = []
@@ -219,7 +219,7 @@ with ThreadPoolExecutor(max_workers=conc) as pool:
         if err is not None:
             errors.append(err)
 if errors:
-    raise Exception(f"[kold] {len(errors)} parallel transfer(s) failed: {errors[:3]}")
-print('[kold] download script finished')
+    raise Exception(f"[koldun] {len(errors)} parallel transfer(s) failed: {errors[:3]}")
+print('[koldun] download script finished')
 
 

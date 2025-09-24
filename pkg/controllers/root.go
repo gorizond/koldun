@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	v1 "github.com/gorizond/kold/pkg/apis/kold.gorizond.io/v1"
+	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	appsv1 "k8s.io/api/apps/v1"
@@ -31,11 +31,11 @@ func registerRootController(ctx context.Context, m *Manager) error {
 		services:    m.Core.Service(),
 	}
 
-	handler.roots.OnChange(ctx, "kold-root-controller", handler.onChange)
-	handler.roots.OnRemove(ctx, "kold-root-controller", handler.onRemove)
+	handler.roots.OnChange(ctx, "koldun-root-controller", handler.onChange)
+	handler.roots.OnRemove(ctx, "koldun-root-controller", handler.onRemove)
 
-	handler.deployments.OnChange(ctx, "kold-root-deployment-watch", handler.onRelatedDeployment)
-	handler.services.OnChange(ctx, "kold-root-service-watch", handler.onRelatedService)
+	handler.deployments.OnChange(ctx, "koldun-root-deployment-watch", handler.onRelatedDeployment)
+	handler.services.OnChange(ctx, "koldun-root-service-watch", handler.onRelatedService)
 	return nil
 }
 
