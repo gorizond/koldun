@@ -4,8 +4,8 @@ Koldun (kubernetes operator for serverless distributed-llama) manages distribute
 
 ## Custom Resources
 
-- **Dllama** (`koldun.gorizond.io/v1`) — top-level orchestration resource that defines which model to run and the power-of-two fan-out for workers. The controller expands a `Dllama` into its component resources and aggregates status.
-- **Model** — tracks acquisition and caching of model artifacts. The controller creates a metadata `ConfigMap`, a `ConfigMap` with a Python downloader script, and a `Job` that installs `huggingface_hub`, `boto3`, `botocore`, `requests` then runs the script to stream artifacts from Hugging Face directly into your S3/MinIO bucket.
+- **Dllama** (`koldun.gorizond.io/v1`) — top-level orchestration resource that defines which model to run and the power-of-two fan-out for workers. The controller expands a `Dllama` into its component resources and aggregates status. Before spawning any `Worker` resources it checks that the referenced `Model` reports a non-empty `status.outputPVCName`, then materialises workers using the image from `spec.workerImage`.
+- **Model** — tracks acquisition and caching of model artifacts. The controller creates a metadata `ConfigMap`, a `ConfigMap` with a Python downloader script, and a `Job` that installs `huggingface_hub`, `boto3`, `botocore`, `requests` then runs the script to stream artifacts from Hugging Face directly into your S3/MinIO bucket. When conversion succeeds, an additional sizing job mounts the converted PVC, calculates its usage, and publishes the results to `status.conversionSizeBytes`/`status.conversionSizeHuman`.
 - **Root** — describes the distributed-llama root coordinator. The controller materialises the runtime as a `Deployment` and `Service` with Wrangler's Apply helpers.
 - **Worker** — models an individual distributed-llama worker slot. Each Worker manages a single-replica `Deployment` with slot specific configuration.
 
@@ -79,13 +79,32 @@ spec:
     huggingFaceTokenSecretRef:
       name: my-hf
   conversion:
-    weightsFloatType: q40
+    weightsFloatType: q80
     outputPath: s3://my-bucket-convert
     converterVersion: v0.16.2
     image: python:3.11
     toolsImage: alpine:3.18
     memory: "8Gi"
 ```
+
+Example `Dllama` referencing the converted model:
+
+```yaml
+apiVersion: koldun.gorizond.io/v1
+kind: Dllama
+metadata:
+  name: hf-convert-script-topology
+  namespace: default
+spec:
+  modelRef:
+    kind: Model
+    name: hf-convert-script
+  replicaPower: 2
+  rootImage: ghcr.io/gorizond/koldun:v0.0.1
+  workerImage: ghcr.io/gorizond/koldun:v0.0.1
+```
+
+With `replicaPower: 2` the controller waits until `Model/hf-convert-script` reports `status.outputPVCName` and then spawns the root plus `replicaPower*2-1 = 3` Workers all mounting the converted artifacts PVC.
 
 Expected Secret for S3/MinIO credentials (AWS SDK standard key names):
 

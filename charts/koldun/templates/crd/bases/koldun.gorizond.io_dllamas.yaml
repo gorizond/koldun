@@ -43,46 +43,32 @@ spec:
             description: DllamaSpec captures the desired state for a distributed-llama
               deployment.
             properties:
-              cacheSpec:
-                description: CacheSpec describes optional cache service configuration
-                  for model artifacts.
-                properties:
-                  bucket:
-                    description: Bucket is the object store bucket where models are
-                      stored.
-                    type: string
-                  endpoint:
-                    description: Endpoint is the URL of the cache backend (e.g. S3
-                      compatible object storage).
-                    type: string
-                  secretRef:
-                    description: SecretRef references a Secret containing credentials
-                      for the cache backend.
-                    properties:
-                      name:
-                        type: string
-                      namespace:
-                        type: string
-                    required:
-                    - name
-                    type: object
-                required:
-                - bucket
-                - endpoint
-                type: object
-              launchArgs:
-                description: LaunchArgs are appended to distributed-llama launch command
-                  for both root and workers.
-                items:
-                  type: string
-                type: array
               modelRef:
-                description: ModelRef references the model artifact that should be
-                  available on the cluster nodes.
-                type: string
+                description: ModelRef points to an existing Model resource that must
+                  be prepared before workers are created.
+                properties:
+                  apiGroup:
+                    description: APIGroup optionally overrides the default API group
+                      for the referenced Model resource.
+                    type: string
+                  kind:
+                    description: Kind must be set to "Model".
+                    type: string
+                  name:
+                    description: Name is the metadata.name of the referenced Model
+                      resource.
+                    type: string
+                  namespace:
+                    description: Namespace allows referencing a Model in another
+                      namespace. Defaults to the Dllama namespace when empty.
+                    type: string
+                required:
+                - kind
+                - name
+                type: object
               replicaPower:
-                description: ReplicaPower is the exponent that defines the worker
-                  fan-out (totalNodes = 2^ReplicaPower).
+                description: ReplicaPower controls how many Worker resources are spawned
+                  once the referenced model is ready.
                 format: int32
                 type: integer
               rootImage:

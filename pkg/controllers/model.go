@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/pointer"
 )
@@ -26,15 +28,16 @@ const (
 	defaultDownloadImage   = "python:3.11-alpine"
 	defaultConversionImage = "python:3.11-alpine"
 	defaultToolsImage      = "alpine:3.18"
-	defaultRcloneImage     = "rclone/rclone:1.67"
-	defaultGoofysImage     = "ghcr.io/kahing/goofys:latest"
 	defaultWeightsType     = "q40"
 
 	jobSuffixDownload = "-download"
 	jobSuffixConvert  = "-convert"
+	jobSuffixSize     = "-size"
 
 	// Annotation to track when a job was last deleted to prevent immediate recreation
 	annotationJobDeletedAt = "koldun.gorizond.io/job-deleted-at"
+	// annotationForceSizeRerun allows users to request re-running the sizing job
+	annotationForceSizeRerun = "koldun.gorizond.io/force-size-rerun"
 )
 
 type modelHandler struct {
@@ -44,6 +47,7 @@ type modelHandler struct {
 	jobs   generic.ControllerInterface[*batchv1.Job, *batchv1.JobList]
 	pvcs   corectlv1.PersistentVolumeClaimController
 	pvs    corectlv1.PersistentVolumeController
+	pods   corectlv1.PodController
 }
 
 func registerModelController(ctx context.Context, m *Manager) error {
@@ -54,6 +58,7 @@ func registerModelController(ctx context.Context, m *Manager) error {
 		jobs:   m.Batch.Job(),
 		pvcs:   m.Core.PersistentVolumeClaim(),
 		pvs:    m.Core.PersistentVolume(),
+		pods:   m.Core.Pod(),
 	}
 
 	handler.models.OnChange(ctx, "koldun-model-controller", handler.onChange)
@@ -87,6 +92,10 @@ func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
 	// Ensure conversion job after download logic. This will noop until download succeeds.
 	if err := h.ensureConversionJob(obj); err != nil {
 		klog.Errorf("Model %s/%s: failed to ensure conversion job: %v", obj.Namespace, obj.Name, err)
+		return obj, err
+	}
+	if err := h.ensureSizingJob(obj); err != nil {
+		klog.Errorf("Model %s/%s: failed to ensure sizing job: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
 
@@ -984,6 +993,179 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		ApplyObjects(job)
 }
 
+func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
+	if obj.Spec.Conversion == nil {
+		return nil
+	}
+	if !strings.EqualFold(obj.Status.ConversionState, "Succeeded") || obj.Status.ObservedGeneration != obj.Generation {
+		return nil
+	}
+
+	outputPVC := strings.TrimSpace(obj.Status.OutputPVCName)
+	if outputPVC == "" {
+		return nil
+	}
+
+	spec := effectiveConversionSpec(obj.Spec.Conversion)
+	toolsImage := spec.ToolsImage
+	if toolsImage == "" {
+		toolsImage = defaultToolsImage
+	}
+
+	jobName := sizeJobName(obj)
+	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
+	forceToken := strings.TrimSpace(obj.Annotations[annotationForceSizeRerun])
+	processedToken := strings.TrimSpace(obj.Status.ConversionSizeForceToken)
+
+	alreadySucceeded := obj.Status.ConversionSizeGeneration == obj.Generation &&
+		strings.EqualFold(obj.Status.ConversionSizeState, "Succeeded") &&
+		obj.Status.ConversionSizeJobName == jobName
+	if alreadySucceeded && (forceToken == "" || forceToken == processedToken) {
+		return nil
+	}
+
+	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
+		if existing.DeletionTimestamp != nil {
+			return nil
+		}
+
+		currentGen := existing.Annotations[annotationModelGeneration]
+		if currentGen == "" {
+			currentGen = existing.Labels[annotationModelGeneration]
+		}
+		jobForceToken := strings.TrimSpace(existing.Annotations[annotationForceSizeRerun])
+		finished := isJobFinished(existing)
+
+		if forceToken != "" && forceToken != jobForceToken {
+			propagation := metav1.DeletePropagationBackground
+			if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+				return fmt.Errorf("failed to delete sizing job for force rerun: %w", err)
+			}
+			return nil
+		}
+
+		if currentGen == expectedGeneration {
+			if !finished {
+				return nil
+			}
+
+			state := strings.ToLower(obj.Status.ConversionSizeState)
+			switch state {
+			case "succeeded":
+				if obj.Status.ConversionSizeGeneration == obj.Generation && (forceToken == "" || forceToken == processedToken) {
+					propagation := metav1.DeletePropagationBackground
+					if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+						return fmt.Errorf("failed to delete completed sizing job: %w", err)
+					}
+				}
+			case "failed":
+				propagation := metav1.DeletePropagationBackground
+				if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+					return fmt.Errorf("failed to delete failed sizing job: %w", err)
+				}
+			case "pending":
+				// Job finished but status has not yet picked up the termination message; leave the job
+				// in place so ensureStatus can read the measurement without thrashing the workload.
+			default:
+				// For other states, keep the job so Kubernetes can report updated status.
+			}
+			return nil
+		}
+
+		if finished {
+			propagation := metav1.DeletePropagationBackground
+			if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+				return fmt.Errorf("failed to delete outdated sizing job: %w", err)
+			}
+		}
+		return nil
+	}
+
+	labels := map[string]string{
+		labelComponent: componentModel,
+		labelModelName: obj.Name,
+	}
+	if dllama := labelValue(obj.Labels, labelDllamaName); dllama != "" {
+		labels[labelDllamaName] = dllama
+	}
+
+	annotations := map[string]string{annotationModelGeneration: expectedGeneration}
+	if forceToken != "" {
+		annotations[annotationForceSizeRerun] = forceToken
+	}
+
+	scriptLines := []string{
+		"set -euo pipefail",
+		"TARGET=${TARGET_DIR:-/mnt/output}",
+		"if [ ! -d \"${TARGET}\" ]; then",
+		"  printf '{\"bytes\":0,\"human\":\"0\"}\n' > /dev/termination-log",
+		"  echo 'Converted artifacts size: 0 (directory missing)'",
+		"  exit 0",
+		"fi",
+		"BYTES=$(du -sk \"${TARGET}\" | awk '{printf \"%d\", $1 * 1024}')",
+		"HUMAN=$(du -sh \"${TARGET}\" | awk '{print $1}')",
+		"printf '{\"bytes\":%s,\"human\":\"%s\"}\n' \"${BYTES}\" \"${HUMAN}\" > /dev/termination-log",
+		"echo \"Converted artifacts size: ${HUMAN} (${BYTES} bytes)\"",
+	}
+
+	command := []string{"/bin/sh", "-c"}
+	args := []string{strings.Join(scriptLines, "\n")}
+
+	volumeName := "output"
+	volume := corev1.Volume{
+		Name: volumeName,
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: outputPVC, ReadOnly: true},
+		},
+	}
+
+	container := corev1.Container{
+		Name:                     "measure-size",
+		Image:                    toolsImage,
+		Command:                  command,
+		Args:                     args,
+		Env:                      []corev1.EnvVar{{Name: "TARGET_DIR", Value: "/mnt/output"}},
+		VolumeMounts:             []corev1.VolumeMount{{Name: volumeName, MountPath: "/mnt/output", ReadOnly: true}},
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+	}
+
+	backoffLimit := int32(1)
+
+	job := &batchv1.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: batchv1.SchemeGroupVersion.String(),
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        jobName,
+			Namespace:   obj.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: batchv1.JobSpec{
+			BackoffLimit: &backoffLimit,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels:      labels,
+					Annotations: annotations,
+				},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{container},
+					Volumes:       []corev1.Volume{volume},
+				},
+			},
+		},
+	}
+
+	klog.V(1).Infof("Model %s/%s: creating sizing job %s", obj.Namespace, obj.Name, jobName)
+	return h.apply.WithOwner(obj).
+		WithSetID(fmt.Sprintf("koldun-model-size-%s", obj.Name)).
+		WithSetOwnerReference(true, false).
+		WithDefaultNamespace(obj.Namespace).
+		ApplyObjects(job)
+}
+
 func (h *modelHandler) buildDownloadContainer(model *v1.Model, spec *v1.ModelDownloadSpec, sourceURL, objectKey, generation string) corev1.Container {
 	storage := model.Spec.ObjectStorage
 	sourceBucket := ""
@@ -1242,6 +1424,12 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		Reason:  "ConversionNotRequested",
 		Message: "Model spec.conversion is not configured",
 	}
+	sizeCond := metav1.Condition{
+		Type:    conditionSized,
+		Status:  metav1.ConditionFalse,
+		Reason:  "SizingNotRequested",
+		Message: "Model conversion sizing is not configured",
+	}
 	readyCond := metav1.Condition{
 		Type:    conditionReady,
 		Status:  metav1.ConditionFalse,
@@ -1251,12 +1439,23 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 
 	downloadState := "Pending"
 	conversionState := "NotRequested"
+	sizeState := "NotRequested"
 
 	downloadJobName := jobNameForModel(obj)
 	conversionJobName := conversionJobName(obj)
+	sizeJobName := sizeJobName(obj)
 
 	updated.Status.DownloadJobName = ""
 	updated.Status.ConversionJobName = ""
+	updated.Status.ConversionSizeJobName = ""
+	updated.Status.ConversionSizeState = ""
+	updated.Status.ConversionSizeBytes = 0
+	updated.Status.ConversionSizeHuman = ""
+	updated.Status.ConversionSizeGeneration = 0
+	updated.Status.ConversionSizeForceToken = ""
+	updated.Status.OutputPVCName = ""
+
+	forceToken := strings.TrimSpace(obj.Annotations[annotationForceSizeRerun])
 
 	storage := obj.Spec.ObjectStorage
 	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
@@ -1332,6 +1531,97 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	}
 
 	updated.Status.ConversionState = conversionState
+	if obj.Spec.Conversion != nil && strings.EqualFold(conversionState, "Succeeded") {
+		updated.Status.OutputPVCName = fmt.Sprintf("%s-s3-output-pvc", obj.Name)
+	}
+
+	if obj.Spec.Conversion != nil {
+		if strings.EqualFold(conversionState, "Succeeded") {
+			sizeState = "Pending"
+			sizeCond.Reason = "SizingPending"
+			sizeCond.Message = "Sizing job pending"
+
+			if job, err := h.jobs.Cache().Get(obj.Namespace, sizeJobName); err == nil && job != nil {
+				updated.Status.ConversionSizeJobName = job.Name
+				sizeState, sizeCond = summarizeJob(job, conditionSized)
+
+				if strings.EqualFold(sizeState, "Succeeded") {
+					measurement, err := h.collectSizeMeasurement(obj.Namespace, job.Name)
+					if err != nil {
+						sizeCond.Status = metav1.ConditionFalse
+						sizeCond.Reason = "ResultCollectionFailed"
+						sizeCond.Message = fmt.Sprintf("Failed to read sizing result: %v", err)
+						sizeState = "Failed"
+					} else if measurement == nil {
+						sizeCond.Status = metav1.ConditionFalse
+						sizeCond.Reason = "ResultPending"
+						sizeCond.Message = "Sizing job completed; waiting for termination message"
+						sizeState = "Pending"
+					} else {
+						sizeCond.Status = metav1.ConditionTrue
+						sizeCond.Reason = "SizingSucceeded"
+						sizeCond.Message = fmt.Sprintf("Converted artifacts size: %s", measurement.Human)
+						updated.Status.ConversionSizeBytes = measurement.Bytes
+						updated.Status.ConversionSizeHuman = measurement.Human
+						updated.Status.ConversionSizeGeneration = obj.Generation
+						updated.Status.ConversionSizeForceToken = forceToken
+					}
+				}
+			} else {
+				prevGenMatch := obj.Status.ConversionSizeGeneration == obj.Generation
+				switch strings.ToLower(obj.Status.ConversionSizeState) {
+				case "succeeded":
+					if prevGenMatch {
+						sizeCond.Status = metav1.ConditionTrue
+						sizeCond.Reason = "SizingSucceeded"
+						sizeCond.Message = fmt.Sprintf("Converted artifacts size: %s", obj.Status.ConversionSizeHuman)
+						sizeState = "Succeeded"
+						updated.Status.ConversionSizeBytes = obj.Status.ConversionSizeBytes
+						updated.Status.ConversionSizeHuman = obj.Status.ConversionSizeHuman
+						updated.Status.ConversionSizeGeneration = obj.Status.ConversionSizeGeneration
+						updated.Status.ConversionSizeJobName = obj.Status.ConversionSizeJobName
+						updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
+					} else {
+						sizeCond.Reason = "SizingPending"
+						sizeCond.Message = "Waiting for sizing job to appear"
+						sizeState = "Pending"
+					}
+				case "failed":
+					if prevGenMatch {
+						sizeCond.Status = metav1.ConditionFalse
+						sizeCond.Reason = "SizingFailed"
+						sizeCond.Message = "Sizing job failed"
+						sizeState = "Failed"
+						updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
+					} else {
+						sizeCond.Reason = "SizingPending"
+						sizeCond.Message = "Waiting for sizing job to appear"
+						sizeState = "Pending"
+					}
+				default:
+					sizeCond.Reason = "SizingPending"
+					sizeCond.Message = "Waiting for sizing job to appear"
+					sizeState = "Pending"
+				}
+			}
+		} else if strings.EqualFold(conversionState, "Failed") {
+			sizeCond.Status = metav1.ConditionFalse
+			sizeCond.Reason = "ConversionNotSucceeded"
+			sizeCond.Message = "Conversion must succeed before sizing"
+			sizeState = "NotRequested"
+		} else {
+			sizeCond.Status = metav1.ConditionFalse
+			sizeCond.Reason = "WaitingForConversion"
+			sizeCond.Message = "Sizing waits until conversion succeeds"
+			sizeState = "Pending"
+		}
+	} else {
+		sizeCond.Status = metav1.ConditionFalse
+		sizeCond.Reason = "SizingNotRequested"
+		sizeCond.Message = "Model conversion sizing is not configured"
+	}
+
+	updated.Status.ConversionSizeState = sizeState
 
 	if obj.Spec.Conversion != nil {
 		if downloadCond.Status == metav1.ConditionTrue && conversionCond.Status == metav1.ConditionTrue {
@@ -1368,6 +1658,11 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 			changed = true
 		}
 	}
+	if obj.Spec.Conversion != nil || hasCondition(updated.Status.Conditions, conditionSized) {
+		if setCondition(&updated.Status.Conditions, sizeCond) {
+			changed = true
+		}
+	}
 	if setCondition(&updated.Status.Conditions, readyCond) {
 		changed = true
 	}
@@ -1380,6 +1675,17 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		changed = true
 	}
 	if obj.Status.ConversionJobName != updated.Status.ConversionJobName || obj.Status.ConversionState != updated.Status.ConversionState {
+		changed = true
+	}
+	if obj.Status.ConversionSizeJobName != updated.Status.ConversionSizeJobName ||
+		obj.Status.ConversionSizeState != updated.Status.ConversionSizeState ||
+		obj.Status.ConversionSizeBytes != updated.Status.ConversionSizeBytes ||
+		obj.Status.ConversionSizeHuman != updated.Status.ConversionSizeHuman ||
+		obj.Status.ConversionSizeGeneration != updated.Status.ConversionSizeGeneration ||
+		obj.Status.ConversionSizeForceToken != updated.Status.ConversionSizeForceToken {
+		changed = true
+	}
+	if obj.Status.OutputPVCName != updated.Status.OutputPVCName {
 		changed = true
 	}
 
@@ -1462,6 +1768,10 @@ func conversionJobName(model *v1.Model) string {
 	return truncateName(model.Name+jobSuffixConvert, 63)
 }
 
+func sizeJobName(model *v1.Model) string {
+	return truncateName(model.Name+jobSuffixSize, 63)
+}
+
 func summarizeJob(job *batchv1.Job, condType string) (string, metav1.Condition) {
 	cond := metav1.Condition{
 		Type:    condType,
@@ -1470,6 +1780,16 @@ func summarizeJob(job *batchv1.Job, condType string) (string, metav1.Condition) 
 		Message: "Job is pending",
 	}
 	state := "Pending"
+
+	successMessage := "Job completed successfully"
+	switch condType {
+	case conditionDownloaded:
+		successMessage = "Model download completed"
+	case conditionConverted:
+		successMessage = "Conversion job completed"
+	case conditionSized:
+		successMessage = "Sizing job completed"
+	}
 
 	for _, jc := range job.Status.Conditions {
 		if jc.Type == batchv1.JobFailed && jc.Status == corev1.ConditionTrue {
@@ -1482,7 +1802,7 @@ func summarizeJob(job *batchv1.Job, condType string) (string, metav1.Condition) 
 		if jc.Type == batchv1.JobComplete && jc.Status == corev1.ConditionTrue {
 			cond.Status = metav1.ConditionTrue
 			cond.Reason = "JobSucceeded"
-			cond.Message = "Model download completed"
+			cond.Message = successMessage
 			state = "Succeeded"
 			return state, cond
 		}
@@ -1497,7 +1817,7 @@ func summarizeJob(job *batchv1.Job, condType string) (string, metav1.Condition) 
 	if job.Status.Succeeded > 0 {
 		cond.Status = metav1.ConditionTrue
 		cond.Reason = "JobSucceeded"
-		cond.Message = "Job completed successfully"
+		cond.Message = successMessage
 		state = "Succeeded"
 		return state, cond
 	}
@@ -1509,6 +1829,35 @@ func summarizeJob(job *batchv1.Job, condType string) (string, metav1.Condition) 
 	}
 
 	return state, cond
+}
+
+type sizeMeasurement struct {
+	Bytes int64  `json:"bytes"`
+	Human string `json:"human"`
+}
+
+func (h *modelHandler) collectSizeMeasurement(namespace, jobName string) (*sizeMeasurement, error) {
+	selector := labels.SelectorFromSet(map[string]string{"job-name": jobName})
+	pods, err := h.pods.Cache().List(namespace, selector)
+	if err != nil {
+		return nil, err
+	}
+	for _, pod := range pods {
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.State.Terminated != nil && strings.TrimSpace(status.State.Terminated.Message) != "" {
+				return parseSizeMeasurement(status.State.Terminated.Message)
+			}
+		}
+	}
+	return nil, nil
+}
+
+func parseSizeMeasurement(payload string) (*sizeMeasurement, error) {
+	var result sizeMeasurement
+	if err := json.Unmarshal([]byte(payload), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 func modelObjectKey(model *v1.Model) string {

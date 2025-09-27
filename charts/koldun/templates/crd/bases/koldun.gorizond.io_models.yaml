@@ -232,6 +232,29 @@ spec:
               conversionState:
                 description: ConversionState mirrors DownloadState for the conversion pipeline.
                 type: string
+              conversionSizeJobName:
+                description: ConversionSizeJobName references the sizing Job that inspects converted artifacts.
+                type: string
+              conversionSizeState:
+                description: ConversionSizeState tracks the state of the sizing job (Pending, Running, Succeeded, Failed).
+                type: string
+              conversionSizeBytes:
+                description: ConversionSizeBytes stores the total size in bytes of converted artifacts measured from the output PVC.
+                format: int64
+                type: integer
+              conversionSizeHuman:
+                description: ConversionSizeHuman stores a human-readable representation of the converted artifact size (e.g. 1.2G).
+                type: string
+              conversionSizeGeneration:
+                description: ConversionSizeGeneration records the Model generation for which the size measurement was produced.
+                format: int64
+                type: integer
+              conversionSizeForceToken:
+                description: ConversionSizeForceToken mirrors the annotation used to force a sizing rerun that produced the recorded measurement.
+                type: string
+              outputPVCName:
+                description: OutputPVCName is the PersistentVolumeClaim that stores converted artifacts.
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

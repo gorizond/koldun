@@ -61,6 +61,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			core.Service(),
 			core.PersistentVolume(),
 			core.PersistentVolumeClaim(),
+			core.Pod(),
 		)
 
 	return &Manager{

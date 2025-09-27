@@ -54,18 +54,26 @@ type Dllama struct {
 
 // DllamaSpec captures the desired state for a distributed-llama deployment.
 type DllamaSpec struct {
-	// ModelRef references the model artifact that should be available on the cluster nodes.
-	ModelRef string `json:"modelRef"`
-	// ReplicaPower is the exponent that defines the worker fan-out (totalNodes = 2^ReplicaPower).
+	// ModelRef points to an existing Model resource that must be prepared before workers are created.
+	ModelRef ModelReference `json:"modelRef"`
+	// ReplicaPower controls how many Worker resources are spawned once the referenced model is ready.
 	ReplicaPower int32 `json:"replicaPower"`
 	// RootImage is the container image used for the root coordinator process.
 	RootImage string `json:"rootImage"`
 	// WorkerImage is the container image used for the worker processes.
 	WorkerImage string `json:"workerImage"`
-	// LaunchArgs are appended to distributed-llama launch command for both root and workers.
-	LaunchArgs []string `json:"launchArgs,omitempty"`
-	// CacheSpec describes optional cache service configuration for model artifacts.
-	CacheSpec *CacheSpec `json:"cacheSpec,omitempty"`
+}
+
+// ModelReference identifies a Model custom resource that should be used by this Dllama deployment.
+type ModelReference struct {
+	// APIGroup optionally overrides the default API group for the referenced Model resource.
+	APIGroup string `json:"apiGroup,omitempty"`
+	// Kind must be set to "Model".
+	Kind string `json:"kind"`
+	// Name is the metadata.name of the referenced Model resource.
+	Name string `json:"name"`
+	// Namespace allows referencing a Model in another namespace. Defaults to the Dllama namespace when empty.
+	Namespace string `json:"namespace,omitempty"`
 }
 
 // CacheSpec contains information about the shared cache used to store model weights.
@@ -152,6 +160,20 @@ type ModelStatus struct {
 	ConversionJobName string `json:"conversionJobName,omitempty"`
 	// ConversionState mirrors DownloadState for the conversion pipeline.
 	ConversionState string `json:"conversionState,omitempty"`
+	// ConversionSizeJobName references the sizing Job that inspects converted artifacts.
+	ConversionSizeJobName string `json:"conversionSizeJobName,omitempty"`
+	// ConversionSizeState tracks the state of the sizing job (Pending, Running, Succeeded, Failed).
+	ConversionSizeState string `json:"conversionSizeState,omitempty"`
+	// ConversionSizeBytes stores the total size in bytes of converted artifacts measured from the output PVC.
+	ConversionSizeBytes int64 `json:"conversionSizeBytes,omitempty"`
+	// ConversionSizeHuman stores a human-readable representation of the converted artifact size (e.g. 1.2G).
+	ConversionSizeHuman string `json:"conversionSizeHuman,omitempty"`
+	// ConversionSizeGeneration records the Model generation for which the size measurement was produced.
+	ConversionSizeGeneration int64 `json:"conversionSizeGeneration,omitempty"`
+	// ConversionSizeForceToken mirrors the annotation used to force a sizing rerun that produced the recorded measurement.
+	ConversionSizeForceToken string `json:"conversionSizeForceToken,omitempty"`
+	// OutputPVCName is the PersistentVolumeClaim that stores converted artifacts.
+	OutputPVCName string `json:"outputPVCName,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -299,14 +321,6 @@ func (in *DllamaSpec) DeepCopy() DllamaSpec {
 		return DllamaSpec{}
 	}
 	out := *in
-	if in.LaunchArgs != nil {
-		out.LaunchArgs = make([]string, len(in.LaunchArgs))
-		copy(out.LaunchArgs, in.LaunchArgs)
-	}
-	if in.CacheSpec != nil {
-		cacheCopy := *in.CacheSpec.DeepCopy()
-		out.CacheSpec = &cacheCopy
-	}
 	return out
 }
 

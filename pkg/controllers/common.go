@@ -20,6 +20,7 @@ const (
 	conditionReady      = "Ready"
 	conditionDownloaded = "Downloaded"
 	conditionConverted  = "Converted"
+	conditionSized      = "Sized"
 
 	annotationModelGeneration = "koldun.gorizond.io/model-generation"
 )
