@@ -4,7 +4,7 @@ ARG DL_VERSION=v0.16.2
 FROM alpine:latest AS dllama-builder
 ARG DL_REPOSITORY
 ARG DL_VERSION
-RUN apk add --no-cache git make go build-base bash
+RUN apk add --no-cache git make build-base
 WORKDIR /src
 RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
 RUN make dllama && make dllama-api && \

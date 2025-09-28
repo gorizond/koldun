@@ -5,15 +5,18 @@ import (
 )
 
 const (
-	labelDllamaName = "koldun.gorizond.io/dllama"
-	labelComponent  = "koldun.gorizond.io/component"
-	labelRootName   = "koldun.gorizond.io/root"
-	labelWorkerName = "koldun.gorizond.io/worker"
-	labelModelName  = "koldun.gorizond.io/model"
+	labelDllamaName       = "koldun.gorizond.io/dllama"
+	labelComponent        = "koldun.gorizond.io/component"
+	labelRootName         = "koldun.gorizond.io/root"
+	labelWorkerName       = "koldun.gorizond.io/worker"
+	labelModelName        = "koldun.gorizond.io/model"
+	labelConversationHash = "koldun.gorizond.io/hash"
+	labelBackendName      = "koldun.gorizond.io/backend"
 
-	componentModel  = "model"
-	componentRoot   = "root"
-	componentWorker = "worker"
+	componentModel   = "model"
+	componentRoot    = "root"
+	componentWorker  = "worker"
+	componentBackend = "backend"
 
 	annotationSlotKey = "koldun.gorizond.io/slot"
 

@@ -3,32 +3,43 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
 )
 
 type rootHandler struct {
-	ctx         context.Context
-	apply       apply.Apply
-	roots       generic.ControllerInterface[*v1.Root, *v1.RootList]
-	deployments generic.ControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList]
-	services    generic.ControllerInterface[*corev1.Service, *corev1.ServiceList]
+	ctx          context.Context
+	apply        apply.Apply
+	dllamas      generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
+	models       generic.ControllerInterface[*v1.Model, *v1.ModelList]
+	roots        generic.ControllerInterface[*v1.Root, *v1.RootList]
+	deployments  generic.ControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList]
+	services     generic.ControllerInterface[*corev1.Service, *corev1.ServiceList]
+	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
+	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
 }
 
 func registerRootController(ctx context.Context, m *Manager) error {
 	handler := &rootHandler{
-		ctx:         ctx,
-		apply:       m.Apply(ctx),
-		roots:       m.Kold.Root(),
-		deployments: m.Apps.Deployment(),
-		services:    m.Core.Service(),
+		ctx:          ctx,
+		apply:        m.Apply(ctx),
+		dllamas:      m.Kold.Dllama(),
+		models:       m.Kold.Model(),
+		roots:        m.Kold.Root(),
+		deployments:  m.Apps.Deployment(),
+		services:     m.Core.Service(),
+		statefulsets: m.Apps.StatefulSet(),
+		workers:      m.Kold.Worker(),
 	}
 
 	handler.roots.OnChange(ctx, "koldun-root-controller", handler.onChange)
@@ -36,6 +47,13 @@ func registerRootController(ctx context.Context, m *Manager) error {
 
 	handler.deployments.OnChange(ctx, "koldun-root-deployment-watch", handler.onRelatedDeployment)
 	handler.services.OnChange(ctx, "koldun-root-service-watch", handler.onRelatedService)
+	handler.statefulsets.OnChange(ctx, "koldun-root-statefulset-watch", handler.onRelatedStatefulSet)
+	handler.statefulsets.OnRemove(ctx, "koldun-root-statefulset-remove", handler.onRelatedStatefulSet)
+	handler.workers.OnChange(ctx, "koldun-root-worker-watch", handler.onRelatedWorker)
+	handler.workers.OnRemove(ctx, "koldun-root-worker-remove", handler.onRelatedWorker)
+	handler.dllamas.OnChange(ctx, "koldun-root-dllama-watch", handler.onRelatedDllama)
+	handler.dllamas.OnRemove(ctx, "koldun-root-dllama-remove", handler.onRelatedDllama)
+	handler.models.OnChange(ctx, "koldun-root-model-watch", handler.onRelatedModel)
 	return nil
 }
 
@@ -91,7 +109,88 @@ func (h *rootHandler) onRelatedService(key string, obj *corev1.Service) (*corev1
 	return obj, nil
 }
 
+func (h *rootHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	if obj.Labels[labelComponent] != componentWorker {
+		return obj, nil
+	}
+	dllamaName := labelValue(obj.Labels, labelDllamaName)
+	if dllamaName == "" {
+		return obj, nil
+	}
+	h.roots.Enqueue(obj.Namespace, fmt.Sprintf("%s-root", dllamaName))
+	return obj, nil
+}
+
+func (h *rootHandler) onRelatedWorker(key string, obj *v1.Worker) (*v1.Worker, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	rootName := strings.TrimSpace(obj.Spec.RootRef)
+	if rootName == "" {
+		if dllama := labelValue(obj.Labels, labelDllamaName); dllama != "" {
+			rootName = fmt.Sprintf("%s-root", dllama)
+		}
+	}
+	if rootName == "" {
+		return obj, nil
+	}
+	h.roots.Enqueue(obj.Namespace, rootName)
+	return obj, nil
+}
+
 func (h *rootHandler) ensureDeployment(root *v1.Root) error {
+	allWorkersReady, _, workerEndpoints, err := h.workerStatus(root)
+	if err != nil {
+		return err
+	}
+	if !allWorkersReady {
+		return nil
+	}
+
+	dllama, err := h.resolveDllama(root)
+	if err != nil {
+		return err
+	}
+	model, err := h.resolveModel(dllama)
+	if err != nil {
+		return err
+	}
+
+	weightsFloatType := ""
+	if model.Spec.Conversion != nil {
+		weightsFloatType = strings.TrimSpace(model.Spec.Conversion.WeightsFloatType)
+	}
+	if weightsFloatType == "" {
+		return fmt.Errorf("model %s/%s conversion.weightsFloatType is required", model.Namespace, model.Name)
+	}
+
+	threads := dllama.Spec.ReplicaPower * 2
+	if threads <= 0 {
+		threads = 2
+	}
+
+	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, weightsFloatType)
+	tokenizerFile := fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
+
+	if strings.TrimSpace(root.Spec.ModelRef) == "" {
+		return fmt.Errorf("root %s/%s missing spec.modelRef", root.Namespace, root.Name)
+	}
+
+	labels := map[string]string{
+		labelComponent:        componentRoot,
+		labelRootName:         root.Name,
+		labelConversationHash: labelValue(root.Labels, labelConversationHash),
+	}
+	if dllamaName := labelValue(root.Labels, labelDllamaName); dllamaName != "" {
+		labels[labelDllamaName] = dllamaName
+	}
+
+	rootContainer := h.rootContainer(root, modelFile, tokenizerFile, weightsFloatType, threads, workerEndpoints)
+	llmContainer := h.llmSidecarContainer(root)
+
 	dep := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: appsv1.SchemeGroupVersion.String(),
@@ -100,30 +199,26 @@ func (h *rootHandler) ensureDeployment(root *v1.Root) error {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      root.Name,
 			Namespace: root.Namespace,
-			Labels: map[string]string{
-				labelComponent: componentRoot,
-				labelRootName:  root.Name,
-			},
+			Labels:    labels,
 		},
-	}
-
-	labels := map[string]string{
-		labelComponent: componentRoot,
-		labelRootName:  root.Name,
-	}
-	if dllamaName := labelValue(root.Labels, labelDllamaName); dllamaName != "" {
-		dep.ObjectMeta.Labels[labelDllamaName] = dllamaName
-		labels[labelDllamaName] = dllamaName
-	}
-
-	dep.Spec = appsv1.DeploymentSpec{
-		Replicas: pointer.Int32(1),
-		Selector: &metav1.LabelSelector{MatchLabels: labels},
-		Template: corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{Labels: labels},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{
-					h.rootContainer(root),
+		Spec: appsv1.DeploymentSpec{
+			Replicas: pointer.Int32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					Volumes: []corev1.Volume{
+						{
+							Name: "model-output",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: root.Spec.ModelRef, ReadOnly: true},
+							},
+						},
+					},
+					Containers: []corev1.Container{
+						rootContainer,
+						llmContainer,
+					},
 				},
 			},
 		},
@@ -132,6 +227,7 @@ func (h *rootHandler) ensureDeployment(root *v1.Root) error {
 	return h.apply.WithOwner(root).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(root.Namespace).
+		WithSetID(fmt.Sprintf("root-%s-deployment", root.Name)).
 		ApplyObjects(dep)
 }
 
@@ -145,8 +241,9 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 			Name:      root.Name,
 			Namespace: root.Namespace,
 			Labels: map[string]string{
-				labelComponent: componentRoot,
-				labelRootName:  root.Name,
+				labelComponent:        componentRoot,
+				labelRootName:         root.Name,
+				labelConversationHash: labelValue(root.Labels, labelConversationHash),
 			},
 		},
 		Spec: corev1.ServiceSpec{
@@ -156,9 +253,9 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 			},
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "http",
-					Port:       8080,
-					TargetPort: intstr.FromInt(8080),
+					Name:       "tcp",
+					Port:       9999,
+					TargetPort: intstr.FromInt(9999),
 				},
 			},
 		},
@@ -172,13 +269,63 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 	return h.apply.WithOwner(root).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(root.Namespace).
+		WithSetID(fmt.Sprintf("root-%s-service", root.Name)).
 		ApplyObjects(svc)
 }
 
-func (h *rootHandler) rootContainer(root *v1.Root) corev1.Container {
-	args := []string{"--role", "root"}
-	if root.Spec.ModelRef != "" {
-		args = append(args, "--model", root.Spec.ModelRef)
+func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int32, endpoints []string, err error) {
+	if root == nil {
+		return false, 0, nil, nil
+	}
+	if len(root.Spec.WorkerSelector) == 0 {
+		return false, 0, nil, nil
+	}
+
+	dllama, err := h.resolveDllama(root)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, 0, nil, nil
+		}
+		return false, 0, nil, err
+	}
+
+	replicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
+	if replicas <= 0 {
+		replicas = 1
+	}
+
+	workerName := fmt.Sprintf("%s-workers", dllama.Name)
+	worker, err := h.workers.Cache().Get(root.Namespace, workerName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, 0, nil, nil
+		}
+		return false, 0, nil, err
+	}
+
+	endpoints = make([]string, 0, replicas)
+	for i := int32(0); i < replicas; i++ {
+		endpoints = append(endpoints, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:9999", worker.Name, i, worker.Name, worker.Namespace))
+	}
+
+	sts, err := h.statefulsets.Cache().Get(worker.Namespace, worker.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, 0, endpoints, nil
+		}
+		return false, 0, nil, err
+	}
+
+	readyCount = sts.Status.ReadyReplicas
+	allReady = readyCount >= replicas
+	return allReady, readyCount, endpoints, nil
+}
+
+func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string) corev1.Container {
+	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", weightsFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
+	if len(workers) > 0 {
+		args = append(args, "--workers")
+		args = append(args, workers...)
 	}
 	if len(root.Spec.Args) > 0 {
 		args = append(args, root.Spec.Args...)
@@ -207,13 +354,139 @@ func (h *rootHandler) rootContainer(root *v1.Root) corev1.Container {
 		}
 	}
 
-	return corev1.Container{
-		Name:  "root",
-		Image: root.Spec.Image,
-		Args:  args,
-		Env:   env,
-		Ports: []corev1.ContainerPort{{ContainerPort: 8080}},
+	if root.Spec.NATS != nil {
+		env = append(env, corev1.EnvVar{Name: "NATS_URL", Value: root.Spec.NATS.URL})
+		if root.Spec.NATS.CredentialsSecret != nil {
+			env = append(env, corev1.EnvVar{
+				Name: "NATS_CREDS",
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: root.Spec.NATS.CredentialsSecret.Name},
+						Key:                  "nats.creds",
+						Optional:             pointer.Bool(true),
+					},
+				},
+			})
+		}
 	}
+
+	return corev1.Container{
+		Name:            "root",
+		Image:           root.Spec.Image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"dllama-api"},
+		Args:            args,
+		Env:             env,
+		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      "model-output",
+				MountPath: "/model",
+				ReadOnly:  true,
+			},
+		},
+	}
+}
+
+func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
+	hash := labelValue(root.Annotations, labelConversationHash)
+	if hash == "" {
+		hash = labelValue(root.Labels, labelConversationHash)
+	}
+	args := []string{"llm", "--llm-sidecar-url", "http://127.0.0.1:9999"}
+	if hash != "" {
+		args = append(args, "--llm-hash", hash)
+	}
+	if root.Spec.NATS != nil && strings.TrimSpace(root.Spec.NATS.URL) != "" {
+		args = append(args, "--llm-nats-url", root.Spec.NATS.URL)
+	}
+
+	return corev1.Container{
+		Name:            "llm",
+		Image:           root.Spec.Image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/koldun"},
+		Args:            args,
+		Env:             append([]corev1.EnvVar{{Name: "HASH_KOLDUN", Value: hash}}, buildLLMNATSEnv(root.Spec.NATS)...),
+		Ports:           []corev1.ContainerPort{{ContainerPort: 8081}},
+	}
+}
+
+func buildLLMNATSEnv(cfg *v1.RootNATSConfig) []corev1.EnvVar {
+	if cfg == nil {
+		return nil
+	}
+	vars := []corev1.EnvVar{{Name: "NATS_URL", Value: cfg.GetURL()}}
+	if cfg.CredentialsSecret != nil {
+		vars = append(vars, corev1.EnvVar{
+			Name: "NATS_CREDS",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cfg.CredentialsSecret.Name},
+					Key:                  "nats.creds",
+					Optional:             pointer.Bool(true),
+				},
+			},
+		})
+	}
+	return vars
+}
+
+func (h *rootHandler) resolveDllama(root *v1.Root) (*v1.Dllama, error) {
+	dllamaName := labelValue(root.Labels, labelDllamaName)
+	if dllamaName == "" {
+		return nil, fmt.Errorf("root %s/%s missing dllama label", root.Namespace, root.Name)
+	}
+	return h.dllamas.Cache().Get(root.Namespace, dllamaName)
+}
+
+func (h *rootHandler) resolveModel(dllama *v1.Dllama) (*v1.Model, error) {
+	if dllama == nil {
+		return nil, fmt.Errorf("dllama not provided")
+	}
+	modelName := strings.TrimSpace(dllama.Spec.ModelRef.Name)
+	if modelName == "" {
+		return nil, fmt.Errorf("dllama %s/%s has empty spec.modelRef.name", dllama.Namespace, dllama.Name)
+	}
+	modelNamespace := referencedModelNamespace(dllama)
+	return h.models.Cache().Get(modelNamespace, modelName)
+}
+
+func (h *rootHandler) onRelatedDllama(key string, obj *v1.Dllama) (*v1.Dllama, error) {
+	namespace, name := "", ""
+	if obj != nil {
+		namespace, name = obj.Namespace, obj.Name
+	} else {
+		namespace, name = splitKey(key)
+	}
+	if namespace == "" || name == "" {
+		return obj, nil
+	}
+	h.roots.Enqueue(namespace, fmt.Sprintf("%s-root", name))
+	return obj, nil
+}
+
+func (h *rootHandler) onRelatedModel(key string, obj *v1.Model) (*v1.Model, error) {
+	namespace, name := "", ""
+	if obj != nil {
+		namespace, name = obj.Namespace, obj.Name
+	} else {
+		namespace, name = splitKey(key)
+	}
+	if namespace == "" || name == "" {
+		return obj, nil
+	}
+
+	dllamas, err := h.dllamas.Cache().List("", labels.Everything())
+	if err != nil {
+		return obj, err
+	}
+	for _, dllama := range dllamas {
+		if referencesModel(dllama, namespace, name) {
+			h.roots.Enqueue(dllama.Namespace, fmt.Sprintf("%s-root", dllama.Name))
+		}
+	}
+	return obj, nil
 }
 
 func (h *rootHandler) ensureStatus(root *v1.Root) (*v1.Root, error) {
@@ -224,16 +497,27 @@ func (h *rootHandler) ensureStatus(root *v1.Root) (*v1.Root, error) {
 
 	ready := metav1.Condition{
 		Type:    conditionReady,
-		Reason:  "DeploymentNotReady",
-		Message: "Root deployment is not yet ready",
+		Reason:  "WorkersNotReady",
+		Message: "Waiting for worker pods to become ready",
 		Status:  metav1.ConditionFalse,
 	}
 
-	if dep, err := h.deployments.Cache().Get(root.Namespace, root.Name); err == nil {
-		if dep.Status.ReadyReplicas >= 1 {
-			ready.Status = metav1.ConditionTrue
-			ready.Reason = "DeploymentReady"
-			ready.Message = "Root deployment is ready"
+	workersReady, _, _, err := h.workerStatus(root)
+	if err != nil {
+		ready.Reason = "WorkersLookupFailed"
+		ready.Message = fmt.Sprintf("Failed to list workers: %v", err)
+	} else if workersReady {
+		ready.Reason = "DeploymentNotReady"
+		ready.Message = "Root deployment is not yet ready"
+		if dep, err := h.deployments.Cache().Get(root.Namespace, root.Name); err == nil {
+			if dep.Status.ReadyReplicas >= 1 {
+				ready.Status = metav1.ConditionTrue
+				ready.Reason = "DeploymentReady"
+				ready.Message = "Root deployment is ready"
+			}
+		} else if !apierrors.IsNotFound(err) {
+			ready.Reason = "DeploymentLookupFailed"
+			ready.Message = fmt.Sprintf("Failed to fetch root deployment: %v", err)
 		}
 	}
 

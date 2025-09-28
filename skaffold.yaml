@@ -1,0 +1,17 @@
+apiVersion: skaffold/v4beta13
+kind: Config
+metadata:
+  name: kold
+build:
+  local:
+    push: false 
+  artifacts:
+    - image: ghcr.io/gorizond/koldun
+      docker:
+        dockerfile: Dockerfile
+# manifests:
+#   rawYaml:
+#     - k8s/ingress-deploy.yaml
+
+# deploy:
+#   kubectl: {}

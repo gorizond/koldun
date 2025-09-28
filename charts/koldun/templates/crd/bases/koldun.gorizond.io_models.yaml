@@ -20,7 +20,7 @@ spec:
     schema:
       openAPIV3Schema:
         description: Model represents the lifecycle of downloading and caching a language
-          model repository.
+          model artifact.
         properties:
           apiVersion:
             description: |-
@@ -42,14 +42,78 @@ spec:
           spec:
             description: ModelSpec holds the desired model artifact configuration.
             properties:
-              objectStorage:
-                description: ObjectStorage describes access to object storage buckets used for downloading and conversion output.
+              conversion:
+                description: Conversion optionally describes how cached artifacts
+                  should be converted post-download.
                 properties:
-                  endpoint:
-                    description: Endpoint is the URL of the object storage backend (e.g. S3 compatible object storage).
+                  args:
+                    description: Args provides optional arguments for the container
+                      entrypoint.
+                    items:
+                      type: string
+                    type: array
+                  command:
+                    description: Command overrides the container entrypoint when set.
+                    items:
+                      type: string
+                    type: array
+                  converterVersion:
+                    description: 'ConverterVersion selects the distributed-llama converter
+                      release tag (default: v0.16.2).'
                     type: string
-                  secretRef:
-                    description: SecretRef references a Secret containing credentials for the storage backend.
+                  image:
+                    description: Image is the container image used for the conversion
+                      Job.
+                    type: string
+                  memory:
+                    description: Memory specifies memory limit for the conversion
+                      job container.
+                    type: string
+                  outputPath:
+                    description: OutputPath optionally overrides the cache destination
+                      for converted artifacts (may be s3:// URI).
+                    type: string
+                  rcloneImage:
+                    description: RcloneImage overrides the image used for rclone-based
+                      syncing/mounting (defaults to rclone/rclone:1.67).
+                    type: string
+                  toolsImage:
+                    description: ToolsImage overrides the image used for lightweight
+                      operations (defaults to alpine:3.18).
+                    type: string
+                  weightsFloatType:
+                    description: WeightsFloatType dictates the target precision (for
+                      example, "q40").
+                    type: string
+                type: object
+              download:
+                description: Download contains configuration for how the model artifacts
+                  are fetched and prepared.
+                properties:
+                  args:
+                    description: Args provides optional arguments for the container
+                      entrypoint.
+                    items:
+                      type: string
+                    type: array
+                  chunkMaxMiB:
+                    description: ChunkMaxMiB caps multipart chunk size in MiB (defaults
+                      to 64)
+                    format: int32
+                    type: integer
+                  command:
+                    description: Command overrides the container entrypoint when set.
+                    items:
+                      type: string
+                    type: array
+                  concurrency:
+                    description: Concurrency sets the number of parallel parts used
+                      by S3 transfer (defaults to 1)
+                    format: int32
+                    type: integer
+                  huggingFaceTokenSecretRef:
+                    description: HuggingFaceTokenSecretRef references a Secret with
+                      token for private model download.
                     properties:
                       name:
                         type: string
@@ -58,16 +122,14 @@ spec:
                     required:
                     - name
                     type: object
-                  bucketForSource:
-                    description: BucketForSource holds the original Hugging Face snapshot and downloaded artifacts.
+                  image:
+                    description: Image is the container image used for the download
+                      Job.
                     type: string
-                  bucketForConvert:
-                    description: BucketForConvert stores converted artifacts produced by conversion jobs.
+                  memory:
+                    description: Memory specifies memory limit for the download job
+                      container (e.g. "128Mi", "1Gi").
                     type: string
-                required:
-                - bucketForConvert
-                - bucketForSource
-                - endpoint
                 type: object
               launchOptions:
                 description: LaunchOptions mirror the arguments passed to distributed-llama's
@@ -75,24 +137,29 @@ spec:
                 items:
                   type: string
                 type: array
-              download:
-                description: ModelDownloadSpec describes how to acquire model artifacts.
+              localPath:
+                description: LocalPath is the path/prefix on the cache backend where
+                  the artifacts will reside.
+                type: string
+              objectStorage:
+                description: ObjectStorage describes access to object storage buckets
+                  used for downloading and conversion output.
                 properties:
-                  image:
-                    description: Image is the container image used for the download Job.
+                  bucketForConvert:
+                    description: BucketForConvert stores converted artifacts generated
+                      after running conversion jobs.
                     type: string
-                  command:
-                    description: Command overrides the container entrypoint when set.
-                    items:
-                      type: string
-                    type: array
-                  args:
-                    description: Args provides optional arguments for the container entrypoint.
-                    items:
-                      type: string
-                    type: array
-                  huggingFaceTokenSecretRef:
-                    description: HuggingFaceTokenSecretRef references a Secret with token for private model download.
+                  bucketForSource:
+                    description: BucketForSource holds the original Hugging Face snapshot
+                      and any downloaded artifacts.
+                    type: string
+                  endpoint:
+                    description: Endpoint is the URL of the object storage backend
+                      (e.g. S3 compatible object storage).
+                    type: string
+                  secretRef:
+                    description: SecretRef references a Secret containing credentials
+                      for the storage backend.
                     properties:
                       name:
                         type: string
@@ -101,111 +168,80 @@ spec:
                     required:
                     - name
                     type: object
-                  chunkMaxMiB:
-                    description: ChunkMaxMiB caps multipart chunk size in MiB (defaults to 64)
-                    format: int32
-                    type: integer
-                  concurrency:
-                    description: Concurrency sets number of parallel parts for S3 transfer (defaults to 1)
-                    format: int32
-                    type: integer
-                  memory:
-                    description: Memory specifies memory limit for the download job container (e.g. "128Mi", "1Gi").
-                    type: string
+                required:
+                - bucketForConvert
+                - bucketForSource
+                - endpoint
                 type: object
               pipProxy:
-                description: Optional HTTP proxy used by pip inside python containers (Dragonfly dfdaemon HTTP proxy).
+                description: PipProxy optionally sets HTTP proxy used by pip inside
+                  python containers (e.g., Dragonfly dfdaemon HTTP proxy)
                 type: string
-              conversion:
-                description: ModelConversionSpec configures post-download conversion of cached artifacts (e.g. GGUF export).
-                properties:
-                  image:
-                    description: Image is the container image used for the conversion Job.
-                    type: string
-                  command:
-                    description: Command overrides the container entrypoint when set.
-                    items:
-                      type: string
-                    type: array
-                  args:
-                    description: Args provides optional arguments for the container entrypoint.
-                    items:
-                      type: string
-                    type: array
-                  weightsFloatType:
-                    description: WeightsFloatType dictates the target precision (for example, "q40").
-                    type: string
-                  outputPath:
-                    description: OutputPath optionally overrides the cache destination for converted artifacts (may be an s3:// URI).
-                    type: string
-                  memory:
-                    description: Memory specifies memory limit for the conversion job container.
-                    type: string
-                  rcloneImage:
-                    description: RcloneImage overrides the image used for rclone-based syncing/mounting.
-                    type: string
-                  toolsImage:
-                    description: ToolsImage overrides the image used for lightweight helper init-containers.
-                    type: string
-                  converterVersion:
-                    description: ConverterVersion selects the distributed-llama converter release tag (default v0.16.2).
-                    type: string
-                type: object
               pv:
-                description: Template for PersistentVolume/PersistentVolumeClaim used to mount S3 via CSI.
+                description: PV optionally describes a template for PersistentVolume/PersistentVolumeClaim
+                  used to mount S3 via CSI
                 properties:
-                  storageClassName:
-                    description: StorageClassName for the PV (default csi-s3).
-                    type: string
-                  capacity:
-                    description: PV capacity (e.g. 10Gi). Defaults to 10Gi.
-                    type: string
                   accessModes:
-                    description: PV access modes. Defaults to [ReadWriteMany].
+                    description: 'AccessModes for the PV, e.g. ["ReadWriteMany"] (default:
+                      ["ReadWriteMany"])'
                     items:
                       type: string
                     type: array
-                  reclaimPolicy:
-                    description: PV reclaim policy. Defaults to Retain.
+                  capacity:
+                    description: 'Capacity for the PV, e.g. "10Gi" (default: "10Gi")'
                     type: string
                   csiDriver:
-                    description: CSI driver name. Defaults to ru.yandex.s3.csi.
+                    description: 'CSIDriver name (default: "ru.yandex.s3.csi")'
                     type: string
                   csiMounter:
-                    description: CSI mounter (e.g., geesefs) stored in volumeAttributes.mounter.
+                    description: CSIMounter (e.g., "geesefs"), placed into volumeAttributes.mounter
                     type: string
                   csiOptions:
-                    description: CSI options string stored in volumeAttributes.options.
+                    description: CSIOptions (arbitrary string passed into volumeAttributes.options)
                     type: string
-                  volumeAttributes:
-                    description: Additional CSI volumeAttributes to merge.
-                    additionalProperties:
-                      type: string
-                    type: object
                   csiSecretName:
-                    description: CSI secret name (default csi-s3-secret).
+                    description: 'CSISecretName overrides the default name of the
+                      CSI secret (default: csi-s3-secret)'
                     type: string
                   csiSecretNamespace:
-                    description: CSI secret namespace (default kube-system).
-                    type: string
-                  pvcStorageClassName:
-                    description: PVC storageClassName. Default empty for static binding.
-                    type: string
-                  pvcCapacity:
-                    description: PVC requested storage (default same as PV capacity or 10Gi).
+                    description: 'CSISecretNamespace overrides the default namespace
+                      of the CSI secret (default: kube-system)'
                     type: string
                   pvcAccessModes:
-                    description: PVC access modes. Defaults to [ReadWriteMany].
+                    description: 'PVCAccessModes (default: ["ReadWriteMany"])'
                     items:
                       type: string
                     type: array
+                  pvcCapacity:
+                    description: 'PVCCapacity request (default: same as PV Capacity
+                      or "10Gi")'
+                    type: string
+                  pvcStorageClassName:
+                    description: 'PVCStorageClassName (default: "") disables dynamic
+                      provisioning for static binding'
+                    type: string
+                  reclaimPolicy:
+                    description: 'ReclaimPolicy for the PV (default: "Retain")'
+                    type: string
+                  storageClassName:
+                    description: 'StorageClassName for the PV (default: "csi-s3")'
+                    type: string
+                  volumeAttributes:
+                    additionalProperties:
+                      type: string
+                    description: Additional volumeAttributes appended to CSI volumeAttributes
+                    type: object
                 type: object
-              localPath:
-                description: LocalPath is the path on the node filesystem (or cache
-                  backend) where the model should reside.
-                type: string
+              replicaPower:
+                description: ReplicaPower defines the desired worker fan-out (power
+                  of two) for Dllama instances referencing this model.
+                format: int32
+                type: integer
               sourceUrl:
-                description: SourceURL points to the upstream model source repository (e.g. Hugging Face repo URL).
+                description: |-
+                  SourceURL points to the upstream model source. For Hugging Face, this is the
+                  repository URL like https://huggingface.co/mistralai/Mistral-7B-v0.3. The operator
+                  will download all repository files into the cache backend.
                 type: string
             required:
             - localPath
@@ -220,41 +256,6 @@ spec:
                   artifact, if known.
                 format: int64
                 type: integer
-              downloadJobName:
-                description: DownloadJobName is the name of the Kubernetes Job responsible for downloading the model.
-                type: string
-              downloadState:
-                description: DownloadState is a high-level state for the downloader pipeline (Pending, Running, Succeeded, Failed).
-                type: string
-              conversionJobName:
-                description: ConversionJobName is the conversion Job associated with this model generation.
-                type: string
-              conversionState:
-                description: ConversionState mirrors DownloadState for the conversion pipeline.
-                type: string
-              conversionSizeJobName:
-                description: ConversionSizeJobName references the sizing Job that inspects converted artifacts.
-                type: string
-              conversionSizeState:
-                description: ConversionSizeState tracks the state of the sizing job (Pending, Running, Succeeded, Failed).
-                type: string
-              conversionSizeBytes:
-                description: ConversionSizeBytes stores the total size in bytes of converted artifacts measured from the output PVC.
-                format: int64
-                type: integer
-              conversionSizeHuman:
-                description: ConversionSizeHuman stores a human-readable representation of the converted artifact size (e.g. 1.2G).
-                type: string
-              conversionSizeGeneration:
-                description: ConversionSizeGeneration records the Model generation for which the size measurement was produced.
-                format: int64
-                type: integer
-              conversionSizeForceToken:
-                description: ConversionSizeForceToken mirrors the annotation used to force a sizing rerun that produced the recorded measurement.
-                type: string
-              outputPVCName:
-                description: OutputPVCName is the PersistentVolumeClaim that stores converted artifacts.
-                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -311,9 +312,55 @@ spec:
                   - type
                   type: object
                 type: array
+              conversionJobName:
+                description: ConversionJobName is the conversion Job associated with
+                  this model generation.
+                type: string
+              conversionSizeBytes:
+                description: ConversionSizeBytes stores the total size in bytes of
+                  converted artifacts measured from the output PVC.
+                format: int64
+                type: integer
+              conversionSizeForceToken:
+                description: ConversionSizeForceToken mirrors the annotation used
+                  to force a sizing rerun that produced the recorded measurement.
+                type: string
+              conversionSizeGeneration:
+                description: ConversionSizeGeneration records the Model generation
+                  for which the size measurement was produced.
+                format: int64
+                type: integer
+              conversionSizeHuman:
+                description: ConversionSizeHuman stores a human-readable representation
+                  of the converted artifact size (e.g. 1.2G).
+                type: string
+              conversionSizeJobName:
+                description: ConversionSizeJobName references the sizing Job that
+                  inspects converted artifacts.
+                type: string
+              conversionSizeState:
+                description: ConversionSizeState tracks the state of the sizing job
+                  (Pending, Running, Succeeded, Failed).
+                type: string
+              conversionState:
+                description: ConversionState mirrors DownloadState for the conversion
+                  pipeline.
+                type: string
+              downloadJobName:
+                description: DownloadJobName is the name of the Kubernetes Job responsible
+                  for downloading the model.
+                type: string
+              downloadState:
+                description: DownloadState is a high-level state for the downloader
+                  pipeline (Pending, Running, Succeeded, Failed).
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
+              outputPVCName:
+                description: OutputPVCName is the PersistentVolumeClaim that stores
+                  converted artifacts.
+                type: string
             type: object
         type: object
     served: true

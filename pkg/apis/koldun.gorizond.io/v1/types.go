@@ -1,6 +1,10 @@
 package v1
 
 import (
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -34,6 +38,10 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&RootList{},
 		&Worker{},
 		&WorkerList{},
+		&Ingress{},
+		&IngressList{},
+		&Token{},
+		&TokenList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
@@ -62,6 +70,76 @@ type DllamaSpec struct {
 	RootImage string `json:"rootImage"`
 	// WorkerImage is the container image used for the worker processes.
 	WorkerImage string `json:"workerImage"`
+	// NATS configures connectivity inherited by runtime pods.
+	NATS *DllamaNATSConfig `json:"nats,omitempty"`
+}
+
+// DllamaNATSConfig configures NATS connectivity for the LLM sidecar spawned by the root deployment.
+type DllamaNATSConfig struct {
+	// URL is the NATS endpoint.
+	URL string `json:"url"`
+	// CredentialsSecret references a Secret containing NATS credentials (optional).
+	CredentialsSecret *SecretReference `json:"credentialsSecret,omitempty"`
+}
+
+// Validate ensures required fields are set.
+func (c *DllamaNATSConfig) Validate() error {
+	if c == nil {
+		return fmt.Errorf("nats config is nil")
+	}
+	if strings.TrimSpace(c.URL) == "" {
+		return fmt.Errorf("nats url is required")
+	}
+	return nil
+}
+
+// ToRootConfig converts the dllama NATS configuration into a RootNATSConfig.
+func (c *DllamaNATSConfig) ToRootConfig() *RootNATSConfig {
+	if c == nil {
+		return nil
+	}
+	return &RootNATSConfig{
+		URL:               c.URL,
+		CredentialsSecret: c.CredentialsSecret,
+	}
+}
+
+// ToWorkerConfig converts the dllama NATS configuration into a WorkerNATSConfig.
+func (c *DllamaNATSConfig) ToWorkerConfig() *WorkerNATSConfig {
+	if c == nil {
+		return nil
+	}
+	return &WorkerNATSConfig{
+		URL:               c.URL,
+		CredentialsSecret: c.CredentialsSecret,
+	}
+}
+
+// DeepCopy for DllamaSpec should include NATS.
+func (in *DllamaSpec) DeepCopy() DllamaSpec {
+	if in == nil {
+		return DllamaSpec{}
+	}
+	out := *in
+	if in.NATS != nil {
+		natsCopy := *in.NATS.DeepCopy()
+		out.NATS = &natsCopy
+	}
+	return out
+}
+
+// DeepCopy for DllamaNATSConfig.
+func (in *DllamaNATSConfig) DeepCopy() *DllamaNATSConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(DllamaNATSConfig)
+	*out = *in
+	if in.CredentialsSecret != nil {
+		secretCopy := *in.CredentialsSecret
+		out.CredentialsSecret = &secretCopy
+	}
+	return out
 }
 
 // ModelReference identifies a Model custom resource that should be used by this Dllama deployment.
@@ -144,6 +222,8 @@ type ModelSpec struct {
 	Conversion *ModelConversionSpec `json:"conversion,omitempty"`
 	// PV optionally describes a template for PersistentVolume/PersistentVolumeClaim used to mount S3 via CSI
 	PV *ModelPVSpec `json:"pv,omitempty"`
+	// ReplicaPower defines the desired worker fan-out (power of two) for Dllama instances referencing this model.
+	ReplicaPower int32 `json:"replicaPower,omitempty"`
 }
 
 // ModelStatus reports whether the model artifact is ready for consumption.
@@ -206,6 +286,8 @@ type RootSpec struct {
 	CacheSpec *CacheSpec `json:"cacheSpec,omitempty"`
 	// WorkerSelector allows selecting Worker resources belonging to this Root.
 	WorkerSelector map[string]string `json:"workerSelector,omitempty"`
+	// NATS contains connection information inherited by the LLM sidecar.
+	NATS *RootNATSConfig `json:"nats,omitempty"`
 }
 
 // RootStatus indicates readiness for the root component.
@@ -213,6 +295,22 @@ type RootStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 	Endpoint           string             `json:"endpoint,omitempty"`
+}
+
+// RootNATSConfig configures NATS connectivity for the LLM sidecar spawned by the root deployment.
+type RootNATSConfig struct {
+	// URL is the NATS endpoint (may include inline credentials).
+	URL string `json:"url"`
+	// CredentialsSecret references a Secret containing connection credentials.
+	CredentialsSecret *SecretReference `json:"credentialsSecret,omitempty"`
+}
+
+// GetURL returns the configured NATS URL or empty string.
+func (c *RootNATSConfig) GetURL() string {
+	if c == nil {
+		return ""
+	}
+	return c.URL
 }
 
 // +kubebuilder:object:root=true
@@ -247,6 +345,51 @@ type WorkerSpec struct {
 	RootRef string `json:"rootRef"`
 	// Slot is the worker slot index relative to the root (starting at 0).
 	Slot int32 `json:"slot"`
+	// NATS configures worker connectivity.
+	NATS *WorkerNATSConfig `json:"nats,omitempty"`
+}
+
+// WorkerNATSConfig configures NATS connectivity for worker pods.
+type WorkerNATSConfig struct {
+	URL string `json:"url"`
+	// CredentialsSecret references a Secret containing credentials.
+	CredentialsSecret *SecretReference `json:"credentialsSecret,omitempty"`
+}
+
+// DeepCopy extends WorkerSpec to copy the NATS configuration.
+func (in *WorkerSpec) DeepCopy() *WorkerSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkerSpec)
+	*out = *in
+	if in.Args != nil {
+		out.Args = make([]string, len(in.Args))
+		copy(out.Args, in.Args)
+	}
+	if in.CacheSpec != nil {
+		cacheCopy := *in.CacheSpec.DeepCopy()
+		out.CacheSpec = &cacheCopy
+	}
+	if in.NATS != nil {
+		natsCopy := *in.NATS.DeepCopy()
+		out.NATS = &natsCopy
+	}
+	return out
+}
+
+// DeepCopy for WorkerNATSConfig.
+func (in *WorkerNATSConfig) DeepCopy() *WorkerNATSConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkerNATSConfig)
+	*out = *in
+	if in.CredentialsSecret != nil {
+		secretCopy := *in.CredentialsSecret
+		out.CredentialsSecret = &secretCopy
+	}
+	return out
 }
 
 // WorkerStatus provides readiness indicators for a worker.
@@ -314,14 +457,6 @@ func (in *DllamaList) DeepCopyObject() runtime.Object {
 		return c
 	}
 	return nil
-}
-
-func (in *DllamaSpec) DeepCopy() DllamaSpec {
-	if in == nil {
-		return DllamaSpec{}
-	}
-	out := *in
-	return out
 }
 
 func (in *DllamaStatus) DeepCopy() *DllamaStatus {
@@ -596,6 +731,10 @@ func (in *RootSpec) DeepCopy() *RootSpec {
 			out.WorkerSelector[k] = v
 		}
 	}
+	if in.NATS != nil {
+		natsCopy := *in.NATS.DeepCopy()
+		out.NATS = &natsCopy
+	}
 	return out
 }
 
@@ -608,6 +747,19 @@ func (in *RootStatus) DeepCopy() *RootStatus {
 	if in.Conditions != nil {
 		out.Conditions = make([]metav1.Condition, len(in.Conditions))
 		copy(out.Conditions, in.Conditions)
+	}
+	return out
+}
+
+func (in *RootNATSConfig) DeepCopy() *RootNATSConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(RootNATSConfig)
+	*out = *in
+	if in.CredentialsSecret != nil {
+		secretCopy := *in.CredentialsSecret
+		out.CredentialsSecret = &secretCopy
 	}
 	return out
 }
@@ -664,23 +816,6 @@ func (in *WorkerList) DeepCopyObject() runtime.Object {
 	return nil
 }
 
-func (in *WorkerSpec) DeepCopy() *WorkerSpec {
-	if in == nil {
-		return nil
-	}
-	out := new(WorkerSpec)
-	*out = *in
-	if in.Args != nil {
-		out.Args = make([]string, len(in.Args))
-		copy(out.Args, in.Args)
-	}
-	if in.CacheSpec != nil {
-		cacheCopy := *in.CacheSpec.DeepCopy()
-		out.CacheSpec = &cacheCopy
-	}
-	return out
-}
-
 func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 	if in == nil {
 		return nil
@@ -692,6 +827,241 @@ func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 		copy(out.Conditions, in.Conditions)
 	}
 	return out
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=ing
+
+// Ingress defines an HTTP entrypoint backed by a managed backend deployment.
+type Ingress struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   IngressSpec   `json:"spec,omitempty"`
+	Status IngressStatus `json:"status,omitempty"`
+}
+
+// IngressSpec describes the desired state for the backend ingress deployment.
+type IngressSpec struct {
+	Backend IngressBackendSpec  `json:"backend"`
+	Route   IngressRouteSpec    `json:"route"`
+	Service *IngressServiceSpec `json:"service,omitempty"`
+}
+
+// IngressBackendSpec defines runtime configuration for the backend deployment.
+type IngressBackendSpec struct {
+	Image           string                      `json:"image"`
+	ImagePullPolicy string                      `json:"imagePullPolicy,omitempty"`
+	RootImage       string                      `json:"rootImage"`
+	WorkerImage     string                      `json:"workerImage"`
+	HashSecret      string                      `json:"hashSecret,omitempty"`
+	NATS            IngressNATSConfig           `json:"nats"`
+	ConversationTTL *metav1.Duration            `json:"conversationTTL,omitempty"`
+	ResponseTimeout *metav1.Duration            `json:"responseTimeout,omitempty"`
+	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
+	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// IngressNATSConfig configures connectivity with the conversation control plane.
+type IngressNATSConfig struct {
+	URL                string `json:"url"`
+	ConversationBucket string `json:"kvBucket,omitempty"`
+	ModelsBucket       string `json:"modelsBucket,omitempty"`
+	TokensBucket       string `json:"tokensBucket,omitempty"`
+	ModelPrefix        string `json:"modelPrefix,omitempty"`
+	TokenPrefix        string `json:"tokenPrefix,omitempty"`
+	TTLPrefix          string `json:"ttlPrefix,omitempty"`
+}
+
+// IngressServiceSpec configures the Service exposing the backend deployment.
+type IngressServiceSpec struct {
+	Type string `json:"type,omitempty"`
+	Port int32  `json:"port,omitempty"`
+}
+
+// IngressRouteSpec configures the Kubernetes Ingress resource fronting the backend Service.
+type IngressRouteSpec struct {
+	Host             string            `json:"host"`
+	Path             string            `json:"path,omitempty"`
+	PathType         string            `json:"pathType,omitempty"`
+	IngressClassName string            `json:"ingressClassName,omitempty"`
+	Annotations      map[string]string `json:"annotations,omitempty"`
+	TLS              []IngressTLSSpec  `json:"tls,omitempty"`
+}
+
+// IngressTLSSpec mirrors networking.k8s.io/v1 IngressTLS configuration.
+type IngressTLSSpec struct {
+	SecretName string   `json:"secretName,omitempty"`
+	Hosts      []string `json:"hosts,omitempty"`
+}
+
+// IngressStatus reports readiness details for the managed backend ingress.
+type IngressStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	BackendServiceName string             `json:"backendServiceName,omitempty"`
+	IngressName        string             `json:"ingressName,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// IngressList represents a list of Ingress resources.
+type IngressList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Ingress `json:"items"`
+}
+
+func (in *Ingress) DeepCopyInto(out *Ingress) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	out.Spec = *in.Spec.DeepCopy()
+	out.Status = *in.Status.DeepCopy()
+}
+
+func (in *Ingress) DeepCopy() *Ingress {
+	if in == nil {
+		return nil
+	}
+	out := new(Ingress)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *Ingress) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+func (in *IngressSpec) DeepCopy() *IngressSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressSpec)
+	*out = *in
+	out.Backend = *in.Backend.DeepCopy()
+	out.Route = *in.Route.DeepCopy()
+	if in.Service != nil {
+		serviceCopy := *in.Service.DeepCopy()
+		out.Service = &serviceCopy
+	}
+	return out
+}
+
+func (in *IngressBackendSpec) DeepCopy() *IngressBackendSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressBackendSpec)
+	*out = *in
+	if in.ConversationTTL != nil {
+		d := *in.ConversationTTL
+		out.ConversationTTL = &d
+	}
+	if in.ResponseTimeout != nil {
+		d := *in.ResponseTimeout
+		out.ResponseTimeout = &d
+	}
+	if in.ExtraArgs != nil {
+		out.ExtraArgs = make([]string, len(in.ExtraArgs))
+		copy(out.ExtraArgs, in.ExtraArgs)
+	}
+	in.Resources.DeepCopyInto(&out.Resources)
+	return out
+}
+
+func (in *IngressNATSConfig) DeepCopy() *IngressNATSConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressNATSConfig)
+	*out = *in
+	return out
+}
+
+func (in *IngressServiceSpec) DeepCopy() *IngressServiceSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressServiceSpec)
+	*out = *in
+	return out
+}
+
+func (in *IngressRouteSpec) DeepCopy() *IngressRouteSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressRouteSpec)
+	*out = *in
+	if in.Annotations != nil {
+		out.Annotations = make(map[string]string, len(in.Annotations))
+		for k, v := range in.Annotations {
+			out.Annotations[k] = v
+		}
+	}
+	if in.TLS != nil {
+		out.TLS = make([]IngressTLSSpec, len(in.TLS))
+		for i := range in.TLS {
+			out.TLS[i] = *in.TLS[i].DeepCopy()
+		}
+	}
+	return out
+}
+
+func (in IngressTLSSpec) DeepCopy() *IngressTLSSpec {
+	out := new(IngressTLSSpec)
+	*out = in
+	if in.Hosts != nil {
+		out.Hosts = make([]string, len(in.Hosts))
+		copy(out.Hosts, in.Hosts)
+	}
+	return out
+}
+
+func (in *IngressStatus) DeepCopy() *IngressStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressStatus)
+	*out = *in
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+	return out
+}
+
+func (in *IngressList) DeepCopyInto(out *IngressList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]Ingress, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *IngressList) DeepCopy() *IngressList {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *IngressList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
 }
 
 // ModelDownloadSpec describes how to acquire model artifacts.
@@ -770,4 +1140,127 @@ func (in *ModelConversionSpec) DeepCopy() *ModelConversionSpec {
 		copy(out.Args, in.Args)
 	}
 	return out
+}
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=tkn
+
+// Token models an API token allowed to access the backend service.
+type Token struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   TokenSpec   `json:"spec,omitempty"`
+	Status TokenStatus `json:"status,omitempty"`
+}
+
+// TokenSpec captures desired configuration for an API token.
+type TokenSpec struct {
+	// Hash stores a SHA-256 hexadecimal digest of the permitted API token.
+	Hash string `json:"hash"`
+	// Disabled marks the token as inactive.
+	Disabled bool `json:"disabled,omitempty"`
+	// Metadata allows attaching arbitrary attributes to the token (e.g. owner, notes).
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// TokenStatus records runtime information about a token.
+type TokenStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	LastValidated      *metav1.Time       `json:"lastValidated,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// TokenList represents a list of Token resources.
+type TokenList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Token `json:"items"`
+}
+
+func (in *Token) DeepCopyInto(out *Token) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	out.Spec = *in.Spec.DeepCopy()
+	out.Status = *in.Status.DeepCopy()
+}
+
+func (in *Token) DeepCopy() *Token {
+	if in == nil {
+		return nil
+	}
+	out := new(Token)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *Token) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+func (in *TokenSpec) DeepCopy() *TokenSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(TokenSpec)
+	*out = *in
+	if in.Metadata != nil {
+		out.Metadata = make(map[string]string, len(in.Metadata))
+		for k, v := range in.Metadata {
+			out.Metadata[k] = v
+		}
+	}
+	return out
+}
+
+func (in *TokenStatus) DeepCopy() *TokenStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(TokenStatus)
+	*out = *in
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+	if in.LastValidated != nil {
+		t := *in.LastValidated
+		out.LastValidated = &t
+	}
+	return out
+}
+
+func (in *TokenList) DeepCopyInto(out *TokenList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]Token, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *TokenList) DeepCopy() *TokenList {
+	if in == nil {
+		return nil
+	}
+	out := new(TokenList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *TokenList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
 }

@@ -77,6 +77,27 @@ spec:
                 type: string
               modelRef:
                 type: string
+              nats:
+                description: NATS contains connection information inherited by the
+                  LLM sidecar.
+                properties:
+                  credentialsSecret:
+                    description: CredentialsSecret references a Secret containing
+                      connection credentials.
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: URL is the NATS endpoint (may include inline credentials).
+                    type: string
+                required:
+                - url
+                type: object
               workerSelector:
                 additionalProperties:
                   type: string

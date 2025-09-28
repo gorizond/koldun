@@ -54,7 +54,10 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			kold.Model(),
 			kold.Root(),
 			kold.Worker(),
+			kold.Ingress(),
+			kold.Token(),
 			apps.Deployment(),
+			apps.StatefulSet(),
 			batch.Job(),
 			core.ConfigMap(),
 			core.Secret(),
@@ -76,6 +79,9 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 
 // Register initialises all controller handlers.
 func (m *Manager) Register(ctx context.Context) error {
+	if err := registerIngressController(ctx, m); err != nil {
+		return fmt.Errorf("register ingress controller: %w", err)
+	}
 	if err := registerModelController(ctx, m); err != nil {
 		return fmt.Errorf("register model controller: %w", err)
 	}

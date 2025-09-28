@@ -40,6 +40,23 @@ spec:
           {{- end }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--mode=operator"
+            {{- if .Values.operator.conversation.natsUrl }}
+            - "--operator-nats-url={{ .Values.operator.conversation.natsUrl }}"
+            {{- end }}
+            {{- if .Values.operator.conversation.kvBucket }}
+            - "--operator-kv-bucket={{ .Values.operator.conversation.kvBucket }}"
+            {{- end }}
+            {{- if .Values.operator.conversation.ttlPrefix }}
+            - "--operator-ttl-prefix={{ .Values.operator.conversation.ttlPrefix }}"
+            {{- end }}
+            {{- if .Values.operator.conversation.pollInterval }}
+            - "--operator-poll-interval={{ .Values.operator.conversation.pollInterval }}"
+            {{- end }}
+            {{- range .Values.operator.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

@@ -56,6 +56,14 @@ service:
   # This sets the ports more information can be found here: https://kubernetes.io/docs/concepts/services-networking/service/#field-spec-ports
   port: 80
 
+operator:
+  conversation:
+    natsUrl: ""
+    kvBucket: ""
+    ttlPrefix: nats_ttl_
+    pollInterval: 10s
+  extraArgs: []
+
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
 ingress:
   enabled: false
@@ -121,3 +129,25 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+ingresses: []
+# - name: example
+#   namespace: default
+#   spec:
+#     backend:
+#       image: ghcr.io/gorizond/koldun:latest
+#       rootImage: ghcr.io/gorizond/koldun-root:latest
+#       workerImage: ghcr.io/gorizond/koldun-worker:latest
+#       nats:
+#         url: nats://nats:4222
+#         kvBucket: koldun_ttl
+#         modelsBucket: koldun_models
+#         tokensBucket: koldun_tokens
+#         modelPrefix: model/
+#         tokenPrefix: token/
+#       conversationTTL: 10m
+#       responseTimeout: 2m
+#     service:
+#       port: 8082
+#     route:
+#       host: example.local

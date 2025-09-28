@@ -1,0 +1,17 @@
+{{- range .Values.ingresses }}
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: {{ required "ingresses[].name is required" .name }}
+  namespace: {{ default $.Release.Namespace .namespace }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+{{- if not .spec }}
+  {{- fail "ingresses[].spec must be provided" }}
+{{- end }}
+{{ toYaml .spec | indent 2 }}
+---
+{{- end }}

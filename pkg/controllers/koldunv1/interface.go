@@ -16,6 +16,8 @@ type Interface interface {
 	Model() generic.ControllerInterface[*v1.Model, *v1.ModelList]
 	Root() generic.ControllerInterface[*v1.Root, *v1.RootList]
 	Worker() generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+	Ingress() generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
+	Token() generic.ControllerInterface[*v1.Token, *v1.TokenList]
 }
 
 type version struct {
@@ -40,4 +42,12 @@ func (v *version) Root() generic.ControllerInterface[*v1.Root, *v1.RootList] {
 
 func (v *version) Worker() generic.ControllerInterface[*v1.Worker, *v1.WorkerList] {
 	return generic.NewController[*v1.Worker, *v1.WorkerList](v1.SchemeGroupVersion.WithKind("Worker"), "workers", true, v.controllerFactory)
+}
+
+func (v *version) Ingress() generic.ControllerInterface[*v1.Ingress, *v1.IngressList] {
+	return generic.NewController[*v1.Ingress, *v1.IngressList](v1.SchemeGroupVersion.WithKind("Ingress"), "ingresses", true, v.controllerFactory)
+}
+
+func (v *version) Token() generic.ControllerInterface[*v1.Token, *v1.TokenList] {
+	return generic.NewController[*v1.Token, *v1.TokenList](v1.SchemeGroupVersion.WithKind("Token"), "tokens", true, v.controllerFactory)
 }

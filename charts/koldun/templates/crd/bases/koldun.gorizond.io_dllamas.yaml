@@ -59,12 +59,32 @@ spec:
                       resource.
                     type: string
                   namespace:
-                    description: Namespace allows referencing a Model in another
-                      namespace. Defaults to the Dllama namespace when empty.
+                    description: Namespace allows referencing a Model in another namespace.
+                      Defaults to the Dllama namespace when empty.
                     type: string
                 required:
                 - kind
                 - name
+                type: object
+              nats:
+                description: NATS configures connectivity inherited by runtime pods.
+                properties:
+                  credentialsSecret:
+                    description: CredentialsSecret references a Secret containing
+                      NATS credentials (optional).
+                    properties:
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  url:
+                    description: URL is the NATS endpoint.
+                    type: string
+                required:
+                - url
                 type: object
               replicaPower:
                 description: ReplicaPower controls how many Worker resources are spawned

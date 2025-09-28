@@ -15,22 +15,24 @@ import (
 )
 
 type dllamaHandler struct {
-	ctx     context.Context
-	apply   apply.Apply
-	dllamas generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
-	models  generic.ControllerInterface[*v1.Model, *v1.ModelList]
-	roots   generic.ControllerInterface[*v1.Root, *v1.RootList]
-	workers generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+	ctx       context.Context
+	apply     apply.Apply
+	dllamas   generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
+	models    generic.ControllerInterface[*v1.Model, *v1.ModelList]
+	roots     generic.ControllerInterface[*v1.Root, *v1.RootList]
+	workers   generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+	ingresses generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
 }
 
 func registerDllamaController(ctx context.Context, m *Manager) error {
 	handler := &dllamaHandler{
-		ctx:     ctx,
-		apply:   m.Apply(ctx),
-		dllamas: m.Kold.Dllama(),
-		models:  m.Kold.Model(),
-		roots:   m.Kold.Root(),
-		workers: m.Kold.Worker(),
+		ctx:       ctx,
+		apply:     m.Apply(ctx),
+		dllamas:   m.Kold.Dllama(),
+		models:    m.Kold.Model(),
+		roots:     m.Kold.Root(),
+		workers:   m.Kold.Worker(),
+		ingresses: m.Kold.Ingress(),
 	}
 
 	handler.dllamas.OnChange(ctx, "koldun-dllama-controller", handler.onChange)
@@ -39,6 +41,7 @@ func registerDllamaController(ctx context.Context, m *Manager) error {
 	handler.models.OnChange(ctx, "koldun-dllama-model-watch", handler.onRelatedModel)
 	handler.roots.OnChange(ctx, "koldun-dllama-root-watch", handler.onRelatedRoot)
 	handler.workers.OnChange(ctx, "koldun-dllama-worker-watch", handler.onRelatedWorker)
+	handler.ingresses.OnChange(ctx, "koldun-dllama-ingress-watch", handler.onRelatedIngress)
 	return nil
 }
 
@@ -108,6 +111,21 @@ func (h *dllamaHandler) onRelatedWorker(key string, obj *v1.Worker) (*v1.Worker,
 	return obj, nil
 }
 
+func (h *dllamaHandler) onRelatedIngress(key string, obj *v1.Ingress) (*v1.Ingress, error) {
+	// When an ingress changes, we need to update all dllamas that might be using its NATS URL
+	dllamas, err := h.dllamas.Cache().List("", labels.Everything())
+	if err != nil {
+		return obj, err
+	}
+
+	// Trigger reconciliation for all dllamas since any of them might be using this ingress's NATS URL
+	for _, dllama := range dllamas {
+		h.dllamas.Enqueue(dllama.Namespace, dllama.Name)
+	}
+
+	return obj, nil
+}
+
 func (h *dllamaHandler) ensureTopology(dllama *v1.Dllama) error {
 	setID := fmt.Sprintf("dllama-%s", dllama.Name)
 	apply := h.apply.WithOwner(dllama).
@@ -157,11 +175,29 @@ func (h *dllamaHandler) desiredObjects(dllama *v1.Dllama, model *v1.Model) []run
 }
 
 func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root {
+	conversationHashLabel := labelValue(dllama.Labels, labelConversationHash)
+	conversationHashAnnotation := labelValue(dllama.Annotations, labelConversationHash)
+	if conversationHashAnnotation == "" {
+		conversationHashAnnotation = conversationHashLabel
+	}
+
 	rootLabels := map[string]string{
-		labelDllamaName: dllama.Name,
-		labelComponent:  componentRoot,
-		labelRootName:   fmt.Sprintf("%s-root", dllama.Name),
-		labelModelName:  model.Name,
+		labelDllamaName:       dllama.Name,
+		labelComponent:        componentRoot,
+		labelRootName:         fmt.Sprintf("%s-root", dllama.Name),
+		labelModelName:        model.Name,
+		labelConversationHash: conversationHashLabel,
+	}
+
+	natsConfig := dllama.Spec.NATS.ToRootConfig()
+	// Copy NATS URL from ingress if dllama doesn't have its own NATS config
+	if natsConfig == nil || natsConfig.URL == "" {
+		if ingressNatsURL := h.getIngressNatsURL(dllama); ingressNatsURL != "" {
+			if natsConfig == nil {
+				natsConfig = &v1.RootNATSConfig{}
+			}
+			natsConfig.URL = ingressNatsURL
+		}
 	}
 
 	return &v1.Root{
@@ -170,51 +206,66 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 			Kind:       "Root",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("%s-root", dllama.Name),
-			Namespace: dllama.Namespace,
-			Labels:    rootLabels,
+			Name:        fmt.Sprintf("%s-root", dllama.Name),
+			Namespace:   dllama.Namespace,
+			Labels:      rootLabels,
+			Annotations: map[string]string{labelConversationHash: conversationHashAnnotation},
 		},
 		Spec: v1.RootSpec{
 			ModelRef:       model.Status.OutputPVCName,
 			Image:          dllama.Spec.RootImage,
 			WorkerSelector: map[string]string{labelDllamaName: dllama.Name},
+			NATS:           natsConfig,
 		},
 	}
 }
 
 func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1.Worker {
-	var result []*v1.Worker
-	workerCount := workersForReplicaPower(dllama.Spec.ReplicaPower)
-
-	for i := int32(0); i < workerCount; i++ {
-		workerLabels := map[string]string{
-			labelDllamaName: dllama.Name,
-			labelComponent:  componentWorker,
-			labelWorkerName: fmt.Sprintf("%s-worker-%d", dllama.Name, i),
-			labelModelName:  model.Name,
-		}
-
-		worker := &v1.Worker{
-			TypeMeta: metav1.TypeMeta{
-				APIVersion: v1.SchemeGroupVersion.String(),
-				Kind:       "Worker",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      fmt.Sprintf("%s-worker-%d", dllama.Name, i),
-				Namespace: dllama.Namespace,
-				Labels:    workerLabels,
-			},
-			Spec: v1.WorkerSpec{
-				ModelRef: model.Status.OutputPVCName,
-				Image:    dllama.Spec.WorkerImage,
-				RootRef:  fmt.Sprintf("%s-root", dllama.Name),
-				Slot:     i,
-			},
-		}
-		result = append(result, worker)
+	workerLabels := map[string]string{
+		labelDllamaName:       dllama.Name,
+		labelComponent:        componentWorker,
+		labelWorkerName:       fmt.Sprintf("%s-workers", dllama.Name),
+		labelModelName:        model.Name,
+		labelConversationHash: labelValue(dllama.Labels, labelConversationHash),
 	}
 
-	return result
+	conversationHashAnnotation := labelValue(dllama.Annotations, labelConversationHash)
+	if conversationHashAnnotation == "" {
+		conversationHashAnnotation = labelValue(dllama.Labels, labelConversationHash)
+	}
+
+	natsConfig := dllama.Spec.NATS.ToWorkerConfig()
+	// Copy NATS URL from ingress if dllama doesn't have its own NATS config
+	if natsConfig == nil || natsConfig.URL == "" {
+		if ingressNatsURL := h.getIngressNatsURL(dllama); ingressNatsURL != "" {
+			if natsConfig == nil {
+				natsConfig = &v1.WorkerNATSConfig{}
+			}
+			natsConfig.URL = ingressNatsURL
+		}
+	}
+
+	worker := &v1.Worker{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: v1.SchemeGroupVersion.String(),
+			Kind:       "Worker",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        fmt.Sprintf("%s-workers", dllama.Name),
+			Namespace:   dllama.Namespace,
+			Labels:      workerLabels,
+			Annotations: map[string]string{labelConversationHash: conversationHashAnnotation},
+		},
+		Spec: v1.WorkerSpec{
+			ModelRef: model.Status.OutputPVCName,
+			Image:    dllama.Spec.WorkerImage,
+			RootRef:  fmt.Sprintf("%s-root", dllama.Name),
+			Slot:     0,
+			NATS:     natsConfig,
+		},
+	}
+
+	return []*v1.Worker{worker}
 }
 
 const maxInt32 = int64(^uint32(0) >> 1)
@@ -232,6 +283,35 @@ func workersForReplicaPower(power int32) int32 {
 		return 0
 	}
 	return int32(result)
+}
+
+func (h *dllamaHandler) getIngressNatsURL(dllama *v1.Dllama) string {
+	// Get all ingresses in the same namespace
+	ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything())
+	if err != nil {
+		return ""
+	}
+
+	// Find the first ingress that has a NATS URL configured
+	for _, ing := range ingresses {
+		if ing.Spec.Backend.NATS.URL != "" {
+			return ing.Spec.Backend.NATS.URL
+		}
+	}
+
+	// If no ingress found in same namespace, try cluster-wide search
+	allIngresses, err := h.ingresses.Cache().List("", labels.Everything())
+	if err != nil {
+		return ""
+	}
+
+	for _, ing := range allIngresses {
+		if ing.Spec.Backend.NATS.URL != "" {
+			return ing.Spec.Backend.NATS.URL
+		}
+	}
+
+	return ""
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
