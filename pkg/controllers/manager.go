@@ -55,7 +55,6 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			kold.Root(),
 			kold.Worker(),
 			kold.Ingress(),
-			kold.Token(),
 			apps.Deployment(),
 			apps.StatefulSet(),
 			batch.Job(),

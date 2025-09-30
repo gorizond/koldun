@@ -58,23 +58,31 @@ The same binary now exposes two auxiliary services that can be enabled with the 
 | `backend` | HTTP edge that authenticates tokens, derives `hash_koldun`, manages JetStream TTL records, and bridges chat requests to NATS |
 | `llm` | Worker that listens on `in.<hash_koldun>` subjects, proxies requests to the local dllama-api sidecar and streams responses back on `out.<hash_koldun>` |
 
-#### Token CRD
+#### Token Secrets
 
-API clients authenticate with an API token stored in the new `Token` custom resource:
+API clients authenticate with API tokens stored as standard Kubernetes Secrets carrying the `koldun.gorizond.io/token` label:
 
 ```yaml
-apiVersion: koldun.gorizond.io/v1
-kind: Token
+apiVersion: v1
+kind: Secret
 metadata:
   name: my-token
   namespace: default
-spec:
+  labels:
+    koldun.gorizond.io/token: "true"
+  annotations:
+    koldun.gorizond.io/token-metadata-owner: alice@example.com
+stringData:
   hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-  metadata:
-    owner: alice@example.com
+  disabled: "false"
+  metadata: '{"notes":"internal demo"}'
 ```
 
-The operator mirrors every `Token` into the JetStream registry bucket (`koldun_tokens` by default). The backend hashes the provided `KOLDUN_API_TOKEN` header (SHA-256 hex) and validates it against that registry; disabled tokens are rejected with HTTP 401.
+- `stringData.hash` must contain the lowercase SHA-256 hex digest of the client token.
+- `stringData.disabled` (or annotation `koldun.gorizond.io/token-disabled`) disables the token when set to a truthy value (`true`, `1`, `yes`, `on`).
+- `stringData.metadata` accepts an optional JSON object mirrored to the registry. Additional metadata entries can also be supplied via annotations prefixed with `koldun.gorizond.io/token-metadata-`.
+
+The operator mirrors every labelled Secret into the JetStream registry bucket (`koldun_tokens` by default). The backend hashes the provided `KOLDUN_API_TOKEN` header (SHA-256 hex) and validates it against that registry; disabled tokens are rejected with HTTP 401.
 
 #### Backend Edge (`--mode=backend`)
 
@@ -161,7 +169,7 @@ The controller renders a Deployment with `--mode=backend`, a ClusterIP Service e
 - `spec.service.type` may be set to `LoadBalancer` or `NodePort` when required.
 - TLS hosts and annotations map directly to the `Ingress` manifest.
 
-The Helm chart includes CRDs for `Ingress` and `Token`. You can declare multiple ingress instances via `values.yaml` under the `ingresses` array—`helm install` renders one manifest per entry using `templates/ingress-cr.yaml`.
+The Helm chart bundles the `Ingress` CRD; API tokens rely on standard Secrets labelled `koldun.gorizond.io/token`. You can declare multiple ingress instances via `values.yaml` under the `ingresses` array—`helm install` renders one manifest per entry using `templates/ingress-cr.yaml`.
 
 #### LLM Worker (`--mode=llm`)
 

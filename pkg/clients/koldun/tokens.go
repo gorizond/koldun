@@ -3,80 +3,80 @@ package koldun
 import (
 	"context"
 	"fmt"
+	"strings"
 
-	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/registry"
+	"github.com/gorizond/koldun/pkg/tokens"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
-var tokenGVR = schema.GroupVersionResource{
-	Group:    v1.GroupName,
-	Version:  v1.Version,
-	Resource: "tokens",
-}
-
-// TokenClient wraps access to Token custom resources using the dynamic client.
+// TokenClient wraps access to Secrets that model Koldun API tokens.
 type TokenClient struct {
-	resource dynamic.NamespaceableResourceInterface
+	client kubernetes.Interface
 }
 
-// NewTokenClient creates a Token client using the supplied Kubernetes REST config.
+// NewTokenClient creates a token Secret client using the supplied Kubernetes REST config.
 func NewTokenClient(cfg *rest.Config) (*TokenClient, error) {
-	dyn, err := dynamic.NewForConfig(cfg)
+	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("build dynamic client: %w", err)
+		return nil, fmt.Errorf("build kubernetes client: %w", err)
 	}
-	return &TokenClient{resource: dyn.Resource(tokenGVR)}, nil
+	return &TokenClient{client: client}, nil
 }
 
-// List returns all Token resources within the supplied namespace.
-// When namespace is empty, resources from all namespaces are returned.
-func (c *TokenClient) List(ctx context.Context, namespace string) ([]v1.Token, error) {
-	var (
-		list *unstructured.UnstructuredList
-		err  error
-	)
-	if namespace == "" {
-		list, err = c.resource.List(ctx, metav1.ListOptions{})
-	} else {
-		list, err = c.resource.Namespace(namespace).List(ctx, metav1.ListOptions{})
-	}
-	if err != nil {
-		return nil, fmt.Errorf("list tokens: %w", err)
+// List returns all token Secrets within the supplied namespace.
+// When namespace is empty, Secrets from all namespaces are returned.
+func (c *TokenClient) List(ctx context.Context, namespace string) ([]registry.Token, error) {
+	if c == nil || c.client == nil {
+		return nil, fmt.Errorf("token client not initialised")
 	}
 
-	items := make([]v1.Token, 0, len(list.Items))
-	for i := range list.Items {
-		obj := list.Items[i]
-		token, err := toToken(&obj)
-		if err != nil {
-			return nil, fmt.Errorf("convert token %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
+	ns := namespace
+	if strings.TrimSpace(ns) == "" {
+		ns = metav1.NamespaceAll
+	}
+
+	secrets, err := c.client.CoreV1().Secrets(ns).List(ctx, metav1.ListOptions{LabelSelector: tokens.LabelToken})
+	if err != nil {
+		return nil, fmt.Errorf("list token secrets: %w", err)
+	}
+
+	items := make([]registry.Token, 0, len(secrets.Items))
+	for i := range secrets.Items {
+		secret := secrets.Items[i]
+		if !tokens.IsTokenSecret(&secret) {
+			continue
 		}
-		items = append(items, *token)
+		entry, err := tokens.ExtractRegistryToken(&secret)
+		if err != nil {
+			return nil, fmt.Errorf("convert token secret %s/%s: %w", secret.Namespace, secret.Name, err)
+		}
+		items = append(items, *entry)
 	}
 	return items, nil
 }
 
-// Get returns a single Token resource by namespace and name.
-func (c *TokenClient) Get(ctx context.Context, namespace, name string) (*v1.Token, error) {
-	if namespace == "" {
-		return nil, fmt.Errorf("namespace is required for Token lookup")
+// Get returns a single token Secret by namespace and name.
+func (c *TokenClient) Get(ctx context.Context, namespace, name string) (*registry.Token, error) {
+	if c == nil || c.client == nil {
+		return nil, fmt.Errorf("token client not initialised")
 	}
-	u, err := c.resource.Namespace(namespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get token %s/%s: %w", namespace, name, err)
+	if strings.TrimSpace(namespace) == "" {
+		return nil, fmt.Errorf("namespace is required for token Secret lookup")
 	}
-	return toToken(u)
-}
 
-func toToken(u *unstructured.Unstructured) (*v1.Token, error) {
-	token := new(v1.Token)
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, token); err != nil {
-		return nil, err
+	secret, err := c.client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get token secret %s/%s: %w", namespace, name, err)
 	}
-	return token, nil
+	if !tokens.IsTokenSecret(secret) {
+		return nil, fmt.Errorf("secret %s/%s is not labelled as a koldun token", namespace, name)
+	}
+	entry, err := tokens.ExtractRegistryToken(secret)
+	if err != nil {
+		return nil, fmt.Errorf("convert token secret %s/%s: %w", namespace, name, err)
+	}
+	return entry, nil
 }

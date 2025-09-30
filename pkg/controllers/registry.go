@@ -9,9 +9,12 @@ import (
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/registry"
+	"github.com/gorizond/koldun/pkg/tokens"
 	"github.com/nats-io/nats.go"
+	corecontrollers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // RegistryConfig configures publication of Models and Tokens to the shared NATS registry.
@@ -24,10 +27,10 @@ type RegistryConfig struct {
 }
 
 type registrySync struct {
-	cfg    RegistryConfig
-	log    *logrus.Entry
-	models generic.ControllerInterface[*v1.Model, *v1.ModelList]
-	tokens generic.ControllerInterface[*v1.Token, *v1.TokenList]
+	cfg     RegistryConfig
+	log     *logrus.Entry
+	models  generic.ControllerInterface[*v1.Model, *v1.ModelList]
+	secrets corecontrollers.SecretController
 
 	conn     *nats.Conn
 	js       nats.JetStreamContext
@@ -79,7 +82,7 @@ func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) erro
 		cfg:      cfg,
 		log:      logrus.StandardLogger().WithField("component", "registry-sync"),
 		models:   m.Kold.Model(),
-		tokens:   m.Kold.Token(),
+		secrets:  m.Core.Secret(),
 		conn:     conn,
 		js:       js,
 		modelsKV: modelsKV,
@@ -88,8 +91,8 @@ func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) erro
 
 	sync.models.OnChange(ctx, "registry-sync-model", sync.onModelChange)
 	sync.models.OnRemove(ctx, "registry-sync-model-remove", sync.onModelRemove)
-	sync.tokens.OnChange(ctx, "registry-sync-token", sync.onTokenChange)
-	sync.tokens.OnRemove(ctx, "registry-sync-token-remove", sync.onTokenRemove)
+	sync.secrets.OnChange(ctx, "registry-sync-token", sync.onSecretChange)
+	sync.secrets.OnRemove(ctx, "registry-sync-token-remove", sync.onSecretRemove)
 
 	go func() {
 		<-ctx.Done()
@@ -149,42 +152,56 @@ func (r *registrySync) onModelRemove(key string, model *v1.Model) (*v1.Model, er
 	return model, nil
 }
 
-func (r *registrySync) onTokenChange(key string, token *v1.Token) (*v1.Token, error) {
-	if token == nil {
+func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev1.Secret, error) {
+	if secret == nil {
 		return nil, nil
 	}
 
-	entry := registry.Token{
-		Hash:      strings.ToLower(strings.TrimSpace(token.Spec.Hash)),
-		Disabled:  token.Spec.Disabled,
-		Namespace: token.Namespace,
-		Metadata:  token.Spec.Metadata,
+	hash := tokens.Hash(secret)
+	if !tokens.IsTokenSecret(secret) {
+		if hash != "" {
+			if err := r.deleteToken(hash); err != nil {
+				r.log.WithError(err).
+					WithField("token", hash).
+					WithField("secret", modelKey(secret.Namespace, secret.Name)).
+					Warn("remove token from registry")
+			}
+		}
+		return secret, nil
 	}
 
-	if entry.Hash == "" {
-		r.log.WithField("token", token.Name).Warn("token hash empty; skipping registry publish")
-		return token, nil
+	entry, err := tokens.ExtractRegistryToken(secret)
+	if err != nil {
+		r.log.WithError(err).
+			WithField("secret", modelKey(secret.Namespace, secret.Name)).
+			Warn("skip token secret")
+		return secret, nil
 	}
 
-	if err := r.putToken(&entry); err != nil {
-		r.log.WithError(err).WithField("token", entry.Hash).Error("publish token registry entry")
-		return token, err
+	if err := r.putToken(entry); err != nil {
+		r.log.WithError(err).
+			WithField("token", entry.Hash).
+			Error("publish token registry entry")
+		return secret, err
 	}
-	return token, nil
+	return secret, nil
 }
 
-func (r *registrySync) onTokenRemove(key string, token *v1.Token) (*v1.Token, error) {
-	if token == nil {
+func (r *registrySync) onSecretRemove(key string, secret *corev1.Secret) (*corev1.Secret, error) {
+	if secret == nil {
 		return nil, nil
 	}
-	hash := strings.ToLower(strings.TrimSpace(token.Spec.Hash))
+	hash := tokens.Hash(secret)
 	if hash == "" {
-		return token, nil
+		return secret, nil
 	}
 	if err := r.deleteToken(hash); err != nil {
-		r.log.WithError(err).WithField("token", hash).Warn("remove token from registry")
+		r.log.WithError(err).
+			WithField("token", hash).
+			WithField("secret", modelKey(secret.Namespace, secret.Name)).
+			Warn("remove token from registry")
 	}
-	return token, nil
+	return secret, nil
 }
 
 func (r *registrySync) putModel(model *registry.Model) error {
