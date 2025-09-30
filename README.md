@@ -56,7 +56,7 @@ The same binary now exposes two auxiliary services that can be enabled with the 
 | --- | --- |
 | `operator` | Default reconciliation loop (existing behaviour) |
 | `backend` | HTTP edge that authenticates tokens, derives `hash_koldun`, manages JetStream TTL records, and bridges chat requests to NATS |
-| `llm` | Worker that listens on `in_<hash_koldun>` subjects, proxies requests to the local dllama-api sidecar and streams responses back on `out_<hash_koldun>` |
+| `llm` | Worker that listens on `in.<hash_koldun>` subjects, proxies requests to the local dllama-api sidecar and streams responses back on `out.<hash_koldun>` |
 
 #### Token CRD
 
@@ -83,8 +83,8 @@ go run ./cmd/operator \
   -mode=backend \
   -backend-namespace default \
   -backend-nats-url nats://koldun:k0ldun@nats.default:4222 \
-  -backend-in-prefix in_ \
-  -backend-out-prefix out_ \
+  -backend-in-prefix in. \
+  -backend-out-prefix out. \
   -backend-ttl-prefix nats_ttl_ \
   -backend-conversation-bucket koldun_ttl \
   -backend-models-bucket koldun_models \
@@ -100,7 +100,7 @@ Request flow:
    - Computes `hash_koldun = make_id(token, chat_id, chat_start_time)` per the supplied Python reference (now re-implemented in Go).
    - Ensures a JetStream KeyValue entry `nats_ttl_<hash>` exists with JSON payload describing the requested model, namespace, replica power, and a generated Dllama name (`dllama-<timestamp>-<hash>`). The entry TTL is refreshed on every request.
    - Looks up the requested model in the registry bucket (default `koldun_models`) to verify readiness (`outputPVCName` + size metadata) and capture its desired `replicaPower`.
-   - Subscribes to `out_<hash>` and publishes the OpenAI payload (plus metadata) to `in_<hash>`. Streaming responses are proxied to the HTTP client as `text/event-stream`, forwarding raw chunks and emitting `[DONE]` when finished.
+   - Subscribes to `out.<hash>` and publishes the OpenAI payload (plus metadata) to `in.<hash>`. Streaming responses are proxied to the HTTP client as `text/event-stream`, forwarding raw chunks and emitting `[DONE]` when finished.
 
 2. `GET /v1/models`
    - Returns the ready models currently published in the registry bucket so OpenAI-compatible clients can discover available deployments.
@@ -171,20 +171,20 @@ go run ./cmd/operator \
   -llm-hash "$HASH_KOLDUN" \
   -llm-nats-url nats://koldun:k0ldun@nats.default:4222 \
   -llm-sidecar-url http://127.0.0.1:8080 \
-  -llm-in-prefix in_ \
-  -llm-out-prefix out_
+  -llm-in-prefix in. \
+  -llm-out-prefix out.
 ```
 
 - Reads `hash_koldun` from `--llm-hash` (defaults to the `HASH_KOLDUN` env variable).
-- Subscribes to `in_<hash>` subjects, forwards requests to the colocated dllama-api sidecar (`/v1/chat/completions`), and publishes streaming chunks back to `out_<hash>` (terminating with `[DONE]`).
+- Subscribes to `in.<hash>` subjects, forwards requests to the colocated dllama-api sidecar (`/v1/chat/completions`), and publishes streaming chunks back to `out.<hash>` (terminating with `[DONE]`).
 - Exposes `/healthz` and `/readyz` for liveness checks when `--llm-health-only` is false.
 
 ### Conversation Lifecycle
 
 Every active chat produces three coordinated channels/key entries:
 
-- `in_<hash_koldun>` — backend publishes new user prompts; the LLM worker subscribes.
-- `out_<hash_koldun>` — LLM worker streams responses; the backend subscribes and relays to the client.
+- `in.<hash_koldun>` — backend publishes new user prompts; the LLM worker subscribes.
+- `out.<hash_koldun>` — LLM worker streams responses; the backend subscribes and relays to the client.
 - `nats_ttl_<hash_koldun>` — JetStream KV record containing `{dllama, model, namespace, replicaPower}` with bucket TTL (default 10 minutes). The operator reconciler ensures a matching `Dllama` resource exists while the key is present and prunes stale `Dllama` objects once the key expires.
 
 #### Operator Conversation Reconciler (`--mode=operator`)

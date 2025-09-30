@@ -27,12 +27,14 @@ const (
 	defaultConversationBucket = "koldun_ttl"
 	defaultModelsBucket       = registry.DefaultModelBucket
 	defaultTokensBucket       = registry.DefaultTokenBucket
-	defaultInPrefix           = "in_"
-	defaultOutPrefix          = "out_"
+	defaultInPrefix           = "in."
+	defaultOutPrefix          = "out."
 	defaultTTLPrefix          = "nats_ttl_"
 	defaultModelPrefix        = registry.DefaultModelPrefix
 	defaultTokenPrefix        = registry.DefaultTokenPrefix
 	tokenCacheTTL             = 5 * time.Minute
+
+	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 )
 
 // Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
@@ -72,6 +74,7 @@ type Server struct {
 	tokensKV nats.KeyValue
 
 	httpServer *http.Server
+	streamName string
 
 	tokenCache struct {
 		mu      sync.RWMutex
@@ -148,6 +151,12 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("jetstream context: %w", err)
 	}
 
+	streamName, err := ensureRequestStream(js, cfg.InPrefix)
+	if err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("request stream: %w", err)
+	}
+
 	convKV, err := ensureBucket(js, &nats.KeyValueConfig{
 		Bucket:  cfg.ConversationBucket,
 		TTL:     cfg.ConversationTTL,
@@ -177,13 +186,14 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	srv := &Server{
-		cfg:      cfg,
-		log:      log,
-		raw:      raw,
-		nc:       js,
-		convKV:   convKV,
-		modelsKV: modelsKV,
-		tokensKV: tokensKV,
+		cfg:        cfg,
+		log:        log,
+		raw:        raw,
+		nc:         js,
+		convKV:     convKV,
+		modelsKV:   modelsKV,
+		tokensKV:   tokensKV,
+		streamName: streamName,
 	}
 	srv.tokenCache.values = make(map[string]tokenEntry)
 	return srv, nil
@@ -198,6 +208,40 @@ func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig) (nats.KeyV
 		kv, err = js.CreateKeyValue(cfg)
 	}
 	return kv, err
+}
+
+func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "", fmt.Errorf("in-prefix is required for request stream")
+	}
+	if !strings.HasSuffix(prefix, ".") {
+		return "", fmt.Errorf("in-prefix %q must end with '.' to enable durable delivery", prefix)
+	}
+
+	subject := prefix + ">"
+	cfg := &nats.StreamConfig{
+		Name:      llmRequestStreamName,
+		Subjects:  []string{subject},
+		Retention: nats.WorkQueuePolicy,
+		Storage:   nats.FileStorage,
+	}
+
+	if _, err := js.StreamInfo(llmRequestStreamName); err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			if _, err := js.AddStream(cfg); err != nil {
+				return "", fmt.Errorf("create stream: %w", err)
+			}
+		} else {
+			return "", fmt.Errorf("stream info: %w", err)
+		}
+	} else {
+		if _, err := js.UpdateStream(cfg); err != nil {
+			return "", fmt.Errorf("update stream: %w", err)
+		}
+	}
+
+	return llmRequestStreamName, nil
 }
 
 // Run starts the HTTP server and blocks until shutdown.
@@ -425,7 +469,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.raw.Publish(subjectIn, body); err != nil {
+	if _, err := s.nc.Publish(subjectIn, body); err != nil {
 		s.log.WithError(err).Error("publish request")
 		writeError(w, http.StatusBadGateway, "failed to enqueue request")
 		return

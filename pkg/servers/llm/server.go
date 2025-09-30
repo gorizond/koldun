@@ -2,6 +2,7 @@ package llm
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,8 +22,13 @@ import (
 const (
 	defaultListenAddress = ":8081"
 	defaultSidecarURL    = "http://127.0.0.1:8080"
-	defaultInPrefix      = "in_"
-	defaultOutPrefix     = "out_"
+	defaultInPrefix      = "in."
+	defaultOutPrefix     = "out."
+
+	sidecarModelsPath          = "/v1/models"
+	sidecarChatCompletionsPath = "/v1/chat/completions"
+
+	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 )
 
 // Config holds runtime parameters for the LLM worker.
@@ -48,9 +54,13 @@ type Server struct {
 	log *logrus.Entry
 
 	nc *nats.Conn
+	js nats.JetStreamContext
 
 	httpServer *http.Server
 	client     *http.Client
+
+	sub        *nats.Subscription
+	streamName string
 
 	inSubject  string
 	outSubject string
@@ -102,26 +112,66 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("connect NATS: %w", err)
 	}
 
+	js, err := nc.JetStream()
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("jetstream context: %w", err)
+	}
+
+	streamName, err := ensureRequestStream(js, cfg.InPrefix)
+	if err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("request stream: %w", err)
+	}
+
 	client := &http.Client{Timeout: cfg.SidecarTimeout}
 
 	srv := &Server{
 		cfg:        cfg,
 		log:        log,
 		nc:         nc,
+		js:         js,
 		client:     client,
 		inSubject:  cfg.InPrefix + cfg.Hash,
 		outSubject: cfg.OutPrefix + cfg.Hash,
+		streamName: streamName,
 	}
 	return srv, nil
 }
 
 // Run starts the subscription loop and health endpoint until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	sub, err := s.nc.Subscribe(s.inSubject, s.handleMessage)
+	if err := s.waitForSidecar(ctx); err != nil {
+		return fmt.Errorf("wait for dllama sidecar: %w", err)
+	}
+
+	queueName := durableName(s.cfg.Hash)
+	ackWait := s.cfg.SidecarTimeout
+	if ackWait <= 0 {
+		ackWait = 2 * time.Minute
+	} else {
+		ackWait += 30 * time.Second
+	}
+
+	sub, err := s.js.QueueSubscribe(
+		s.inSubject,
+		queueName,
+		s.handleMessage,
+		nats.ManualAck(),
+		nats.Durable(queueName),
+		nats.BindStream(s.streamName),
+		nats.AckWait(ackWait),
+		nats.MaxAckPending(32),
+	)
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", s.inSubject, err)
 	}
-	s.log.Infof("subscribed to %s", s.inSubject)
+	s.sub = sub
+	s.log.WithFields(logrus.Fields{
+		"subject": s.inSubject,
+		"queue":   queueName,
+		"stream":  s.streamName,
+	}).Info("subscribed to request stream")
 
 	errCh := make(chan error, 1)
 
@@ -147,7 +197,11 @@ func (s *Server) Run(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		s.log.Info("llm server shutting down")
-		_ = sub.Drain()
+		if s.sub != nil {
+			if err := s.sub.Drain(); err != nil {
+				s.log.WithError(err).Warn("drain subscription")
+			}
+		}
 		s.wg.Wait()
 		s.nc.Drain()
 		if s.httpServer != nil {
@@ -165,6 +219,70 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+func (s *Server) waitForSidecar(ctx context.Context) error {
+	endpoint, err := s.sidecarEndpoint(sidecarModelsPath)
+	if err != nil {
+		return err
+	}
+
+	s.log.WithField("endpoint", endpoint.String()).Info("waiting for dllama-api sidecar")
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	deadline := time.Now().Add(s.cfg.SidecarTimeout)
+	var lastErr error
+
+	for {
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			cancel()
+			return fmt.Errorf("build sidecar probe: %w", err)
+		}
+
+		res, err := s.client.Do(req)
+		cancel()
+
+		if err == nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+			res.Body.Close()
+			if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+				s.log.WithField("endpoint", endpoint.String()).Info("dllama-api sidecar is ready")
+				return nil
+			}
+			err = fmt.Errorf("unexpected status %d", res.StatusCode)
+		} else if ctx.Err() != nil {
+			return nil
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("probe timed out: %w", err)
+		}
+
+		lastErr = err
+
+		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("timeout waiting for dllama-api sidecar: %w", lastErr)
+			}
+			return fmt.Errorf("timeout waiting for dllama-api sidecar")
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) sidecarEndpoint(path string) (*url.URL, error) {
+	base, err := url.Parse(s.cfg.SidecarURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid sidecar url: %w", err)
+	}
+	return base.ResolveReference(&url.URL{Path: path}), nil
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.nc == nil || s.nc.Status() != nats.CONNECTED {
 		http.Error(w, "nats not connected", http.StatusServiceUnavailable)
@@ -175,8 +293,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessage(msg *nats.Msg) {
+	if msg == nil {
+		return
+	}
+
 	s.wg.Add(1)
 	defer s.wg.Done()
+
+	defer func() {
+		if err := msg.Ack(); err != nil {
+			s.log.WithError(err).Warn("ack request message")
+		}
+	}()
 
 	var payload inboundRequest
 	if err := json.Unmarshal(msg.Data, &payload); err != nil {
@@ -190,31 +318,34 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		"model":  payload.Model,
 	}).Info("processing request")
 
+	var err error
 	if payload.Request.Stream {
-		s.streamToSidecar(payload)
-		return
+		err = s.streamToSidecar(payload)
+	} else {
+		err = s.executeOnce(payload)
 	}
-	s.executeOnce(payload)
+	if err != nil {
+		s.log.WithError(err).Warn("request handling failed")
+	}
 }
 
-func (s *Server) streamToSidecar(payload inboundRequest) {
-	endpoint, err := url.Parse(s.cfg.SidecarURL)
+func (s *Server) streamToSidecar(payload inboundRequest) error {
+	endpoint, err := s.sidecarEndpoint(sidecarChatCompletionsPath)
 	if err != nil {
-		s.log.WithError(err).Error("invalid sidecar url")
-		return
+		s.log.WithError(err).Error("resolve sidecar endpoint")
+		return err
 	}
-	endpoint = endpoint.ResolveReference(&url.URL{Path: "/v1/chat/completions"})
 
 	body, err := json.Marshal(payload.Request)
 	if err != nil {
 		s.log.WithError(err).Error("marshal request")
-		return
+		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, endpoint.String(), strings.NewReader(string(body)))
+	req, err := http.NewRequest(http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		s.log.WithError(err).Error("build sidecar request")
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -225,14 +356,15 @@ func (s *Server) streamToSidecar(payload inboundRequest) {
 	if err != nil {
 		s.log.WithError(err).Error("sidecar request failed")
 		s.publishError(fmt.Sprintf("sidecar request failed: %v", err))
-		return
+		return err
 	}
 	defer res.Body.Close()
 
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		s.publishError(fmt.Sprintf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody))))
-		return
+		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		s.publishError(err.Error())
+		return err
 	}
 
 	scanner := bufio.NewScanner(res.Body)
@@ -251,54 +383,59 @@ func (s *Server) streamToSidecar(payload inboundRequest) {
 	}
 	if err := scanner.Err(); err != nil {
 		s.log.WithError(err).Warn("stream read error")
+		return err
 	}
 	if err := s.nc.Publish(s.outSubject, []byte("[DONE]")); err != nil {
 		s.log.WithError(err).Warn("publish done marker")
+		return err
 	}
+	return nil
 }
 
-func (s *Server) executeOnce(payload inboundRequest) {
-	endpoint, err := url.Parse(s.cfg.SidecarURL)
+func (s *Server) executeOnce(payload inboundRequest) error {
+	endpoint, err := s.sidecarEndpoint(sidecarChatCompletionsPath)
 	if err != nil {
-		s.log.WithError(err).Error("invalid sidecar url")
-		return
+		s.log.WithError(err).Error("resolve sidecar endpoint")
+		return err
 	}
-	endpoint = endpoint.ResolveReference(&url.URL{Path: "/v1/chat/completions"})
 
 	body, err := json.Marshal(payload.Request)
 	if err != nil {
 		s.log.WithError(err).Error("marshal request")
-		return
+		return err
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint.String(), strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		s.log.WithError(err).Error("build sidecar request")
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	res, err := s.client.Do(req)
 	if err != nil {
 		s.publishError(fmt.Sprintf("sidecar request failed: %v", err))
-		return
+		return err
 	}
 	defer res.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(res.Body, 10<<20))
 	if err != nil {
 		s.publishError(fmt.Sprintf("read sidecar response failed: %v", err))
-		return
+		return err
 	}
 
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		s.publishError(fmt.Sprintf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody))))
-		return
+	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		s.publishError(err.Error())
+		return err
 	}
 
 	if err := s.nc.Publish(s.outSubject, respBody); err != nil {
 		s.log.WithError(err).Warn("publish response")
+		return err
 	}
+	return nil
 }
 
 func (s *Server) publishError(msg string) {
@@ -309,4 +446,57 @@ func (s *Server) publishError(msg string) {
 	body, _ := json.Marshal(errPayload)
 	_ = s.nc.Publish(s.outSubject, body)
 	_ = s.nc.Publish(s.outSubject, []byte("[DONE]"))
+}
+
+func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "", fmt.Errorf("in-prefix is required for request stream")
+	}
+	if !strings.HasSuffix(prefix, ".") {
+		return "", fmt.Errorf("in-prefix %q must end with '.' to enable durable delivery", prefix)
+	}
+
+	subject := prefix + ">"
+	cfg := &nats.StreamConfig{
+		Name:      llmRequestStreamName,
+		Subjects:  []string{subject},
+		Retention: nats.WorkQueuePolicy,
+		Storage:   nats.FileStorage,
+	}
+
+	if _, err := js.StreamInfo(llmRequestStreamName); err != nil {
+		if errors.Is(err, nats.ErrStreamNotFound) {
+			if _, err := js.AddStream(cfg); err != nil {
+				return "", fmt.Errorf("create stream: %w", err)
+			}
+		} else {
+			return "", fmt.Errorf("stream info: %w", err)
+		}
+	} else {
+		if _, err := js.UpdateStream(cfg); err != nil {
+			return "", fmt.Errorf("update stream: %w", err)
+		}
+	}
+
+	return llmRequestStreamName, nil
+}
+
+func durableName(hash string) string {
+	hash = strings.TrimSpace(hash)
+	if hash == "" {
+		return "llm-default"
+	}
+
+	var b strings.Builder
+	b.Grow(len(hash) + 4)
+	b.WriteString("llm-")
+	for _, r := range hash {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	return b.String()
 }
