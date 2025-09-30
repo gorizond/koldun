@@ -1,4 +1,4 @@
-package backend
+package ingress
 
 import (
 	"context"
@@ -35,7 +35,7 @@ const (
 	tokenCacheTTL             = 5 * time.Minute
 )
 
-// Config drives the behaviour of the backend worker that bridges HTTP chat requests to NATS.
+// Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
 type Config struct {
 	ListenAddress string
 	Namespace     string
@@ -60,7 +60,7 @@ type Config struct {
 	Logger *logrus.Entry
 }
 
-// Server consumes chat completion requests, coordinates TTL records, and relays messages over NATS.
+// Server consumes chat completion requests, coordinates TTL records, and relays messages over NATS for ingress traffic.
 type Server struct {
 	cfg Config
 	log *logrus.Entry
@@ -84,7 +84,7 @@ type tokenEntry struct {
 	disabled bool
 }
 
-// New constructs the backend server.
+// New constructs the ingress server.
 func New(cfg Config) (*Server, error) {
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = defaultListenAddress
@@ -134,10 +134,10 @@ func New(cfg Config) (*Server, error) {
 
 	log := cfg.Logger
 	if log == nil {
-		log = logrus.StandardLogger().WithField("component", "koldun-backend")
+		log = logrus.StandardLogger().WithField("component", "koldun-ingress")
 	}
 
-	raw, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-backend"))
+	raw, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-ingress"))
 	if err != nil {
 		return nil, fmt.Errorf("connect NATS: %w", err)
 	}
@@ -232,7 +232,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		s.log.Infof("backend listening on %s", s.cfg.ListenAddress)
+		s.log.Infof("ingress listening on %s", s.cfg.ListenAddress)
 		if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

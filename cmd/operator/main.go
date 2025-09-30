@@ -9,7 +9,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/controllers"
 	"github.com/gorizond/koldun/pkg/kube"
-	"github.com/gorizond/koldun/pkg/servers/backend"
+	"github.com/gorizond/koldun/pkg/servers/ingress"
 	"github.com/gorizond/koldun/pkg/servers/llm"
 	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
@@ -61,7 +61,7 @@ func main() {
 	)
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	fs.StringVar(&mode, "mode", "operator", "Process mode: operator|llm|backend")
+	fs.StringVar(&mode, "mode", "operator", "Process mode: operator|llm|ingress (alias: backend)")
 	fs.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig, falls back to in-cluster config")
 
 	fs.StringVar(&llmListen, "llm-listen", ":8081", "LLM health endpoint listen address")
@@ -144,8 +144,8 @@ func main() {
 			SidecarTimeout: llmSidecarTimeout,
 			HealthOnly:     llmHealthOnly,
 		})
-	case "backend":
-		runBackend(ctx, backend.Config{
+	case "backend", "ingress":
+		runIngress(ctx, ingress.Config{
 			ListenAddress:      backendListen,
 			Namespace:          backendNamespace,
 			RootImage:          backendRootImage,
@@ -209,12 +209,12 @@ func runLLM(ctx context.Context, cfg llm.Config) {
 	}
 }
 
-func runBackend(ctx context.Context, cfg backend.Config) {
-	server, err := backend.New(cfg)
+func runIngress(ctx context.Context, cfg ingress.Config) {
+	server, err := ingress.New(cfg)
 	if err != nil {
-		logrus.Fatalf("failed to initialise backend: %v", err)
+		logrus.Fatalf("failed to initialise ingress server: %v", err)
 	}
 	if err := server.Run(ctx); err != nil {
-		logrus.Fatalf("backend server exited with error: %v", err)
+		logrus.Fatalf("ingress server exited with error: %v", err)
 	}
 }

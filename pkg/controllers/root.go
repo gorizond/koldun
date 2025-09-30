@@ -17,6 +17,11 @@ import (
 	"k8s.io/utils/pointer"
 )
 
+const (
+	dllamaStartupProbePeriodSeconds  int32 = 1     // probe once per second during startup
+	dllamaStartupProbeFailureSeconds int32 = 43200 // allow up to 12h before declaring startup failure
+)
+
 type rootHandler struct {
 	ctx          context.Context
 	apply        apply.Apply
@@ -207,6 +212,7 @@ func (h *rootHandler) ensureDeployment(root *v1.Root) error {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					TerminationGracePeriodSeconds: pointer.Int64(0),
 					Volumes: []corev1.Volume{
 						{
 							Name: "model-output",
@@ -377,7 +383,18 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		Command:         []string{"dllama-api"},
 		Args:            args,
 		Env:             env,
-		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
+		StartupProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path:   "/v1/models",
+					Port:   intstr.FromInt(9999),
+					Scheme: corev1.URISchemeHTTP,
+				},
+			},
+			PeriodSeconds:    dllamaStartupProbePeriodSeconds,
+			FailureThreshold: dllamaStartupProbeFailureSeconds,
+		},
+		Ports: []corev1.ContainerPort{{ContainerPort: 9999}},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "model-output",

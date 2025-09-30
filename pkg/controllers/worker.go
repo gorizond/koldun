@@ -156,7 +156,8 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 					Annotations: map[string]string{annotationSlotKey: strconv.Itoa(int(worker.Spec.Slot))},
 				},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{h.workerContainer(worker, threads)},
+					TerminationGracePeriodSeconds: pointer.Int64(0),
+					Containers:                    []corev1.Container{h.workerContainer(worker, threads)},
 				},
 			},
 		},
