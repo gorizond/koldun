@@ -27,27 +27,35 @@ func main() {
 		llmNATSURL        string
 		llmInPrefix       string
 		llmOutPrefix      string
+		llmRequestSubject string
+		llmStateSubject   string
+		llmDllamaName     string
 		llmSidecarURL     string
 		llmSidecarTimeout time.Duration
 		llmHealthOnly     bool
 
 		// Backend flags
-		backendListen             string
-		backendNamespace          string
-		backendNATSURL            string
-		backendInPrefix           string
-		backendOutPrefix          string
-		backendTTLPrefix          string
-		backendConversationBucket string
-		backendModelsBucket       string
-		backendTokensBucket       string
-		backendModelPrefix        string
-		backendTokenPrefix        string
-		backendConversationTTL    time.Duration
-		backendResponseTimeout    time.Duration
-		backendHashSecret         string
-		backendRootImage          string
-		backendWorkerImage        string
+		backendListen                      string
+		backendNamespace                   string
+		backendNATSURL                     string
+		backendInPrefix                    string
+		backendOutPrefix                   string
+		backendTTLPrefix                   string
+		backendConversationBucket          string
+		backendModelsBucket                string
+		backendTokensBucket                string
+		backendModelPrefix                 string
+		backendTokenPrefix                 string
+		backendConversationTTL             time.Duration
+		backendResponseTimeout             time.Duration
+		backendSessionMinDllamas           int
+		backendSessionMaxDllamas           int
+		backendSessionScaleUpBacklog       int
+		backendSessionScaleDownIdleSeconds int
+		backendSessionDispatcherImage      string
+		backendHashSecret                  string
+		backendRootImage                   string
+		backendWorkerImage                 string
 
 		// Operator conversation/registry flags
 		operatorNATSURL      string
@@ -69,6 +77,9 @@ func main() {
 	fs.StringVar(&llmNATSURL, "llm-nats-url", "nats://nats.default:4222", "NATS endpoint for LLM worker")
 	fs.StringVar(&llmInPrefix, "llm-in-prefix", "in.", "NATS subject prefix for inbound messages (must end with '.')")
 	fs.StringVar(&llmOutPrefix, "llm-out-prefix", "out.", "NATS subject prefix for outbound messages")
+	fs.StringVar(&llmRequestSubject, "llm-request-subject", "", "Full NATS subject delivering dispatcher assignments to this worker")
+	fs.StringVar(&llmStateSubject, "llm-state-subject", "", "NATS subject where worker publishes state heartbeats")
+	fs.StringVar(&llmDllamaName, "llm-dllama-name", "", "Identifier of the dllama worker for dispatcher accounting")
 	fs.StringVar(&llmSidecarURL, "llm-sidecar-url", "http://127.0.0.1:8080", "Base URL for dllama-api sidecar")
 	fs.DurationVar(&llmSidecarTimeout, "llm-sidecar-timeout", 2*time.Minute, "Timeout for sidecar HTTP calls")
 	fs.BoolVar(&llmHealthOnly, "llm-health-only", false, "Disable health server (useful for tests)")
@@ -86,6 +97,11 @@ func main() {
 	fs.StringVar(&backendTokenPrefix, "backend-token-prefix", "token/", "Key prefix for token entries in the registry bucket")
 	fs.DurationVar(&backendConversationTTL, "backend-conversation-ttl", 10*time.Minute, "Conversation lifetime (JetStream TTL)")
 	fs.DurationVar(&backendResponseTimeout, "backend-response-timeout", 2*time.Minute, "Timeout waiting for replies from NATS")
+	fs.IntVar(&backendSessionMinDllamas, "backend-session-min-dllamas", 1, "Minimum number of Dllama resources per session")
+	fs.IntVar(&backendSessionMaxDllamas, "backend-session-max-dllamas", 0, "Maximum number of Dllama resources per session (0 = unlimited)")
+	fs.IntVar(&backendSessionScaleUpBacklog, "backend-session-scale-up-backlog", 0, "Queued message threshold to trigger additional Dllama instances")
+	fs.IntVar(&backendSessionScaleDownIdleSeconds, "backend-session-scale-down-idle-seconds", 0, "Idle seconds before scaling down Dllama instances")
+	fs.StringVar(&backendSessionDispatcherImage, "backend-session-dispatcher-image", "", "Container image for session dispatcher pods (defaults to backend image)")
 	fs.StringVar(&backendHashSecret, "backend-hash-secret", "", "Optional secret used for hash_koldun HMAC (base64/plain)")
 	fs.StringVar(&backendRootImage, "backend-root-image", "", "Container image for Dllama root pods")
 	fs.StringVar(&backendWorkerImage, "backend-worker-image", "", "Container image for Dllama worker pods")
@@ -140,28 +156,36 @@ func main() {
 			NATSURL:        llmNATSURL,
 			InPrefix:       llmInPrefix,
 			OutPrefix:      llmOutPrefix,
+			RequestSubject: llmRequestSubject,
+			StateSubject:   llmStateSubject,
+			DllamaName:     llmDllamaName,
 			SidecarURL:     llmSidecarURL,
 			SidecarTimeout: llmSidecarTimeout,
 			HealthOnly:     llmHealthOnly,
 		})
 	case "backend", "ingress":
 		runIngress(ctx, ingress.Config{
-			ListenAddress:      backendListen,
-			Namespace:          backendNamespace,
-			RootImage:          backendRootImage,
-			WorkerImage:        backendWorkerImage,
-			NATSURL:            backendNATSURL,
-			ConversationBucket: backendConversationBucket,
-			ModelsBucket:       backendModelsBucket,
-			TokensBucket:       backendTokensBucket,
-			InPrefix:           backendInPrefix,
-			OutPrefix:          backendOutPrefix,
-			TTLPrefix:          backendTTLPrefix,
-			ModelPrefix:        backendModelPrefix,
-			TokenPrefix:        backendTokenPrefix,
-			ConversationTTL:    backendConversationTTL,
-			ResponseTimeout:    backendResponseTimeout,
-			HashSecret:         []byte(backendHashSecret),
+			ListenAddress:               backendListen,
+			Namespace:                   backendNamespace,
+			RootImage:                   backendRootImage,
+			WorkerImage:                 backendWorkerImage,
+			NATSURL:                     backendNATSURL,
+			ConversationBucket:          backendConversationBucket,
+			ModelsBucket:                backendModelsBucket,
+			TokensBucket:                backendTokensBucket,
+			InPrefix:                    backendInPrefix,
+			OutPrefix:                   backendOutPrefix,
+			TTLPrefix:                   backendTTLPrefix,
+			ModelPrefix:                 backendModelPrefix,
+			TokenPrefix:                 backendTokenPrefix,
+			ConversationTTL:             backendConversationTTL,
+			ResponseTimeout:             backendResponseTimeout,
+			SessionMinDllamas:           int32(backendSessionMinDllamas),
+			SessionMaxDllamas:           int32(backendSessionMaxDllamas),
+			SessionScaleUpBacklog:       int32(backendSessionScaleUpBacklog),
+			SessionScaleDownIdleSeconds: int32(backendSessionScaleDownIdleSeconds),
+			SessionDispatcherImage:      backendSessionDispatcherImage,
+			HashSecret:                  []byte(backendHashSecret),
 		})
 	default:
 		logrus.Fatalf("unknown mode %q", mode)

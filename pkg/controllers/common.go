@@ -1,7 +1,10 @@
 package controllers
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	validation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -11,6 +14,7 @@ const (
 	labelWorkerName       = "koldun.gorizond.io/worker"
 	labelModelName        = "koldun.gorizond.io/model"
 	labelConversationHash = "koldun.gorizond.io/hash"
+	labelSessionName      = "koldun.gorizond.io/session"
 	labelBackendName      = "koldun.gorizond.io/backend"
 
 	componentModel   = "model"
@@ -18,7 +22,11 @@ const (
 	componentWorker  = "worker"
 	componentBackend = "backend"
 
-	annotationSlotKey = "koldun.gorizond.io/slot"
+	annotationSlotKey                  = "koldun.gorizond.io/slot"
+	annotationSessionQueuePrefix       = "koldun.gorizond.io/session-dllama-prefix"
+	annotationSessionAssignmentsBucket = "koldun.gorizond.io/session-assignments-bucket"
+	annotationSessionBacklogSubject    = "koldun.gorizond.io/session-backlog-subject"
+	annotationSessionStateStream       = "koldun.gorizond.io/session-state-stream"
 
 	conditionReady      = "Ready"
 	conditionDownloaded = "Downloaded"
@@ -79,4 +87,37 @@ func truncateName(base string, limit int) string {
 		return ""
 	}
 	return base[:limit]
+}
+
+func sanitizeLabelValue(value string) string {
+	trimmed := value
+	if trimmed == "" {
+		return trimmed
+	}
+	if len(trimmed) > validation.LabelValueMaxLength {
+		trimmed = trimmed[:validation.LabelValueMaxLength]
+	}
+	return trimmed
+}
+
+func workerResourceName(dllamaName string) string {
+	const maxLength = validation.LabelValueMaxLength - 11 // leave room for controller revision suffix
+	base := fmt.Sprintf("%s-workers", dllamaName)
+	if len(base) > maxLength {
+		base = base[:maxLength]
+	}
+	return base
+}
+
+func dllamaNameForSession(sessionName string, ordinal int32) string {
+	suffix := fmt.Sprintf("-%d", ordinal)
+	base := fmt.Sprintf("%s-dllama", sessionName)
+	max := validation.LabelValueMaxLength - len(suffix)
+	if max < 1 {
+		max = 1
+	}
+	if len(base) > max {
+		base = base[:max]
+	}
+	return base + suffix
 }

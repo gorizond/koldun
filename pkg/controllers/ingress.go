@@ -354,6 +354,17 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 	if strings.TrimSpace(spec.Route.Host) == "" {
 		return fmt.Errorf("route.host is required")
 	}
+	if scaling := spec.Backend.SessionScaling; scaling != nil {
+		if scaling.MinDllamas < 0 {
+			return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
+		}
+		if scaling.MaxDllamas < 0 {
+			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= 0")
+		}
+		if scaling.MinDllamas > 0 && scaling.MaxDllamas > 0 && scaling.MaxDllamas < scaling.MinDllamas {
+			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= minDllamas")
+		}
+	}
 	return nil
 }
 
@@ -364,6 +375,14 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 		"--backend-namespace=$(POD_NAMESPACE)",
 		fmt.Sprintf("--backend-root-image=%s", spec.Backend.RootImage),
 		fmt.Sprintf("--backend-worker-image=%s", spec.Backend.WorkerImage),
+	}
+
+	dispatcherImage := spec.Backend.DispatcherImage
+	if dispatcherImage == "" {
+		dispatcherImage = spec.Backend.Image
+	}
+	if dispatcherImage != "" {
+		args = append(args, fmt.Sprintf("--backend-session-dispatcher-image=%s", dispatcherImage))
 	}
 
 	if spec.Backend.NATS.URL != "" {
@@ -395,6 +414,21 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	}
 	if spec.Backend.ResponseTimeout != nil {
 		args = append(args, fmt.Sprintf("--backend-response-timeout=%s", spec.Backend.ResponseTimeout.Duration.String()))
+	}
+	if spec.Backend.SessionScaling != nil {
+		scaling := spec.Backend.SessionScaling
+		if scaling.MinDllamas > 0 {
+			args = append(args, fmt.Sprintf("--backend-session-min-dllamas=%d", scaling.MinDllamas))
+		}
+		if scaling.MaxDllamas > 0 {
+			args = append(args, fmt.Sprintf("--backend-session-max-dllamas=%d", scaling.MaxDllamas))
+		}
+		if scaling.ScaleUpBacklog > 0 {
+			args = append(args, fmt.Sprintf("--backend-session-scale-up-backlog=%d", scaling.ScaleUpBacklog))
+		}
+		if scaling.ScaleDownIdleSeconds > 0 {
+			args = append(args, fmt.Sprintf("--backend-session-scale-down-idle-seconds=%d", scaling.ScaleDownIdleSeconds))
+		}
 	}
 	if spec.Backend.HashSecret != "" {
 		args = append(args, fmt.Sprintf("--backend-hash-secret=%s", spec.Backend.HashSecret))

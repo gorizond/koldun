@@ -55,6 +55,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 			kold.Root(),
 			kold.Worker(),
 			kold.Ingress(),
+			kold.Session(),
 			apps.Deployment(),
 			apps.StatefulSet(),
 			batch.Job(),
@@ -89,6 +90,9 @@ func (m *Manager) Register(ctx context.Context) error {
 	}
 	if err := registerWorkerController(ctx, m); err != nil {
 		return fmt.Errorf("register worker controller: %w", err)
+	}
+	if err := registerSessionController(ctx, m); err != nil {
+		return fmt.Errorf("register session controller: %w", err)
 	}
 	if err := registerDllamaController(ctx, m); err != nil {
 		return fmt.Errorf("register dllama controller: %w", err)

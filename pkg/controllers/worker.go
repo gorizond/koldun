@@ -97,13 +97,13 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 	name := worker.Name
 	labels := map[string]string{
 		labelComponent:  componentWorker,
-		labelWorkerName: worker.Name,
+		labelWorkerName: sanitizeLabelValue(worker.Name),
 	}
 	if dllama := labelValue(worker.Labels, labelDllamaName); dllama != "" {
-		labels[labelDllamaName] = dllama
+		labels[labelDllamaName] = sanitizeLabelValue(dllama)
 	}
 	if hash := labelValue(worker.Labels, labelConversationHash); hash != "" {
-		labels[labelConversationHash] = hash
+		labels[labelConversationHash] = sanitizeLabelValue(hash)
 	}
 
 	replicas, threads := h.workerReplicaConfig(worker)

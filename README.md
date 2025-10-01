@@ -4,6 +4,7 @@ Koldun (kubernetes operator for serverless distributed-llama) manages distribute
 
 ## Custom Resources
 
+- **Session** — captures a user conversation keyed by `session-<hash_koldun>`. The session controller supervises a pool of generated `Dllama` worker sets, tracks idle/busy capacity, and performs health checks against the `:9999/v1/models` endpoint before dispatching queued messages. Backends can tune the `sessionScaling` block to enforce minimum/maximum pools and backlog thresholds.
 - **Dllama** (`koldun.gorizond.io/v1`) — top-level orchestration resource that defines which model to run and the power-of-two fan-out for workers. The controller expands a `Dllama` into its component resources and aggregates status. Before spawning any `Worker` resources it checks that the referenced `Model` reports a non-empty `status.outputPVCName`, then materialises workers using the image from `spec.workerImage`. **New**: Automatically copies NATS URL from available `Ingress` resources to avoid configuration duplication.
 - **Model** — tracks acquisition and caching of model artifacts. The controller creates a metadata `ConfigMap`, a `ConfigMap` with a Python downloader script, and a `Job` that installs `huggingface_hub`, `boto3`, `botocore`, `requests` then runs the script to stream artifacts from Hugging Face directly into your S3/MinIO bucket. When conversion succeeds, an additional sizing job mounts the converted PVC, calculates its usage, and publishes the results to `status.conversionSizeBytes`/`status.conversionSizeHuman`.
 - **Root** — describes the distributed-llama root coordinator. The controller materialises the runtime as a `Deployment` and `Service` with Wrangler's Apply helpers.
@@ -29,6 +30,7 @@ This eliminates the need to duplicate NATS connection details across multiple `D
 
 All controllers are wired through Wrangler's generic factories and `apply` engine:
 
+- `pkg/controllers/session.go` manages per-user sessions, ensuring at least one idle Dllama worker set, probing root health via `/v1/models`, and updating session status with ready/busy capacity information.
 - `pkg/controllers/dllama.go` expands Dllama resources into Model/Root/Worker children, applies ownership, and updates the aggregate status once underlying components report ready. Also implements automatic NATS URL copying from `Ingress` resources with comprehensive logging for troubleshooting.
 - `pkg/controllers/model.go` orchestrates metadata `ConfigMap` creation, a streamed download `Job`, and an optional post-processing conversion `Job` (e.g. GGUF export + tokenizer pack) that reads artifacts directly from the S3/MinIO cache via an S3 CSI PV/PVC mount.
 - `pkg/controllers/root.go` renders the coordinator `Deployment` and associated `Service`, watching Kubernetes workloads to reflect readiness and expose a stable endpoint.
@@ -106,7 +108,7 @@ Request flow:
    - Validates `KOLDUN_API_TOKEN` against the token entries published by the operator.
    - Extracts `chat_id`/`chat_start_time` (headers `X-Chat-ID`, `X-Chat-Start` or `request.metadata`).
    - Computes `hash_koldun = make_id(token, chat_id, chat_start_time)` per the supplied Python reference (now re-implemented in Go).
-   - Ensures a JetStream KeyValue entry `nats_ttl_<hash>` exists with JSON payload describing the requested model, namespace, replica power, and a generated Dllama name (`dllama-<timestamp>-<hash>`). The entry TTL is refreshed on every request.
+   - Ensures a JetStream KeyValue entry `nats_ttl_<hash>` exists with JSON payload describing the requested model, namespace, replica power, and session metadata. The entry TTL is refreshed on every request and reconciled into a `Session` resource (`session-<hash>`) that supervises the backing Dllama workers.
    - Looks up the requested model in the registry bucket (default `koldun_models`) to verify readiness (`outputPVCName` + size metadata) and capture its desired `replicaPower`.
    - Subscribes to `out.<hash>` and publishes the OpenAI payload (plus metadata) to `in.<hash>`. Streaming responses are proxied to the HTTP client as `text/event-stream`, forwarding raw chunks and emitting `[DONE]` when finished.
 
@@ -119,6 +121,7 @@ Key flags:
 - `--backend-hash-secret` — optional secret for hashing (enables HMAC-SHA256).
 - `--backend-conversation-ttl` — JetStream KV TTL (default 10m) that governs conversation lifetime.
 - `--backend-response-timeout` — time to wait for NATS responses before returning HTTP 504.
+- `--backend-session-…` flags control the per-session Dllama pool (minimum/maximum size and backlog/idle thresholds) mirrored in `spec.backend.sessionScaling`.
 
 Notes:
 
@@ -150,6 +153,11 @@ spec:
       tokensBucket: koldun_tokens
       modelPrefix: model/
       tokenPrefix: token/
+    sessionScaling:
+      minDllamas: 1
+      maxDllamas: 4
+      scaleUpBacklog: 2
+      scaleDownIdleSeconds: 120
     conversationTTL: 10m
     responseTimeout: 2m
   service:
@@ -166,6 +174,7 @@ The controller renders a Deployment with `--mode=backend`, a ClusterIP Service e
 - `spec.backend.hashSecret` sets an HMAC secret shared with the backend.
 - `spec.backend.nats.url` supports embedded credentials (`nats://koldun:k0ldun@host:4222`). Use `spec.backend.extraArgs` plus projected env vars if you prefer to avoid literals.
 - `spec.backend.nats.modelsBucket` / `spec.backend.nats.tokensBucket` let you point at alternative registry buckets if you want per-tenant isolation.
+- `spec.backend.sessionScaling` defines minimum/maximum Dllama pools per session and backlog/idle thresholds used by the operator for auto-scaling.
 - `spec.service.type` may be set to `LoadBalancer` or `NodePort` when required.
 - TLS hosts and annotations map directly to the `Ingress` manifest.
 

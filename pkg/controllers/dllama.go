@@ -188,6 +188,9 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 		labelModelName:        model.Name,
 		labelConversationHash: conversationHashLabel,
 	}
+	if session := labelValue(dllama.Labels, labelSessionName); session != "" {
+		rootLabels[labelSessionName] = session
+	}
 
 	natsConfig := dllama.Spec.NATS.ToRootConfig()
 	// Copy NATS URL from ingress if dllama doesn't have its own NATS config
@@ -200,6 +203,18 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 		}
 	}
 
+	rootAnnotations := map[string]string{labelConversationHash: conversationHashAnnotation}
+	for _, key := range []string{
+		annotationSessionQueuePrefix,
+		annotationSessionAssignmentsBucket,
+		annotationSessionBacklogSubject,
+		annotationSessionStateStream,
+	} {
+		if value := labelValue(dllama.Annotations, key); strings.TrimSpace(value) != "" {
+			rootAnnotations[key] = value
+		}
+	}
+
 	return &v1.Root{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
@@ -209,7 +224,7 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 			Name:        fmt.Sprintf("%s-root", dllama.Name),
 			Namespace:   dllama.Namespace,
 			Labels:      rootLabels,
-			Annotations: map[string]string{labelConversationHash: conversationHashAnnotation},
+			Annotations: rootAnnotations,
 		},
 		Spec: v1.RootSpec{
 			ModelRef:       model.Status.OutputPVCName,
@@ -221,12 +236,16 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 }
 
 func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1.Worker {
+	workerName := workerResourceName(dllama.Name)
 	workerLabels := map[string]string{
-		labelDllamaName:       dllama.Name,
+		labelDllamaName:       sanitizeLabelValue(dllama.Name),
 		labelComponent:        componentWorker,
-		labelWorkerName:       fmt.Sprintf("%s-workers", dllama.Name),
-		labelModelName:        model.Name,
-		labelConversationHash: labelValue(dllama.Labels, labelConversationHash),
+		labelWorkerName:       sanitizeLabelValue(workerName),
+		labelModelName:        sanitizeLabelValue(model.Name),
+		labelConversationHash: sanitizeLabelValue(labelValue(dllama.Labels, labelConversationHash)),
+	}
+	if session := labelValue(dllama.Labels, labelSessionName); session != "" {
+		workerLabels[labelSessionName] = sanitizeLabelValue(session)
 	}
 
 	conversationHashAnnotation := labelValue(dllama.Annotations, labelConversationHash)
@@ -251,7 +270,7 @@ func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1
 			Kind:       "Worker",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        fmt.Sprintf("%s-workers", dllama.Name),
+			Name:        workerName,
 			Namespace:   dllama.Namespace,
 			Labels:      workerLabels,
 			Annotations: map[string]string{labelConversationHash: conversationHashAnnotation},

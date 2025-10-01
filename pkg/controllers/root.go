@@ -300,7 +300,7 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 		replicas = 1
 	}
 
-	workerName := fmt.Sprintf("%s-workers", dllama.Name)
+	workerName := workerResourceName(dllama.Name)
 	worker, err := h.workers.Cache().Get(root.Namespace, workerName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -416,6 +416,20 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 	}
 	if root.Spec.NATS != nil && strings.TrimSpace(root.Spec.NATS.URL) != "" {
 		args = append(args, "--llm-nats-url", root.Spec.NATS.URL)
+	}
+	dllamaName := labelValue(root.Labels, labelDllamaName)
+	queuePrefix := strings.TrimSpace(root.Annotations[annotationSessionQueuePrefix])
+	if queuePrefix != "" && !strings.HasSuffix(queuePrefix, ".") {
+		queuePrefix += "."
+	}
+	if queuePrefix != "" && dllamaName != "" {
+		requestSubject := fmt.Sprintf("%s%s.in", queuePrefix, dllamaName)
+		stateSubject := fmt.Sprintf("%s%s.state", queuePrefix, dllamaName)
+		args = append(args, "--llm-request-subject", requestSubject)
+		args = append(args, "--llm-state-subject", stateSubject)
+	}
+	if dllamaName != "" {
+		args = append(args, "--llm-dllama-name", dllamaName)
 	}
 
 	return corev1.Container{

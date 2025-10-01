@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gorizond/koldun/pkg/api/openai"
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 )
@@ -31,6 +32,17 @@ const (
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 )
 
+func ensureTrailingDot(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	if strings.HasSuffix(prefix, ".") {
+		return prefix
+	}
+	return prefix + "."
+}
+
 // Config holds runtime parameters for the LLM worker.
 type Config struct {
 	Hash string
@@ -41,6 +53,10 @@ type Config struct {
 	NATSURL   string
 	InPrefix  string
 	OutPrefix string
+
+	RequestSubject string
+	StateSubject   string
+	DllamaName     string
 
 	SidecarURL     string
 	SidecarTimeout time.Duration
@@ -59,23 +75,25 @@ type Server struct {
 	httpServer *http.Server
 	client     *http.Client
 
-	sub        *nats.Subscription
-	streamName string
-
-	inSubject  string
-	outSubject string
+	sub          *nats.Subscription
+	streamName   string
+	inSubject    string
+	outSubject   string
+	stateSubject string
 
 	wg sync.WaitGroup
 }
 
 type inboundRequest struct {
-	Hash      string                       `json:"hash"`
-	ChatID    string                       `json:"chatId"`
-	ChatStart string                       `json:"chatStart"`
-	TokenHash string                       `json:"tokenHash"`
-	Model     string                       `json:"model"`
-	Namespace string                       `json:"namespace"`
-	Request   openai.ChatCompletionRequest `json:"request"`
+	Hash            string                       `json:"hash"`
+	ChatID          string                       `json:"chatId"`
+	ChatStart       string                       `json:"chatStart"`
+	TokenHash       string                       `json:"tokenHash"`
+	Model           string                       `json:"model"`
+	Namespace       string                       `json:"namespace"`
+	Request         openai.ChatCompletionRequest `json:"request"`
+	ResponseSubject string                       `json:"responseSubject"`
+	RequestID       string                       `json:"requestId,omitempty"`
 }
 
 // New constructs the LLM server and initialises the required clients.
@@ -95,11 +113,24 @@ func New(cfg Config) (*Server, error) {
 	if cfg.OutPrefix == "" {
 		cfg.OutPrefix = defaultOutPrefix
 	}
+	if !strings.HasSuffix(cfg.InPrefix, ".") {
+		cfg.InPrefix = ensureTrailingDot(cfg.InPrefix)
+	}
 	if cfg.SidecarURL == "" {
 		cfg.SidecarURL = defaultSidecarURL
 	}
 	if cfg.SidecarTimeout == 0 {
 		cfg.SidecarTimeout = 2 * time.Minute
+	}
+	if strings.TrimSpace(cfg.RequestSubject) == "" {
+		cfg.RequestSubject = cfg.InPrefix + cfg.Hash
+	}
+	if strings.TrimSpace(cfg.StateSubject) == "" {
+		base := strings.TrimSuffix(cfg.RequestSubject, ".in")
+		cfg.StateSubject = base + ".state"
+	}
+	if strings.TrimSpace(cfg.DllamaName) == "" {
+		cfg.DllamaName = cfg.Hash
 	}
 
 	log := cfg.Logger
@@ -127,14 +158,15 @@ func New(cfg Config) (*Server, error) {
 	client := &http.Client{Timeout: cfg.SidecarTimeout}
 
 	srv := &Server{
-		cfg:        cfg,
-		log:        log,
-		nc:         nc,
-		js:         js,
-		client:     client,
-		inSubject:  cfg.InPrefix + cfg.Hash,
-		outSubject: cfg.OutPrefix + cfg.Hash,
-		streamName: streamName,
+		cfg:          cfg,
+		log:          log,
+		nc:           nc,
+		js:           js,
+		client:       client,
+		inSubject:    cfg.RequestSubject,
+		outSubject:   cfg.OutPrefix + cfg.Hash,
+		stateSubject: cfg.StateSubject,
+		streamName:   streamName,
 	}
 	return srv, nil
 }
@@ -145,7 +177,7 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("wait for dllama sidecar: %w", err)
 	}
 
-	queueName := durableName(s.cfg.Hash)
+	queueName := durableName(s.cfg.DllamaName)
 	ackWait := s.cfg.SidecarTimeout
 	if ackWait <= 0 {
 		ackWait = 2 * time.Minute
@@ -300,23 +332,53 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	defer func() {
-		if err := msg.Ack(); err != nil {
-			s.log.WithError(err).Warn("ack request message")
-		}
-	}()
-
-	var payload inboundRequest
-	if err := json.Unmarshal(msg.Data, &payload); err != nil {
-		s.log.WithError(err).Warn("invalid inbound payload")
+	var envelope conversation.AssignmentEnvelope
+	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+		s.log.WithError(err).Warn("invalid assignment envelope")
+		_ = msg.Term()
+		return
+	}
+	if len(envelope.Payload) == 0 {
+		s.log.Warn("assignment missing payload")
+		_ = msg.Term()
 		return
 	}
 
+	var payload inboundRequest
+	if err := json.Unmarshal(envelope.Payload, &payload); err != nil {
+		s.log.WithError(err).Warn("invalid inbound payload")
+		_ = msg.Term()
+		return
+	}
+
+	assignmentID := envelope.AssignmentID
+	if assignmentID == "" {
+		assignmentID = payload.RequestID
+	}
+	if assignmentID == "" {
+		assignmentID = durableName(fmt.Sprintf("%s-%d", s.cfg.DllamaName, time.Now().UnixNano()))
+	}
+
 	s.log.WithFields(logrus.Fields{
-		"hash":   payload.Hash,
-		"chatId": payload.ChatID,
-		"model":  payload.Model,
+		"hash":         payload.Hash,
+		"chatId":       payload.ChatID,
+		"model":        payload.Model,
+		"assignmentId": assignmentID,
 	}).Info("processing request")
+
+	s.publishState("busy", assignmentID, 1, "")
+	ackMode := "ack"
+	defer func() {
+		if ackMode == "ack" {
+			if err := msg.Ack(); err != nil {
+				s.log.WithError(err).Warn("ack request message")
+			}
+			return
+		}
+		if err := msg.Nak(); err != nil {
+			s.log.WithError(err).Warn("nak request message")
+		}
+	}()
 
 	var err error
 	if payload.Request.Stream {
@@ -325,11 +387,21 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		err = s.executeOnce(payload)
 	}
 	if err != nil {
+		s.publishState("error", assignmentID, 0, err.Error())
 		s.log.WithError(err).Warn("request handling failed")
+		ackMode = "nak"
+		return
 	}
+
+	s.publishState("idle", assignmentID, 0, "")
 }
 
 func (s *Server) streamToSidecar(payload inboundRequest) error {
+	target := strings.TrimSpace(payload.ResponseSubject)
+	if target == "" {
+		target = s.outSubject
+	}
+
 	endpoint, err := s.sidecarEndpoint(sidecarChatCompletionsPath)
 	if err != nil {
 		s.log.WithError(err).Error("resolve sidecar endpoint")
@@ -355,7 +427,7 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 	res, err := s.client.Do(req)
 	if err != nil {
 		s.log.WithError(err).Error("sidecar request failed")
-		s.publishError(fmt.Sprintf("sidecar request failed: %v", err))
+		s.publishError(target, fmt.Sprintf("sidecar request failed: %v", err))
 		return err
 	}
 	defer res.Body.Close()
@@ -363,7 +435,7 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
-		s.publishError(err.Error())
+		s.publishError(target, err.Error())
 		return err
 	}
 
@@ -377,7 +449,7 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-		if err := s.nc.Publish(s.outSubject, []byte(line)); err != nil {
+		if err := s.nc.Publish(target, []byte(line)); err != nil {
 			s.log.WithError(err).Warn("publish chunk")
 		}
 	}
@@ -385,7 +457,7 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 		s.log.WithError(err).Warn("stream read error")
 		return err
 	}
-	if err := s.nc.Publish(s.outSubject, []byte("[DONE]")); err != nil {
+	if err := s.nc.Publish(target, []byte("[DONE]")); err != nil {
 		s.log.WithError(err).Warn("publish done marker")
 		return err
 	}
@@ -393,6 +465,11 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 }
 
 func (s *Server) executeOnce(payload inboundRequest) error {
+	target := strings.TrimSpace(payload.ResponseSubject)
+	if target == "" {
+		target = s.outSubject
+	}
+
 	endpoint, err := s.sidecarEndpoint(sidecarChatCompletionsPath)
 	if err != nil {
 		s.log.WithError(err).Error("resolve sidecar endpoint")
@@ -414,38 +491,58 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 
 	res, err := s.client.Do(req)
 	if err != nil {
-		s.publishError(fmt.Sprintf("sidecar request failed: %v", err))
+		s.publishError(target, fmt.Sprintf("sidecar request failed: %v", err))
 		return err
 	}
 	defer res.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(res.Body, 10<<20))
-	if err != nil {
-		s.publishError(fmt.Sprintf("read sidecar response failed: %v", err))
-		return err
-	}
-
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
-		s.publishError(err.Error())
+		s.publishError(target, err.Error())
 		return err
 	}
 
-	if err := s.nc.Publish(s.outSubject, respBody); err != nil {
-		s.log.WithError(err).Warn("publish response")
-		return err
+	if _, err := io.Copy(io.Discard, res.Body); err != nil {
+		s.log.WithError(err).Warn("drain sidecar response")
 	}
+
 	return nil
 }
 
-func (s *Server) publishError(msg string) {
+func (s *Server) publishState(state, assignmentID string, active int32, errMsg string) {
+	if strings.TrimSpace(s.stateSubject) == "" {
+		return
+	}
+	event := conversation.WorkerStateEvent{
+		Dllama:       s.cfg.DllamaName,
+		State:        state,
+		AssignmentID: assignmentID,
+		Active:       active,
+		Timestamp:    time.Now().Unix(),
+		Error:        errMsg,
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		s.log.WithError(err).Warn("marshal state event")
+		return
+	}
+	if err := s.nc.Publish(s.stateSubject, data); err != nil {
+		s.log.WithError(err).WithField("subject", s.stateSubject).Warn("publish state event")
+	}
+}
+
+func (s *Server) publishError(target, msg string) {
 	s.log.Warn(msg)
+	if target == "" {
+		target = s.outSubject
+	}
 	errPayload := map[string]any{
 		"error": msg,
 	}
 	body, _ := json.Marshal(errPayload)
-	_ = s.nc.Publish(s.outSubject, body)
-	_ = s.nc.Publish(s.outSubject, []byte("[DONE]"))
+	_ = s.nc.Publish(target, body)
+	_ = s.nc.Publish(target, []byte("[DONE]"))
 }
 
 func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error) {

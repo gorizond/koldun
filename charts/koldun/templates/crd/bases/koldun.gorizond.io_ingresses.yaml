@@ -142,6 +142,21 @@ spec:
                     type: object
                   responseTimeout:
                     type: string
+                  sessionScaling:
+                    properties:
+                      maxDllamas:
+                        format: int32
+                        type: integer
+                      minDllamas:
+                        format: int32
+                        type: integer
+                      scaleDownIdleSeconds:
+                        format: int32
+                        type: integer
+                      scaleUpBacklog:
+                        format: int32
+                        type: integer
+                    type: object
                   rootImage:
                     type: string
                   workerImage:

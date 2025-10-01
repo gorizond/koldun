@@ -18,8 +18,53 @@ import (
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/registry"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
 	"github.com/sirupsen/logrus"
 )
+
+func sanitizeSessionHash(hash string) string {
+	h := strings.ToLower(strings.TrimSpace(hash))
+	if len(h) > 32 {
+		h = h[:32]
+	}
+	return h
+}
+
+func ensureTrailingDot(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	if strings.HasSuffix(prefix, ".") {
+		return prefix
+	}
+	return prefix + "."
+}
+
+func responseSubjectPrefix(outPrefix, hash string) string {
+	prefix := ensureTrailingDot(outPrefix)
+	return fmt.Sprintf("%s%s.", prefix, hash)
+}
+
+func sessionBacklogSubject(hash string) string {
+	return fmt.Sprintf("sessions.%s.requests", sanitizeSessionHash(hash))
+}
+
+func dllamaSubjectPrefix(hash string) string {
+	return fmt.Sprintf("sessions.%s.dllama.", sanitizeSessionHash(hash))
+}
+
+func assignmentsBucketName(hash string) string {
+	return fmt.Sprintf("sess_%s_assign", sanitizeSessionHash(hash))
+}
+
+func stateStreamName(hash string) string {
+	return strings.ToUpper(fmt.Sprintf("sess_%s_state", sanitizeSessionHash(hash)))
+}
+
+func newRequestID() string {
+	return nuid.New().Next()
+}
 
 const (
 	defaultListenAddress      = ":8082"
@@ -57,6 +102,12 @@ type Config struct {
 	ConversationTTL time.Duration
 	ResponseTimeout time.Duration
 
+	SessionMinDllamas           int32
+	SessionMaxDllamas           int32
+	SessionScaleUpBacklog       int32
+	SessionScaleDownIdleSeconds int32
+	SessionDispatcherImage      string
+
 	HashSecret []byte
 
 	Logger *logrus.Entry
@@ -80,6 +131,11 @@ type Server struct {
 		mu      sync.RWMutex
 		values  map[string]tokenEntry
 		expires time.Time
+	}
+
+	sessionLoad struct {
+		mu     sync.Mutex
+		values map[string]int32
 	}
 }
 
@@ -133,6 +189,15 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.ResponseTimeout == 0 {
 		cfg.ResponseTimeout = 2 * time.Minute
+	}
+	if cfg.SessionMinDllamas <= 0 {
+		cfg.SessionMinDllamas = 1
+	}
+	if cfg.SessionMaxDllamas > 0 && cfg.SessionMaxDllamas < cfg.SessionMinDllamas {
+		cfg.SessionMaxDllamas = cfg.SessionMinDllamas
+	}
+	if strings.TrimSpace(cfg.SessionDispatcherImage) == "" {
+		cfg.SessionDispatcherImage = cfg.RootImage
 	}
 
 	log := cfg.Logger
@@ -196,6 +261,7 @@ func New(cfg Config) (*Server, error) {
 		streamName: streamName,
 	}
 	srv.tokenCache.values = make(map[string]tokenEntry)
+	srv.sessionLoad.values = make(map[string]int32)
 	return srv, nil
 }
 
@@ -421,20 +487,41 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	record, err := s.ensureConversation(ctx, hash, model)
+	load := s.incrementSessionLoad(hash)
+
+	record, err := s.ensureConversation(ctx, hash, model, load)
 	if err != nil {
+		s.decrementSessionLoad(hash)
 		s.log.WithError(err).Error("ensure conversation record")
 		writeError(w, http.StatusInternalServerError, "failed to prepare conversation")
 		return
 	}
 
+	defer func() {
+		remaining := s.decrementSessionLoad(hash)
+		if _, err := s.ensureConversation(context.Background(), hash, model, remaining); err != nil {
+			s.log.WithError(err).Warn("update conversation record after completion")
+		}
+	}()
+
 	s.refreshConversationTTL(hash)
 
-	subjectIn := s.cfg.InPrefix + hash
-	subjectOut := s.cfg.OutPrefix + hash
+	backlogSubject := record.Queue.BacklogSubject
+	if strings.TrimSpace(backlogSubject) == "" {
+		backlogSubject = sessionBacklogSubject(hash)
+	}
+
+	responsePrefix := ""
+	if record.Queue != nil {
+		responsePrefix = strings.TrimSpace(record.Queue.ResponseSubjectPrefix)
+	}
+	if responsePrefix == "" {
+		responsePrefix = responseSubjectPrefix(s.cfg.OutPrefix, hash)
+	}
+	responseSubject := responsePrefix + newRequestID()
 
 	msgs := make(chan *nats.Msg, 32)
-	sub, err := s.raw.ChanSubscribe(subjectOut, msgs)
+	sub, err := s.raw.ChanSubscribe(responseSubject, msgs)
 	if err != nil {
 		s.log.WithError(err).Error("subscribe out subject")
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to conversation stream")
@@ -445,31 +532,48 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		close(msgs)
 	}()
 
+	requestID := newRequestID()
+
 	reqPayload := struct {
-		Hash      string                       `json:"hash"`
-		ChatID    string                       `json:"chatId"`
-		ChatStart string                       `json:"chatStart"`
-		TokenHash string                       `json:"tokenHash"`
-		Model     string                       `json:"model"`
-		Namespace string                       `json:"namespace"`
-		Request   openai.ChatCompletionRequest `json:"request"`
+		Hash            string                       `json:"hash"`
+		ChatID          string                       `json:"chatId"`
+		ChatStart       string                       `json:"chatStart"`
+		TokenHash       string                       `json:"tokenHash"`
+		Model           string                       `json:"model"`
+		Namespace       string                       `json:"namespace"`
+		Request         openai.ChatCompletionRequest `json:"request"`
+		ResponseSubject string                       `json:"responseSubject"`
+		RequestID       string                       `json:"requestId"`
 	}{
-		Hash:      hash,
-		ChatID:    chatID,
-		ChatStart: chatStart,
-		TokenHash: sha256Hex(token),
-		Model:     record.Model,
-		Namespace: record.Namespace,
-		Request:   req,
+		Hash:            hash,
+		ChatID:          chatID,
+		ChatStart:       chatStart,
+		TokenHash:       sha256Hex(token),
+		Model:           record.Model,
+		Namespace:       record.Namespace,
+		Request:         req,
+		ResponseSubject: responseSubject,
+		RequestID:       requestID,
 	}
 
-	body, err := json.Marshal(reqPayload)
+	payloadBody, err := json.Marshal(reqPayload)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to marshal request")
+		writeError(w, http.StatusInternalServerError, "failed to marshal request payload")
 		return
 	}
 
-	if _, err := s.nc.Publish(subjectIn, body); err != nil {
+	backlogMsg := conversation.BacklogMessage{
+		ID:        requestID,
+		Payload:   payloadBody,
+		CreatedAt: time.Now().Unix(),
+	}
+	body, err := json.Marshal(backlogMsg)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to marshal backlog envelope")
+		return
+	}
+
+	if _, err := s.nc.Publish(backlogSubject, body); err != nil {
 		s.log.WithError(err).Error("publish request")
 		writeError(w, http.StatusBadGateway, "failed to enqueue request")
 		return
@@ -491,7 +595,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(msg.Data)
 }
 
-func (s *Server) ensureConversation(ctx context.Context, hash string, model *registry.Model) (*conversation.Record, error) {
+func (s *Server) ensureConversation(ctx context.Context, hash string, model *registry.Model, active int32) (*conversation.Record, error) {
 	s.log.WithFields(logrus.Fields{
 		"hash":     hash,
 		"nats_url": s.cfg.NATSURL,
@@ -520,6 +624,10 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 				record.WorkerImage = s.cfg.WorkerImage
 				recordChanged = true
 			}
+			if record.DispatcherImage != s.cfg.SessionDispatcherImage {
+				record.DispatcherImage = s.cfg.SessionDispatcherImage
+				recordChanged = true
+			}
 			if record.NATS.URL != s.cfg.NATSURL {
 				s.log.WithFields(logrus.Fields{
 					"hash":         hash,
@@ -527,6 +635,74 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 					"new_nats_url": s.cfg.NATSURL,
 				}).Info("updating conversation record NATS URL")
 				record.NATS.URL = s.cfg.NATSURL
+				recordChanged = true
+			}
+			if strings.TrimSpace(record.Session) == "" {
+				record.Session = fmt.Sprintf("session-%s", sanitizeSessionHash(hash))
+				recordChanged = true
+			}
+			if record.Queue == nil {
+				record.Queue = &conversation.QueueConfig{}
+				recordChanged = true
+			}
+			backlogSubject := sessionBacklogSubject(hash)
+			if record.Queue.BacklogSubject != backlogSubject {
+				record.Queue.BacklogSubject = backlogSubject
+				recordChanged = true
+			}
+			responsePrefix := responseSubjectPrefix(s.cfg.OutPrefix, hash)
+			if record.Queue.ResponseSubjectPrefix != responsePrefix {
+				record.Queue.ResponseSubjectPrefix = responsePrefix
+				recordChanged = true
+			}
+			dllamaPrefix := dllamaSubjectPrefix(hash)
+			if record.Queue.DllamaSubjectPrefix != dllamaPrefix {
+				record.Queue.DllamaSubjectPrefix = dllamaPrefix
+				recordChanged = true
+			}
+			assignmentsBucket := assignmentsBucketName(hash)
+			if record.Queue.AssignmentsBucket != assignmentsBucket {
+				record.Queue.AssignmentsBucket = assignmentsBucket
+				recordChanged = true
+			}
+			stateStream := stateStreamName(hash)
+			if record.Queue.StateStream != stateStream {
+				record.Queue.StateStream = stateStream
+				recordChanged = true
+			}
+			if record.Scaling == nil {
+				record.Scaling = &conversation.SessionScalingConfig{}
+				recordChanged = true
+			}
+			if record.Scaling.MinDllamas != s.cfg.SessionMinDllamas {
+				record.Scaling.MinDllamas = s.cfg.SessionMinDllamas
+				recordChanged = true
+			}
+			if record.Scaling.MaxDllamas != s.cfg.SessionMaxDllamas {
+				record.Scaling.MaxDllamas = s.cfg.SessionMaxDllamas
+				recordChanged = true
+			}
+			if record.Scaling.ScaleUpBacklog != s.cfg.SessionScaleUpBacklog {
+				record.Scaling.ScaleUpBacklog = s.cfg.SessionScaleUpBacklog
+				recordChanged = true
+			}
+			if record.Scaling.ScaleDownIdleSeconds != s.cfg.SessionScaleDownIdleSeconds {
+				record.Scaling.ScaleDownIdleSeconds = s.cfg.SessionScaleDownIdleSeconds
+				recordChanged = true
+			}
+			desired := active
+			if desired < s.cfg.SessionMinDllamas {
+				desired = s.cfg.SessionMinDllamas
+			}
+			if s.cfg.SessionMaxDllamas > 0 && desired > s.cfg.SessionMaxDllamas {
+				desired = s.cfg.SessionMaxDllamas
+			}
+			if record.Scaling.DesiredDllamas != desired {
+				record.Scaling.DesiredDllamas = desired
+				recordChanged = true
+			}
+			if record.Scaling.ActiveRequests != active {
+				record.Scaling.ActiveRequests = active
 				recordChanged = true
 			}
 			if recordChanged {
@@ -555,23 +731,47 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 		modelNamespace = s.cfg.Namespace
 	}
 
+	desired := active
+	if desired < s.cfg.SessionMinDllamas {
+		desired = s.cfg.SessionMinDllamas
+	}
+	if s.cfg.SessionMaxDllamas > 0 && desired > s.cfg.SessionMaxDllamas {
+		desired = s.cfg.SessionMaxDllamas
+	}
+
 	record := &conversation.Record{
-		Hash:         hash,
-		Dllama:       fmt.Sprintf("dllama-%d-%s", time.Now().Unix(), hash[:minVal(len(hash), 8)]),
-		Namespace:    s.cfg.Namespace,
-		Model:        fmt.Sprintf("%s/%s", modelNamespace, model.Name),
-		CreatedAt:    time.Now().Unix(),
-		ReplicaPower: requiredReplica,
-		RootImage:    s.cfg.RootImage,
-		WorkerImage:  s.cfg.WorkerImage,
-		NATS:         conversation.NATSConfig{URL: s.cfg.NATSURL},
+		Hash:            hash,
+		Session:         fmt.Sprintf("session-%s", sanitizeSessionHash(hash)),
+		Namespace:       s.cfg.Namespace,
+		Model:           fmt.Sprintf("%s/%s", modelNamespace, model.Name),
+		CreatedAt:       time.Now().Unix(),
+		ReplicaPower:    requiredReplica,
+		RootImage:       s.cfg.RootImage,
+		WorkerImage:     s.cfg.WorkerImage,
+		DispatcherImage: s.cfg.SessionDispatcherImage,
+		NATS:            conversation.NATSConfig{URL: s.cfg.NATSURL},
+		Queue: &conversation.QueueConfig{
+			BacklogSubject:        sessionBacklogSubject(hash),
+			ResponseSubjectPrefix: responseSubjectPrefix(s.cfg.OutPrefix, hash),
+			AssignmentsBucket:     assignmentsBucketName(hash),
+			DllamaSubjectPrefix:   dllamaSubjectPrefix(hash),
+			StateStream:           stateStreamName(hash),
+		},
+		Scaling: &conversation.SessionScalingConfig{
+			MinDllamas:           s.cfg.SessionMinDllamas,
+			MaxDllamas:           s.cfg.SessionMaxDllamas,
+			ScaleUpBacklog:       s.cfg.SessionScaleUpBacklog,
+			ScaleDownIdleSeconds: s.cfg.SessionScaleDownIdleSeconds,
+			DesiredDllamas:       desired,
+			ActiveRequests:       active,
+		},
 	}
 
 	s.log.WithFields(logrus.Fields{
 		"hash":     hash,
 		"nats_url": s.cfg.NATSURL,
-		"dllama":   record.Dllama,
-	}).Info("creating conversation record with NATS URL")
+		"session":  record.Session,
+	}).Info("creating conversation session record with NATS URL")
 
 	data, err := record.Marshal()
 	if err != nil {
@@ -615,6 +815,43 @@ func (s *Server) invalidateTokenCache() {
 	s.tokenCache.mu.Lock()
 	s.tokenCache.expires = time.Time{}
 	s.tokenCache.mu.Unlock()
+}
+
+func (s *Server) incrementSessionLoad(hash string) int32 {
+	s.sessionLoad.mu.Lock()
+	defer s.sessionLoad.mu.Unlock()
+	if s.sessionLoad.values == nil {
+		s.sessionLoad.values = make(map[string]int32)
+	}
+	s.sessionLoad.values[hash]++
+	return s.sessionLoad.values[hash]
+}
+
+func (s *Server) decrementSessionLoad(hash string) int32 {
+	s.sessionLoad.mu.Lock()
+	defer s.sessionLoad.mu.Unlock()
+	if s.sessionLoad.values == nil {
+		return 0
+	}
+	if current, ok := s.sessionLoad.values[hash]; ok {
+		current--
+		if current <= 0 {
+			delete(s.sessionLoad.values, hash)
+			return 0
+		}
+		s.sessionLoad.values[hash] = current
+		return current
+	}
+	return 0
+}
+
+func (s *Server) sessionLoadValue(hash string) int32 {
+	s.sessionLoad.mu.Lock()
+	defer s.sessionLoad.mu.Unlock()
+	if s.sessionLoad.values == nil {
+		return 0
+	}
+	return s.sessionLoad.values[hash]
 }
 
 func (s *Server) loadTokenCache(ctx context.Context) map[string]tokenEntry {

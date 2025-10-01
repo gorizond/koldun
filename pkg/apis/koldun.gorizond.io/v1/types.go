@@ -40,6 +40,8 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 		&WorkerList{},
 		&Ingress{},
 		&IngressList{},
+		&Session{},
+		&SessionList{},
 	)
 	metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 	return nil
@@ -814,6 +816,264 @@ func (in *WorkerList) DeepCopyObject() runtime.Object {
 	return nil
 }
 
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Namespaced,shortName=sess
+
+// Session models a user conversation with lifecycle and worker pool state.
+type Session struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   SessionSpec   `json:"spec,omitempty"`
+	Status SessionStatus `json:"status,omitempty"`
+}
+
+// SessionSpec captures desired configuration for a conversation session.
+type SessionSpec struct {
+	// Hash is the unique identifier computed from token/chat metadata.
+	Hash string `json:"hash"`
+	// ModelRef identifies the model that should serve this session.
+	ModelRef ModelReference `json:"modelRef"`
+	// RootImage is the image used by root Dllama coordinators.
+	RootImage string `json:"rootImage"`
+	// WorkerImage is the image used by worker Dllama pods.
+	WorkerImage string `json:"workerImage"`
+	// DispatcherImage is the image that runs the per-session dispatcher deployment.
+	DispatcherImage string `json:"dispatcherImage,omitempty"`
+	// ReplicaPower controls worker topology for spawned Dllamas (power of two).
+	ReplicaPower int32 `json:"replicaPower,omitempty"`
+	// MinIdle enforces a minimum number of idle Dllama workers kept ready (deprecated in favour of Scaling.MinDllamas).
+	MinIdle int32 `json:"minIdle,omitempty"`
+	// MaxWorkers bounds the number of concurrent Dllama worker sets (deprecated in favour of Scaling.MaxDllamas).
+	MaxWorkers int32 `json:"maxWorkers,omitempty"`
+	// Scaling controls automatic creation/removal of Dllama resources for the session.
+	Scaling *SessionScalingSpec `json:"scaling,omitempty"`
+	// Queue defines NATS subjects/streams used for request backlog.
+	Queue *SessionQueueSpec `json:"queue,omitempty"`
+	// NATS contains session specific overrides for runtime connectivity.
+	NATS *SessionNATSConfig `json:"nats,omitempty"`
+	// TTL controls when the session and its resources should be garbage collected when idle.
+	TTL *metav1.Duration `json:"ttl,omitempty"`
+}
+
+// SessionScalingSpec defines desired pool sizing behaviour for a session.
+type SessionScalingSpec struct {
+	MinDllamas           int32 `json:"minDllamas,omitempty"`
+	MaxDllamas           int32 `json:"maxDllamas,omitempty"`
+	ScaleUpBacklog       int32 `json:"scaleUpBacklog,omitempty"`
+	ScaleDownIdleSeconds int32 `json:"scaleDownIdleSeconds,omitempty"`
+	DesiredDllamas       int32 `json:"desiredDllamas,omitempty"`
+}
+
+// SessionQueueSpec configures NATS subjects used for session backlogs.
+type SessionQueueSpec struct {
+	// BacklogSubject stores pending user messages.
+	BacklogSubject string `json:"backlogSubject,omitempty"`
+	// ResponseSubjectPrefix prefixes per-message response subjects.
+	ResponseSubjectPrefix string `json:"responseSubjectPrefix,omitempty"`
+	// AssignmentsBucket stores per-request dispatcher assignments for idempotency.
+	AssignmentsBucket string `json:"assignmentsBucket,omitempty"`
+	// DllamaSubjectPrefix prefixes per-dllama request subjects (must end with '.').
+	DllamaSubjectPrefix string `json:"dllamaSubjectPrefix,omitempty"`
+	// StateStream stores worker heartbeat events for dispatcher recovery.
+	StateStream string `json:"stateStream,omitempty"`
+	// AckTimeout determines when a message lease is considered expired.
+	AckTimeout *metav1.Duration `json:"ackTimeout,omitempty"`
+}
+
+// SessionNATSConfig configures overrides for the session runtime.
+type SessionNATSConfig struct {
+	URL string `json:"url,omitempty"`
+	// CredentialsSecret references a Secret containing connection credentials.
+	CredentialsSecret *SecretReference `json:"credentialsSecret,omitempty"`
+}
+
+// SessionStatus reflects current backlog and worker state for a session.
+type SessionStatus struct {
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	ReadyWorkers       int32              `json:"readyWorkers,omitempty"`
+	BusyWorkers        int32              `json:"busyWorkers,omitempty"`
+	AvailableWorkers   int32              `json:"availableWorkers,omitempty"`
+	Backlog            int64              `json:"backlog,omitempty"`
+	InFlight           int64              `json:"inFlight,omitempty"`
+	ActiveRequests     int32              `json:"activeRequests,omitempty"`
+	Workers            []SessionWorker    `json:"workers,omitempty"`
+	LastActivity       *metav1.Time       `json:"lastActivity,omitempty"`
+}
+
+// SessionWorker summarises state for a Dllama worker set handling the session.
+type SessionWorker struct {
+	Name           string       `json:"name"`
+	Phase          string       `json:"phase,omitempty"`
+	Endpoint       string       `json:"endpoint,omitempty"`
+	Ready          bool         `json:"ready,omitempty"`
+	Healthy        bool         `json:"healthy,omitempty"`
+	ActiveMessages int32        `json:"activeMessages,omitempty"`
+	LastHeartbeat  *metav1.Time `json:"lastHeartbeat,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// SessionList contains multiple Session resources.
+type SessionList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []Session `json:"items"`
+}
+
+func (in *Session) DeepCopyInto(out *Session) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
+	out.Spec = *in.Spec.DeepCopy()
+	out.Status = *in.Status.DeepCopy()
+}
+
+func (in *Session) DeepCopy() *Session {
+	if in == nil {
+		return nil
+	}
+	out := new(Session)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *Session) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
+func (in *SessionSpec) DeepCopy() *SessionSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionSpec)
+	*out = *in
+	if in.Queue != nil {
+		out.Queue = in.Queue.DeepCopy()
+	}
+	if in.Scaling != nil {
+		scalingCopy := *in.Scaling.DeepCopy()
+		out.Scaling = &scalingCopy
+	}
+	if in.NATS != nil {
+		natsCopy := *in.NATS.DeepCopy()
+		out.NATS = &natsCopy
+	}
+	if in.TTL != nil {
+		d := *in.TTL
+		out.TTL = &d
+	}
+	return out
+}
+
+func (in *SessionScalingSpec) DeepCopy() *SessionScalingSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionScalingSpec)
+	*out = *in
+	return out
+}
+
+func (in *SessionQueueSpec) DeepCopy() *SessionQueueSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionQueueSpec)
+	*out = *in
+	if in.AckTimeout != nil {
+		d := *in.AckTimeout
+		out.AckTimeout = &d
+	}
+	return out
+}
+
+func (in *SessionNATSConfig) DeepCopy() *SessionNATSConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionNATSConfig)
+	*out = *in
+	if in.CredentialsSecret != nil {
+		secretCopy := *in.CredentialsSecret
+		out.CredentialsSecret = &secretCopy
+	}
+	return out
+}
+
+func (in *SessionStatus) DeepCopy() *SessionStatus {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionStatus)
+	*out = *in
+	if in.Conditions != nil {
+		out.Conditions = make([]metav1.Condition, len(in.Conditions))
+		copy(out.Conditions, in.Conditions)
+	}
+	if in.Workers != nil {
+		out.Workers = make([]SessionWorker, len(in.Workers))
+		for i := range in.Workers {
+			in.Workers[i].DeepCopyInto(&out.Workers[i])
+		}
+	}
+	if in.LastActivity != nil {
+		t := *in.LastActivity
+		out.LastActivity = &t
+	}
+	return out
+}
+
+func (in *SessionWorker) DeepCopyInto(out *SessionWorker) {
+	*out = *in
+	if in.LastHeartbeat != nil {
+		t := *in.LastHeartbeat
+		out.LastHeartbeat = &t
+	}
+}
+
+func (in *SessionWorker) DeepCopy() *SessionWorker {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionWorker)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *SessionList) DeepCopyInto(out *SessionList) {
+	*out = *in
+	out.TypeMeta = in.TypeMeta
+	in.ListMeta.DeepCopyInto(&out.ListMeta)
+	if in.Items != nil {
+		out.Items = make([]Session, len(in.Items))
+		for i := range in.Items {
+			in.Items[i].DeepCopyInto(&out.Items[i])
+		}
+	}
+}
+
+func (in *SessionList) DeepCopy() *SessionList {
+	if in == nil {
+		return nil
+	}
+	out := new(SessionList)
+	in.DeepCopyInto(out)
+	return out
+}
+
+func (in *SessionList) DeepCopyObject() runtime.Object {
+	if c := in.DeepCopy(); c != nil {
+		return c
+	}
+	return nil
+}
+
 func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 	if in == nil {
 		return nil
@@ -853,12 +1113,22 @@ type IngressBackendSpec struct {
 	ImagePullPolicy string                      `json:"imagePullPolicy,omitempty"`
 	RootImage       string                      `json:"rootImage"`
 	WorkerImage     string                      `json:"workerImage"`
+	DispatcherImage string                      `json:"dispatcherImage,omitempty"`
 	HashSecret      string                      `json:"hashSecret,omitempty"`
 	NATS            IngressNATSConfig           `json:"nats"`
 	ConversationTTL *metav1.Duration            `json:"conversationTTL,omitempty"`
 	ResponseTimeout *metav1.Duration            `json:"responseTimeout,omitempty"`
+	SessionScaling  *IngressSessionScalingSpec  `json:"sessionScaling,omitempty"`
 	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
 	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
+// IngressSessionScalingSpec controls auto-scaling behaviour for Session-managed Dllamas.
+type IngressSessionScalingSpec struct {
+	MinDllamas           int32 `json:"minDllamas,omitempty"`
+	MaxDllamas           int32 `json:"maxDllamas,omitempty"`
+	ScaleUpBacklog       int32 `json:"scaleUpBacklog,omitempty"`
+	ScaleDownIdleSeconds int32 `json:"scaleDownIdleSeconds,omitempty"`
 }
 
 // IngressNATSConfig configures connectivity with the conversation control plane.
@@ -964,11 +1234,24 @@ func (in *IngressBackendSpec) DeepCopy() *IngressBackendSpec {
 		d := *in.ResponseTimeout
 		out.ResponseTimeout = &d
 	}
+	if in.SessionScaling != nil {
+		scalingCopy := *in.SessionScaling.DeepCopy()
+		out.SessionScaling = &scalingCopy
+	}
 	if in.ExtraArgs != nil {
 		out.ExtraArgs = make([]string, len(in.ExtraArgs))
 		copy(out.ExtraArgs, in.ExtraArgs)
 	}
 	in.Resources.DeepCopyInto(&out.Resources)
+	return out
+}
+
+func (in *IngressSessionScalingSpec) DeepCopy() *IngressSessionScalingSpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressSessionScalingSpec)
+	*out = *in
 	return out
 }
 

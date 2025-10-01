@@ -30,9 +30,9 @@ type ConversationConfig struct {
 type conversationReconciler struct {
 	cfg ConversationConfig
 
-	log     *logrus.Entry
-	dllamas generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
-	apply   apply.Apply
+	log      *logrus.Entry
+	sessions generic.ControllerInterface[*v1.Session, *v1.SessionList]
+	apply    apply.Apply
 
 	conn *nats.Conn
 	kv   nats.KeyValue
@@ -76,12 +76,12 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 	}
 
 	reconciler := &conversationReconciler{
-		cfg:     cfg,
-		log:     log,
-		dllamas: m.Kold.Dllama(),
-		apply:   m.Apply(ctx),
-		conn:    conn,
-		kv:      kv,
+		cfg:      cfg,
+		log:      log,
+		sessions: m.Kold.Session(),
+		apply:    m.Apply(ctx),
+		conn:     conn,
+		kv:       kv,
 	}
 
 	go reconciler.run(ctx)
@@ -132,42 +132,42 @@ func (r *conversationReconciler) sync(ctx context.Context) {
 			continue
 		}
 
-		if err := r.ensureDllama(record); err != nil {
-			r.log.WithError(err).WithField("hash", record.Hash).Error("ensure dllama")
+		if err := r.ensureSession(record); err != nil {
+			r.log.WithError(err).WithField("hash", record.Hash).Error("ensure session")
 		}
 
-		expected[record.NamespacedName()] = struct{}{}
+		expected[record.SessionNamespacedName()] = struct{}{}
 	}
 
-	existing, err := r.dllamas.Cache().List("", labels.Everything())
+	existing, err := r.sessions.Cache().List("", labels.Everything())
 	if err != nil {
-		r.log.WithError(err).Warn("list dllamas")
+		r.log.WithError(err).Warn("list sessions")
 		return
 	}
 
-	for _, dllama := range existing {
-		hash := labelValue(dllama.Labels, labelConversationHash)
+	for _, session := range existing {
+		hash := strings.TrimSpace(session.Spec.Hash)
 		if hash == "" {
-			hash = labelValue(dllama.Annotations, labelConversationHash)
+			hash = labelValue(session.Labels, labelConversationHash)
 		}
 		if hash == "" {
 			continue
 		}
 
-		key := fmt.Sprintf("%s/%s", dllama.Namespace, dllama.Name)
+		key := fmt.Sprintf("%s/%s", session.Namespace, session.Name)
 		if _, ok := expected[key]; ok {
 			continue
 		}
 
-		if err := r.dllamas.Delete(dllama.Namespace, dllama.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			r.log.WithError(err).WithField("dllama", key).Error("delete stale dllama")
+		if err := r.sessions.Delete(session.Namespace, session.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+			r.log.WithError(err).WithField("session", key).Error("delete stale session")
 		}
 	}
 }
 
-func (r *conversationReconciler) ensureDllama(record *conversation.Record) error {
-	if strings.TrimSpace(record.Dllama) == "" {
-		return fmt.Errorf("dllama name missing for hash %s", record.Hash)
+func (r *conversationReconciler) ensureSession(record *conversation.Record) error {
+	if strings.TrimSpace(record.SessionName()) == "" {
+		return fmt.Errorf("session name missing for hash %s", record.Hash)
 	}
 	modelNamespace, modelName := record.ModelParts()
 	if strings.TrimSpace(modelName) == "" {
@@ -180,34 +180,70 @@ func (r *conversationReconciler) ensureDllama(record *conversation.Record) error
 	hashLabelValue := truncateName(record.Hash, validation.LabelValueMaxLength)
 	labels := map[string]string{
 		labelConversationHash: hashLabelValue,
-		labelDllamaName:       record.Dllama,
-		labelModelName:        modelName,
 	}
 
-	dllama := &v1.Dllama{
+	session := &v1.Session{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
-			Kind:       "Dllama",
+			Kind:       "Session",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      record.Dllama,
+			Name:      record.SessionName(),
 			Namespace: record.Namespace,
 			Labels:    labels,
-			Annotations: map[string]string{
-				labelConversationHash: record.Hash,
-			},
 		},
-		Spec: v1.DllamaSpec{
+		Spec: v1.SessionSpec{
+			Hash: record.Hash,
 			ModelRef: v1.ModelReference{
 				APIGroup: v1.GroupName,
 				Kind:     "Model",
 				Name:     modelName,
 			},
-			ReplicaPower: record.ReplicaPower,
-			RootImage:    record.RootImage,
-			WorkerImage:  record.WorkerImage,
-			NATS: func() *v1.DllamaNATSConfig {
-				cfg := &v1.DllamaNATSConfig{URL: record.NATS.URL}
+			ReplicaPower:    record.ReplicaPower,
+			RootImage:       record.RootImage,
+			WorkerImage:     record.WorkerImage,
+			DispatcherImage: record.DispatcherImage,
+			MinIdle: func() int32 {
+				if record.Scaling != nil && record.Scaling.MinDllamas > 0 {
+					return record.Scaling.MinDllamas
+				}
+				return 1
+			}(),
+			MaxWorkers: func() int32 {
+				if record.Scaling != nil && record.Scaling.MaxDllamas > 0 {
+					return record.Scaling.MaxDllamas
+				}
+				return 0
+			}(),
+			Scaling: func() *v1.SessionScalingSpec {
+				if record.Scaling == nil {
+					return nil
+				}
+				return &v1.SessionScalingSpec{
+					MinDllamas:           record.Scaling.MinDllamas,
+					MaxDllamas:           record.Scaling.MaxDllamas,
+					ScaleUpBacklog:       record.Scaling.ScaleUpBacklog,
+					ScaleDownIdleSeconds: record.Scaling.ScaleDownIdleSeconds,
+					DesiredDllamas:       record.Scaling.DesiredDllamas,
+				}
+			}(),
+			Queue: func() *v1.SessionQueueSpec {
+				if record.Queue == nil {
+					return nil
+				}
+				return &v1.SessionQueueSpec{
+					BacklogSubject:        record.Queue.BacklogSubject,
+					ResponseSubjectPrefix: record.Queue.ResponseSubjectPrefix,
+					AssignmentsBucket:     record.Queue.AssignmentsBucket,
+					DllamaSubjectPrefix:   record.Queue.DllamaSubjectPrefix,
+					StateStream:           record.Queue.StateStream,
+				}
+			}(),
+			NATS: func() *v1.SessionNATSConfig {
+				if strings.TrimSpace(record.NATS.URL) == "" {
+					return nil
+				}
+				cfg := &v1.SessionNATSConfig{URL: record.NATS.URL}
 				if secret := strings.TrimSpace(record.NATS.CredentialsSecret); secret != "" {
 					cfg.CredentialsSecret = &v1.SecretReference{Name: secret}
 				}
@@ -217,13 +253,13 @@ func (r *conversationReconciler) ensureDllama(record *conversation.Record) error
 	}
 
 	if modelNamespace != "" && modelNamespace != record.Namespace {
-		dllama.Spec.ModelRef.Namespace = modelNamespace
+		session.Spec.ModelRef.Namespace = modelNamespace
 	}
-	if dllama.Spec.ReplicaPower <= 0 {
-		dllama.Spec.ReplicaPower = 1
+	if session.Spec.ReplicaPower <= 0 {
+		session.Spec.ReplicaPower = 1
 	}
 
 	return r.apply.WithDefaultNamespace(record.Namespace).
-		WithSetID(fmt.Sprintf("conversation-%s", record.Hash)).
-		ApplyObjects(dllama)
+		WithSetID(fmt.Sprintf("conversation-session-%s", record.Hash)).
+		ApplyObjects(session)
 }
