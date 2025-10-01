@@ -14,12 +14,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	validation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/pointer"
 )
 
 const (
 	dllamaStartupProbePeriodSeconds  int32 = 1     // probe once per second during startup
 	dllamaStartupProbeFailureSeconds int32 = 43200 // allow up to 12h before declaring startup failure
+
+	statefulSetRevisionSuffixLength = 11 // "-" + 10 char hash
 )
 
 type rootHandler struct {
@@ -50,7 +53,6 @@ func registerRootController(ctx context.Context, m *Manager) error {
 	handler.roots.OnChange(ctx, "koldun-root-controller", handler.onChange)
 	handler.roots.OnRemove(ctx, "koldun-root-controller", handler.onRemove)
 
-	handler.deployments.OnChange(ctx, "koldun-root-deployment-watch", handler.onRelatedDeployment)
 	handler.services.OnChange(ctx, "koldun-root-service-watch", handler.onRelatedService)
 	handler.statefulsets.OnChange(ctx, "koldun-root-statefulset-watch", handler.onRelatedStatefulSet)
 	handler.statefulsets.OnRemove(ctx, "koldun-root-statefulset-remove", handler.onRelatedStatefulSet)
@@ -62,6 +64,20 @@ func registerRootController(ctx context.Context, m *Manager) error {
 	return nil
 }
 
+func rootStatefulSetName(name string) string {
+	suffix := "-root"
+	max := validation.LabelValueMaxLength - statefulSetRevisionSuffixLength
+	baseMax := max - len(suffix)
+	if baseMax < 1 {
+		baseMax = 1
+	}
+	base := strings.TrimSuffix(name, suffix)
+	if len(base) > baseMax {
+		base = base[:baseMax]
+	}
+	return base + suffix
+}
+
 func (h *rootHandler) onChange(key string, obj *v1.Root) (*v1.Root, error) {
 	if obj == nil {
 		return nil, nil
@@ -70,10 +86,10 @@ func (h *rootHandler) onChange(key string, obj *v1.Root) (*v1.Root, error) {
 		return obj, nil
 	}
 
-	if err := h.ensureDeployment(obj); err != nil {
+	if err := h.ensureService(obj); err != nil {
 		return obj, err
 	}
-	if err := h.ensureService(obj); err != nil {
+	if err := h.ensureStatefulSet(obj); err != nil {
 		return obj, err
 	}
 
@@ -81,21 +97,6 @@ func (h *rootHandler) onChange(key string, obj *v1.Root) (*v1.Root, error) {
 }
 
 func (h *rootHandler) onRemove(key string, obj *v1.Root) (*v1.Root, error) {
-	return obj, nil
-}
-
-func (h *rootHandler) onRelatedDeployment(key string, obj *appsv1.Deployment) (*appsv1.Deployment, error) {
-	if obj == nil {
-		return nil, nil
-	}
-	if obj.Labels[labelComponent] != componentRoot {
-		return obj, nil
-	}
-	rootName := obj.Labels[labelRootName]
-	if rootName == "" {
-		return obj, nil
-	}
-	h.roots.Enqueue(obj.Namespace, rootName)
 	return obj, nil
 }
 
@@ -118,14 +119,21 @@ func (h *rootHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) 
 	if obj == nil {
 		return nil, nil
 	}
-	if obj.Labels[labelComponent] != componentWorker {
-		return obj, nil
+
+	switch obj.Labels[labelComponent] {
+	case componentRoot:
+		rootName := obj.Labels[labelRootName]
+		if rootName == "" {
+			rootName = obj.Name
+		}
+		h.roots.Enqueue(obj.Namespace, rootName)
+	case componentWorker:
+		dllamaName := labelValue(obj.Labels, labelDllamaName)
+		if dllamaName == "" {
+			return obj, nil
+		}
+		h.roots.Enqueue(obj.Namespace, fmt.Sprintf("%s-root", dllamaName))
 	}
-	dllamaName := labelValue(obj.Labels, labelDllamaName)
-	if dllamaName == "" {
-		return obj, nil
-	}
-	h.roots.Enqueue(obj.Namespace, fmt.Sprintf("%s-root", dllamaName))
 	return obj, nil
 }
 
@@ -146,7 +154,7 @@ func (h *rootHandler) onRelatedWorker(key string, obj *v1.Worker) (*v1.Worker, e
 	return obj, nil
 }
 
-func (h *rootHandler) ensureDeployment(root *v1.Root) error {
+func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	allWorkersReady, _, workerEndpoints, err := h.workerStatus(root)
 	if err != nil {
 		return err
@@ -184,33 +192,41 @@ func (h *rootHandler) ensureDeployment(root *v1.Root) error {
 		return fmt.Errorf("root %s/%s missing spec.modelRef", root.Namespace, root.Name)
 	}
 
+	stsName := rootStatefulSetName(root.Name)
+
 	labels := map[string]string{
 		labelComponent:        componentRoot,
-		labelRootName:         root.Name,
+		labelRootName:         sanitizeLabelValue(root.Name),
 		labelConversationHash: labelValue(root.Labels, labelConversationHash),
 	}
 	if dllamaName := labelValue(root.Labels, labelDllamaName); dllamaName != "" {
 		labels[labelDllamaName] = dllamaName
 	}
 
+	selector := map[string]string{}
+	for k, v := range labels {
+		selector[k] = v
+	}
+
 	rootContainer := h.rootContainer(root, modelFile, tokenizerFile, weightsFloatType, threads, workerEndpoints)
 	llmContainer := h.llmSidecarContainer(root)
 
-	dep := &appsv1.Deployment{
+	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: appsv1.SchemeGroupVersion.String(),
-			Kind:       "Deployment",
+			Kind:       "StatefulSet",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      root.Name,
+			Name:      stsName,
 			Namespace: root.Namespace,
 			Labels:    labels,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32(1),
-			Selector: &metav1.LabelSelector{MatchLabels: labels},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: root.Name,
+			Replicas:    pointer.Int32(1),
+			Selector:    &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
 					Volumes: []corev1.Volume{
@@ -230,11 +246,25 @@ func (h *rootHandler) ensureDeployment(root *v1.Root) error {
 		},
 	}
 
-	return h.apply.WithOwner(root).
+	if err := h.apply.WithOwner(root).
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(root.Namespace).
-		WithSetID(fmt.Sprintf("root-%s-deployment", root.Name)).
-		ApplyObjects(dep)
+		WithSetID(fmt.Sprintf("root-%s-statefulset", root.Name)).
+		ApplyObjects(sts); err != nil {
+		return err
+	}
+
+	if h.deployments != nil {
+		if _, err := h.deployments.Cache().Get(root.Namespace, root.Name); err == nil {
+			if err := h.deployments.Delete(root.Namespace, root.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete legacy root deployment: %w", err)
+			}
+		} else if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("lookup legacy root deployment: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (h *rootHandler) ensureService(root *v1.Root) error {
@@ -248,14 +278,15 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 			Namespace: root.Namespace,
 			Labels: map[string]string{
 				labelComponent:        componentRoot,
-				labelRootName:         root.Name,
+				labelRootName:         sanitizeLabelValue(root.Name),
 				labelConversationHash: labelValue(root.Labels, labelConversationHash),
 			},
 		},
 		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
 			Selector: map[string]string{
 				labelComponent: componentRoot,
-				labelRootName:  root.Name,
+				labelRootName:  sanitizeLabelValue(root.Name),
 			},
 			Ports: []corev1.ServicePort{
 				{
@@ -422,6 +453,9 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 	if queuePrefix != "" && !strings.HasSuffix(queuePrefix, ".") {
 		queuePrefix += "."
 	}
+	if queuePrefix != "" {
+		args = append(args, "--llm-in-prefix", queuePrefix)
+	}
 	if queuePrefix != "" && dllamaName != "" {
 		requestSubject := fmt.Sprintf("%s%s.in", queuePrefix, dllamaName)
 		stateSubject := fmt.Sprintf("%s%s.state", queuePrefix, dllamaName)
@@ -538,17 +572,17 @@ func (h *rootHandler) ensureStatus(root *v1.Root) (*v1.Root, error) {
 		ready.Reason = "WorkersLookupFailed"
 		ready.Message = fmt.Sprintf("Failed to list workers: %v", err)
 	} else if workersReady {
-		ready.Reason = "DeploymentNotReady"
-		ready.Message = "Root deployment is not yet ready"
-		if dep, err := h.deployments.Cache().Get(root.Namespace, root.Name); err == nil {
-			if dep.Status.ReadyReplicas >= 1 {
+		ready.Reason = "StatefulSetNotReady"
+		ready.Message = "Root statefulset is not yet ready"
+		if sts, err := h.statefulsets.Cache().Get(root.Namespace, rootStatefulSetName(root.Name)); err == nil {
+			if sts.Status.ReadyReplicas >= 1 {
 				ready.Status = metav1.ConditionTrue
-				ready.Reason = "DeploymentReady"
-				ready.Message = "Root deployment is ready"
+				ready.Reason = "StatefulSetReady"
+				ready.Message = "Root statefulset is ready"
 			}
 		} else if !apierrors.IsNotFound(err) {
-			ready.Reason = "DeploymentLookupFailed"
-			ready.Message = fmt.Sprintf("Failed to fetch root deployment: %v", err)
+			ready.Reason = "StatefulSetLookupFailed"
+			ready.Message = fmt.Sprintf("Failed to fetch root statefulset: %v", err)
 		}
 	}
 

@@ -4,7 +4,7 @@ Koldun (kubernetes operator for serverless distributed-llama) manages distribute
 
 ## Custom Resources
 
-- **Session** — captures a user conversation keyed by `session-<hash_koldun>`. The session controller supervises a pool of generated `Dllama` worker sets, tracks idle/busy capacity, and performs health checks against the `:9999/v1/models` endpoint before dispatching queued messages. Backends can tune the `sessionScaling` block to enforce minimum/maximum pools and backlog thresholds.
+- **Session** — captures a user conversation keyed by `session-<hash_koldun>`. The session controller supervises a pool of generated `Dllama` worker sets, manages a dedicated dispatcher Deployment, and tracks idle/busy capacity before handing work to Dllamas. `sessionScaling` controls pool size thresholds; the `queue` block defines backlog subjects, per-Dllama assignment prefixes, and the assignments KV bucket used for idempotency.
 - **Dllama** (`koldun.gorizond.io/v1`) — top-level orchestration resource that defines which model to run and the power-of-two fan-out for workers. The controller expands a `Dllama` into its component resources and aggregates status. Before spawning any `Worker` resources it checks that the referenced `Model` reports a non-empty `status.outputPVCName`, then materialises workers using the image from `spec.workerImage`. **New**: Automatically copies NATS URL from available `Ingress` resources to avoid configuration duplication.
 - **Model** — tracks acquisition and caching of model artifacts. The controller creates a metadata `ConfigMap`, a `ConfigMap` with a Python downloader script, and a `Job` that installs `huggingface_hub`, `boto3`, `botocore`, `requests` then runs the script to stream artifacts from Hugging Face directly into your S3/MinIO bucket. When conversion succeeds, an additional sizing job mounts the converted PVC, calculates its usage, and publishes the results to `status.conversionSizeBytes`/`status.conversionSizeHuman`.
 - **Root** — describes the distributed-llama root coordinator. The controller materialises the runtime as a `Deployment` and `Service` with Wrangler's Apply helpers.
@@ -122,6 +122,7 @@ Key flags:
 - `--backend-conversation-ttl` — JetStream KV TTL (default 10m) that governs conversation lifetime.
 - `--backend-response-timeout` — time to wait for NATS responses before returning HTTP 504.
 - `--backend-session-…` flags control the per-session Dllama pool (minimum/maximum size and backlog/idle thresholds) mirrored in `spec.backend.sessionScaling`.
+- `--backend-session-dispatcher-image` overrides the image used for dispatcher Deployments (defaults to the backend image when omitted).
 
 Notes:
 
@@ -146,6 +147,7 @@ spec:
     image: ghcr.io/gorizond/koldun:latest
     rootImage: ghcr.io/gorizond/koldun:latest
     workerImage: ghcr.io/gorizond/koldun:latest
+    dispatcherImage: ghcr.io/gorizond/koldun:latest
     nats:
       url: nats://koldun:k0ldun@nats.default:4222
       kvBucket: koldun_ttl
@@ -175,6 +177,7 @@ The controller renders a Deployment with `--mode=backend`, a ClusterIP Service e
 - `spec.backend.nats.url` supports embedded credentials (`nats://koldun:k0ldun@host:4222`). Use `spec.backend.extraArgs` plus projected env vars if you prefer to avoid literals.
 - `spec.backend.nats.modelsBucket` / `spec.backend.nats.tokensBucket` let you point at alternative registry buckets if you want per-tenant isolation.
 - `spec.backend.sessionScaling` defines minimum/maximum Dllama pools per session and backlog/idle thresholds used by the operator for auto-scaling.
+- `spec.backend.dispatcherImage` overrides the image used by dispatcher Deployments that fan out backlog entries to Dllamas.
 - `spec.service.type` may be set to `LoadBalancer` or `NodePort` when required.
 - TLS hosts and annotations map directly to the `Ingress` manifest.
 
@@ -187,22 +190,41 @@ go run ./cmd/operator \
   -mode=llm \
   -llm-hash "$HASH_KOLDUN" \
   -llm-nats-url nats://koldun:k0ldun@nats.default:4222 \
-  -llm-sidecar-url http://127.0.0.1:8080 \
-  -llm-in-prefix in. \
-  -llm-out-prefix out.
+  -llm-request-subject "sessions.${HASH_KOLDUN}.dllama.${DLLAMA}.in" \
+  -llm-state-subject "sessions.${HASH_KOLDUN}.dllama.${DLLAMA}.state" \
+  -llm-out-prefix out. \
+  -llm-sidecar-url http://127.0.0.1:8080
 ```
 
-- Reads `hash_koldun` from `--llm-hash` (defaults to the `HASH_KOLDUN` env variable).
-- Subscribes to `in.<hash>` subjects, forwards requests to the colocated dllama-api sidecar (`/v1/chat/completions`), and publishes streaming chunks back to `out.<hash>` (terminating with `[DONE]`).
+- Reads `hash_koldun` from `--llm-hash` (defaults to the `HASH_KOLDUN` env variable when unset).
+- Consumes assignments from the per-Dllama request subject, forwards them to the colocated dllama-api sidecar (`/v1/chat/completions`), publishes streaming chunks back to `out.<hash>`, and emits busy/idle/error heartbeats to the configured state subject.
 - Exposes `/healthz` and `/readyz` for liveness checks when `--llm-health-only` is false.
+
+#### Dispatcher (`--mode=dispatcher`)
+
+```
+go run ./cmd/operator \
+  -mode=dispatcher \
+  -dispatcher-hash "$HASH_KOLDUN" \
+  -dispatcher-nats-url nats://koldun:k0ldun@nats.default:4222 \
+  -dispatcher-backlog-subject sessions.${HASH_KOLDUN}.requests \
+  -dispatcher-assignments-bucket sess_${HASH_KOLDUN}_assign \
+  -dispatcher-dllama-prefix "sessions.${HASH_KOLDUN}.dllama." \
+  -dispatcher-ack-wait 2m
+```
+
+- Consumes backlog entries, writes assignments to JetStream KV so retries are idempotent, and republishes payloads to ready Dllamas using the configured subject prefix.
+- Listens for `conversation.WorkerStateEvent` heartbeats on `${dispatcher-state-prefix}>.state` (defaults to the dllama prefix) to mark assignments complete or trigger retries.
+- The session controller automatically creates this Deployment per session with the appropriate flags; running the binary manually is useful for debugging or bespoke automation.
 
 ### Conversation Lifecycle
 
-Every active chat produces three coordinated channels/key entries:
+Every active chat produces four coordinated channels/key entries:
 
-- `in.<hash_koldun>` — backend publishes new user prompts; the LLM worker subscribes.
-- `out.<hash_koldun>` — LLM worker streams responses; the backend subscribes and relays to the client.
-- `nats_ttl_<hash_koldun>` — JetStream KV record containing `{dllama, model, namespace, replicaPower}` with bucket TTL (default 10 minutes). The operator reconciler ensures a matching `Dllama` resource exists while the key is present and prunes stale `Dllama` objects once the key expires.
+- `sessions.<hash_koldun>.requests` — ingress enqueues backlog messages (`conversation.BacklogMessage`). The per-session dispatcher performs work stealing from this stream.
+- `sessions.<hash_koldun>.dllama.<dllama>.in` — dispatcher republishes payloads as `conversation.AssignmentEnvelope`s to ready Dllamas.
+- `sessions.<hash_koldun>.dllama.<dllama>.state` — Dllamas emit `conversation.WorkerStateEvent` heartbeats so the dispatcher can mark assignments complete or requeue on failure.
+- `nats_ttl_<hash_koldun>` — JetStream KV record containing `{model, namespace, replicaPower, queue}` with bucket TTL (default 10 minutes). The operator reconciler ensures a matching `Session` resource exists while the key is present and prunes stale resources once the key expires.
 
 #### Operator Conversation Reconciler (`--mode=operator`)
 

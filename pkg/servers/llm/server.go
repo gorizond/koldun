@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -204,6 +205,8 @@ func (s *Server) Run(ctx context.Context) error {
 		"queue":   queueName,
 		"stream":  s.streamName,
 	}).Info("subscribed to request stream")
+
+	s.startHeartbeatLoop(ctx)
 
 	errCh := make(chan error, 1)
 
@@ -532,6 +535,28 @@ func (s *Server) publishState(state, assignmentID string, active int32, errMsg s
 	}
 }
 
+func (s *Server) startHeartbeatLoop(ctx context.Context) {
+	// Emit an immediate idle heartbeat so the dispatcher can register this worker.
+	s.publishState("idle", "", 0, "")
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.publishState("idle", "", 0, "")
+			}
+		}
+	}()
+}
+
 func (s *Server) publishError(target, msg string) {
 	s.log.Warn(msg)
 	if target == "" {
@@ -554,29 +579,51 @@ func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error
 		return "", fmt.Errorf("in-prefix %q must end with '.' to enable durable delivery", prefix)
 	}
 
-	subject := prefix + ">"
-	cfg := &nats.StreamConfig{
-		Name:      llmRequestStreamName,
-		Subjects:  []string{subject},
-		Retention: nats.WorkQueuePolicy,
-		Storage:   nats.FileStorage,
+	required := map[string]struct{}{
+		(prefix + ">"):          {},
+		(defaultInPrefix + ">"): {},
 	}
 
-	if _, err := js.StreamInfo(llmRequestStreamName); err != nil {
-		if errors.Is(err, nats.ErrStreamNotFound) {
-			if _, err := js.AddStream(cfg); err != nil {
-				return "", fmt.Errorf("create stream: %w", err)
-			}
-		} else {
-			return "", fmt.Errorf("stream info: %w", err)
+	info, err := js.StreamInfo(llmRequestStreamName)
+	switch {
+	case err == nil:
+		for _, subj := range info.Config.Subjects {
+			required[strings.TrimSpace(subj)] = struct{}{}
 		}
-	} else {
-		if _, err := js.UpdateStream(cfg); err != nil {
+
+		cfg := info.Config
+		cfg.Subjects = uniqueSubjects(required)
+		if _, err := js.UpdateStream(&cfg); err != nil {
 			return "", fmt.Errorf("update stream: %w", err)
 		}
+	case errors.Is(err, nats.ErrStreamNotFound):
+		cfg := &nats.StreamConfig{
+			Name:      llmRequestStreamName,
+			Subjects:  uniqueSubjects(required),
+			Retention: nats.WorkQueuePolicy,
+			Storage:   nats.FileStorage,
+		}
+		if _, err := js.AddStream(cfg); err != nil {
+			return "", fmt.Errorf("create stream: %w", err)
+		}
+	default:
+		return "", fmt.Errorf("stream info: %w", err)
 	}
 
 	return llmRequestStreamName, nil
+}
+
+func uniqueSubjects(values map[string]struct{}) []string {
+	list := make([]string, 0, len(values))
+	for subj := range values {
+		subj = strings.TrimSpace(subj)
+		if subj == "" {
+			continue
+		}
+		list = append(list, subj)
+	}
+	sort.Strings(list)
+	return list
 }
 
 func durableName(hash string) string {

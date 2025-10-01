@@ -161,6 +161,8 @@ spec:
                     type: string
                   workerImage:
                     type: string
+                  dispatcherImage:
+                    type: string
                 required:
                 - image
                 - nats

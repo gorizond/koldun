@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/controllers"
 	"github.com/gorizond/koldun/pkg/kube"
+	"github.com/gorizond/koldun/pkg/servers/dispatcher"
 	"github.com/gorizond/koldun/pkg/servers/ingress"
 	"github.com/gorizond/koldun/pkg/servers/llm"
 	"github.com/rancher/wrangler/v3/pkg/signals"
@@ -57,6 +58,16 @@ func main() {
 		backendRootImage                   string
 		backendWorkerImage                 string
 
+		// Dispatcher flags
+		dispatcherHash              string
+		dispatcherNATSURL           string
+		dispatcherBacklogSubject    string
+		dispatcherAssignmentsBucket string
+		dispatcherDllamaPrefix      string
+		dispatcherStatePrefix       string
+		dispatcherQueueGroup        string
+		dispatcherAckWait           time.Duration
+
 		// Operator conversation/registry flags
 		operatorNATSURL      string
 		operatorKVBucket     string
@@ -83,6 +94,15 @@ func main() {
 	fs.StringVar(&llmSidecarURL, "llm-sidecar-url", "http://127.0.0.1:8080", "Base URL for dllama-api sidecar")
 	fs.DurationVar(&llmSidecarTimeout, "llm-sidecar-timeout", 2*time.Minute, "Timeout for sidecar HTTP calls")
 	fs.BoolVar(&llmHealthOnly, "llm-health-only", false, "Disable health server (useful for tests)")
+
+	fs.StringVar(&dispatcherHash, "dispatcher-hash", "", "Conversation hash this dispatcher serves")
+	fs.StringVar(&dispatcherNATSURL, "dispatcher-nats-url", "nats://nats.default:4222", "NATS endpoint for dispatcher")
+	fs.StringVar(&dispatcherBacklogSubject, "dispatcher-backlog-subject", "", "NATS subject holding backlog requests")
+	fs.StringVar(&dispatcherAssignmentsBucket, "dispatcher-assignments-bucket", "", "JetStream KV bucket for assignment tracking")
+	fs.StringVar(&dispatcherDllamaPrefix, "dispatcher-dllama-prefix", "", "Subject prefix used for worker assignments (must end with '.')")
+	fs.StringVar(&dispatcherStatePrefix, "dispatcher-state-prefix", "", "Subject prefix used for worker state heartbeats (defaults to dllama prefix)")
+	fs.StringVar(&dispatcherQueueGroup, "dispatcher-queue-group", "", "Queue group name for backlog consumption")
+	fs.DurationVar(&dispatcherAckWait, "dispatcher-ack-wait", 2*time.Minute, "Ack wait for backlog messages")
 
 	fs.StringVar(&backendListen, "backend-listen", ":8082", "Backend HTTP listen address")
 	fs.StringVar(&backendNamespace, "backend-namespace", "default", "Namespace for Dllama resources")
@@ -187,6 +207,17 @@ func main() {
 			SessionDispatcherImage:      backendSessionDispatcherImage,
 			HashSecret:                  []byte(backendHashSecret),
 		})
+	case "dispatcher":
+		runDispatcher(ctx, dispatcher.Config{
+			Hash:                dispatcherHash,
+			NATSURL:             dispatcherNATSURL,
+			BacklogSubject:      dispatcherBacklogSubject,
+			AssignmentsBucket:   dispatcherAssignmentsBucket,
+			DllamaSubjectPrefix: dispatcherDllamaPrefix,
+			StateSubjectPrefix:  dispatcherStatePrefix,
+			QueueGroup:          dispatcherQueueGroup,
+			AckWait:             dispatcherAckWait,
+		})
 	default:
 		logrus.Fatalf("unknown mode %q", mode)
 	}
@@ -240,5 +271,15 @@ func runIngress(ctx context.Context, cfg ingress.Config) {
 	}
 	if err := server.Run(ctx); err != nil {
 		logrus.Fatalf("ingress server exited with error: %v", err)
+	}
+}
+
+func runDispatcher(ctx context.Context, cfg dispatcher.Config) {
+	server, err := dispatcher.New(cfg)
+	if err != nil {
+		logrus.Fatalf("failed to initialise dispatcher: %v", err)
+	}
+	if err := server.Run(ctx); err != nil {
+		logrus.Fatalf("dispatcher exited with error: %v", err)
 	}
 }

@@ -43,6 +43,8 @@ spec:
                   type: string
                 workerImage:
                   type: string
+                dispatcherImage:
+                  type: string
                 replicaPower:
                   type: integer
                   format: int32
@@ -81,6 +83,12 @@ spec:
                     backlogSubject:
                       type: string
                     responseSubjectPrefix:
+                      type: string
+                    assignmentsBucket:
+                      type: string
+                    dllamaSubjectPrefix:
+                      type: string
+                    stateStream:
                       type: string
                     ackTimeout:
                       type: string

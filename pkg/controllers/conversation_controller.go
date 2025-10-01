@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -69,7 +70,7 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 		return fmt.Errorf("jetstream context: %w", err)
 	}
 
-	kv, err := js.KeyValue(cfg.KVBucket)
+	kv, err := ensureConversationBucket(js, cfg.KVBucket)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
@@ -86,6 +87,22 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 
 	go reconciler.run(ctx)
 	return nil
+}
+
+func ensureConversationBucket(js nats.JetStreamContext, bucket string) (nats.KeyValue, error) {
+	bucket = strings.TrimSpace(bucket)
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket name cannot be empty")
+	}
+
+	kv, err := js.KeyValue(bucket)
+	if err == nil {
+		return kv, nil
+	}
+	if errors.Is(err, nats.ErrBucketNotFound) {
+		return js.CreateKeyValue(&nats.KeyValueConfig{Bucket: bucket, History: 1})
+	}
+	return nil, err
 }
 
 func (r *conversationReconciler) run(ctx context.Context) {

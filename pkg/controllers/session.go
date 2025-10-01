@@ -8,6 +8,10 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/pointer"
+
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
@@ -120,7 +124,7 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 		if err := h.createDllamaForSession(sess); err != nil {
 			return err
 		}
-		return nil
+		return h.ensureDispatcher(sess)
 	}
 
 	if params.shouldScaleUp(state) {
@@ -134,7 +138,7 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 		if err := h.createDllamaForSession(sess); err != nil {
 			return err
 		}
-		return nil
+		return h.ensureDispatcher(sess)
 	}
 
 	if params.shouldScaleDown(state) {
@@ -154,10 +158,11 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 			if err := h.deleteDllama(sess, candidate); err != nil {
 				return err
 			}
+			return h.ensureDispatcher(sess)
 		}
 	}
 
-	return nil
+	return h.ensureDispatcher(sess)
 }
 
 func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
@@ -521,6 +526,116 @@ func (h *sessionHandler) deleteDllama(sess *v1.Session, dllama *v1.Dllama) error
 	return nil
 }
 
+func (h *sessionHandler) ensureDispatcher(sess *v1.Session) error {
+	queue := sess.Spec.Queue
+	if queue == nil {
+		return nil
+	}
+	backlogSubject := strings.TrimSpace(queue.BacklogSubject)
+	assignmentsBucket := strings.TrimSpace(queue.AssignmentsBucket)
+	dllamaPrefix := strings.TrimSpace(queue.DllamaSubjectPrefix)
+	if backlogSubject == "" || assignmentsBucket == "" || dllamaPrefix == "" {
+		return nil
+	}
+	dllamaPrefix = ensureTrailingDot(dllamaPrefix)
+	statePrefix := dllamaPrefix
+	if stream := strings.TrimSpace(queue.StateStream); stream != "" {
+		if strings.Contains(stream, ".") {
+			statePrefix = ensureTrailingDot(stream)
+		}
+	}
+
+	if sess.Spec.NATS == nil || strings.TrimSpace(sess.Spec.NATS.URL) == "" {
+		h.log.WithField("session", sess.Name).Warn("session missing NATS config for dispatcher")
+		return nil
+	}
+
+	image := strings.TrimSpace(sess.Spec.DispatcherImage)
+	if image == "" {
+		image = strings.TrimSpace(sess.Spec.RootImage)
+	}
+	if image == "" {
+		return fmt.Errorf("dispatcher image missing for session %s", sess.Name)
+	}
+
+	labels := map[string]string{
+		labelSessionName:      sanitizeLabelValue(sess.Name),
+		labelConversationHash: sanitizeLabelValue(sess.Spec.Hash),
+		labelComponent:        componentDispatcher,
+	}
+
+	ackWait := 2 * time.Minute
+	if queue.AckTimeout != nil && queue.AckTimeout.Duration > 0 {
+		ackWait = queue.AckTimeout.Duration
+	}
+
+	queueGroup := fmt.Sprintf("dispatcher-%s", sanitizeIdentifier(sess.Name))
+
+	deployment := desiredDispatcherDeployment(sess, labels, queueGroup, image, backlogSubject, assignmentsBucket, dllamaPrefix, statePrefix, ackWait)
+
+	apply := h.apply.WithOwner(sess).
+		WithSetOwnerReference(true, false).
+		WithDefaultNamespace(sess.Namespace).
+		WithSetID(fmt.Sprintf("session-%s-dispatcher", sess.Name))
+
+	return apply.ApplyObjects(deployment)
+}
+
+func desiredDispatcherDeployment(sess *v1.Session, labels map[string]string, queueGroup, image, backlogSubject, assignmentsBucket, dllamaPrefix, statePrefix string, ackWait time.Duration) *appsv1.Deployment {
+	selector := map[string]string{}
+	for k, v := range labels {
+		selector[k] = v
+	}
+
+	args := dispatcherArgs(sess, backlogSubject, assignmentsBucket, dllamaPrefix, statePrefix, queueGroup, ackWait)
+
+	container := corev1.Container{
+		Name:            "dispatcher",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/koldun"},
+		Args:            args,
+	}
+
+	deployment := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-dispatcher", sess.Name),
+			Namespace: sess.Namespace,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: pointer.Int32(1),
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				Spec: corev1.PodSpec{
+					TerminationGracePeriodSeconds: pointer.Int64(0),
+					Containers:                    []corev1.Container{container},
+				},
+			},
+		},
+	}
+
+	return deployment
+}
+
+func dispatcherArgs(sess *v1.Session, backlogSubject, assignmentsBucket, dllamaPrefix, statePrefix, queueGroup string, ackWait time.Duration) []string {
+	args := []string{
+		"dispatcher",
+		fmt.Sprintf("--dispatcher-hash=%s", strings.TrimSpace(sess.Spec.Hash)),
+		fmt.Sprintf("--dispatcher-nats-url=%s", strings.TrimSpace(sess.Spec.NATS.URL)),
+		fmt.Sprintf("--dispatcher-backlog-subject=%s", backlogSubject),
+		fmt.Sprintf("--dispatcher-assignments-bucket=%s", assignmentsBucket),
+		fmt.Sprintf("--dispatcher-dllama-prefix=%s", dllamaPrefix),
+		fmt.Sprintf("--dispatcher-state-prefix=%s", statePrefix),
+		fmt.Sprintf("--dispatcher-queue-group=%s", queueGroup),
+		fmt.Sprintf("--dispatcher-ack-wait=%s", ackWait.String()),
+	}
+
+	return args
+}
+
 func (h *sessionHandler) reconcileDllama(sess *v1.Session, dllama *v1.Dllama) error {
 	updated := dllama.DeepCopy()
 	desiredSpec := desiredDllamaSpecForSession(sess)
@@ -656,6 +771,40 @@ func ensureOwnerReference(meta *metav1.ObjectMeta, sess *v1.Session) bool {
 	}
 	meta.OwnerReferences = append(meta.OwnerReferences, *ref)
 	return true
+}
+
+func ensureTrailingDot(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return ""
+	}
+	if strings.HasSuffix(prefix, ".") {
+		return prefix
+	}
+	return prefix + "."
+}
+
+func sanitizeIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return value
+	}
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
 }
 
 func replicaPowerOrDefault(power int32) int32 {

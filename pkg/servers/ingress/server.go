@@ -285,29 +285,51 @@ func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error
 		return "", fmt.Errorf("in-prefix %q must end with '.' to enable durable delivery", prefix)
 	}
 
-	subject := prefix + ">"
-	cfg := &nats.StreamConfig{
-		Name:      llmRequestStreamName,
-		Subjects:  []string{subject},
-		Retention: nats.WorkQueuePolicy,
-		Storage:   nats.FileStorage,
+	required := map[string]struct{}{
+		(prefix + ">"):          {},
+		(defaultInPrefix + ">"): {},
 	}
 
-	if _, err := js.StreamInfo(llmRequestStreamName); err != nil {
-		if errors.Is(err, nats.ErrStreamNotFound) {
-			if _, err := js.AddStream(cfg); err != nil {
-				return "", fmt.Errorf("create stream: %w", err)
-			}
-		} else {
-			return "", fmt.Errorf("stream info: %w", err)
+	info, err := js.StreamInfo(llmRequestStreamName)
+	switch {
+	case err == nil:
+		for _, subj := range info.Config.Subjects {
+			required[strings.TrimSpace(subj)] = struct{}{}
 		}
-	} else {
-		if _, err := js.UpdateStream(cfg); err != nil {
+
+		cfg := info.Config
+		cfg.Subjects = uniqueSubjects(required)
+		if _, err := js.UpdateStream(&cfg); err != nil {
 			return "", fmt.Errorf("update stream: %w", err)
 		}
+	case errors.Is(err, nats.ErrStreamNotFound):
+		cfg := &nats.StreamConfig{
+			Name:      llmRequestStreamName,
+			Subjects:  uniqueSubjects(required),
+			Retention: nats.WorkQueuePolicy,
+			Storage:   nats.FileStorage,
+		}
+		if _, err := js.AddStream(cfg); err != nil {
+			return "", fmt.Errorf("create stream: %w", err)
+		}
+	default:
+		return "", fmt.Errorf("stream info: %w", err)
 	}
 
 	return llmRequestStreamName, nil
+}
+
+func uniqueSubjects(values map[string]struct{}) []string {
+	list := make([]string, 0, len(values))
+	for subj := range values {
+		subj = strings.TrimSpace(subj)
+		if subj == "" {
+			continue
+		}
+		list = append(list, subj)
+	}
+	sort.Strings(list)
+	return list
 }
 
 // Run starts the HTTP server and blocks until shutdown.
@@ -573,7 +595,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := s.nc.Publish(backlogSubject, body); err != nil {
+	if err := s.raw.Publish(backlogSubject, body); err != nil {
 		s.log.WithError(err).Error("publish request")
 		writeError(w, http.StatusBadGateway, "failed to enqueue request")
 		return

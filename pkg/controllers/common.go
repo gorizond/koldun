@@ -17,10 +17,11 @@ const (
 	labelSessionName      = "koldun.gorizond.io/session"
 	labelBackendName      = "koldun.gorizond.io/backend"
 
-	componentModel   = "model"
-	componentRoot    = "root"
-	componentWorker  = "worker"
-	componentBackend = "backend"
+	componentModel      = "model"
+	componentRoot       = "root"
+	componentWorker     = "worker"
+	componentBackend    = "backend"
+	componentDispatcher = "dispatcher"
 
 	annotationSlotKey                  = "koldun.gorizond.io/slot"
 	annotationSessionQueuePrefix       = "koldun.gorizond.io/session-dllama-prefix"
