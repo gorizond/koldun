@@ -39,9 +39,10 @@ type Server struct {
 	stateSub    *nats.Subscription
 	assignments nats.KeyValue
 
-	mu       sync.Mutex
-	workers  map[string]*workerState
-	inflight map[string]*assignment
+	mu            sync.Mutex
+	workers       map[string]*workerState
+	inflight      map[string]*assignment
+	lastNoIdleLog time.Time
 }
 
 type workerState struct {
@@ -179,9 +180,18 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		return
 	}
 
+	idleWorkers, totalWorkers, inflight := s.snapshotWorkerStats()
+
 	worker := s.selectWorker()
 	if worker == "" {
-		s.log.Debug("dispatcher backlog: no idle workers available, requeuing")
+		if s.shouldLogNoIdle(time.Now()) {
+			s.log.WithFields(logrus.Fields{
+				"requestId":    backlog.ID,
+				"idleWorkers":  idleWorkers,
+				"totalWorkers": totalWorkers,
+				"inflight":     inflight,
+			}).Info("dispatcher backlog: no idle workers available, requeuing")
+		}
 		if err := s.nc.Publish(s.cfg.BacklogSubject, msg.Data); err != nil {
 			s.log.WithError(err).Warn("requeue backlog message")
 		}
@@ -219,6 +229,16 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 	}
 	s.mu.Unlock()
 
+	nowIdle, total, nowInflight := s.snapshotWorkerStats()
+
+	s.log.WithFields(logrus.Fields{
+		"assignmentId": assignmentID,
+		"requestId":    backlog.ID,
+		"worker":       worker,
+		"idleWorkers":  nowIdle,
+		"totalWorkers": total,
+		"inflight":     nowInflight,
+	}).Debug("dispatcher dispatched assignment")
 }
 
 func (s *Server) handleState(msg *nats.Msg) {
@@ -346,6 +366,29 @@ func (s *Server) recoverAssignments() {
 			s.log.WithError(err).WithField("key", key).Warn("cleanup assignment entry")
 		}
 	}
+}
+
+func (s *Server) snapshotWorkerStats() (idle int, total int, inflight int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, st := range s.workers {
+		total++
+		if strings.ToLower(st.state) == "idle" && st.active == 0 {
+			idle++
+		}
+	}
+	inflight = len(s.inflight)
+	return
+}
+
+func (s *Server) shouldLogNoIdle(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.Sub(s.lastNoIdleLog) < 5*time.Second {
+		return false
+	}
+	s.lastNoIdleLog = now
+	return true
 }
 
 func ensureTrailingDot(prefix string) string {
