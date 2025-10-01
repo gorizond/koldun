@@ -155,7 +155,7 @@ func (s *Server) startBacklogSubscription() error {
 }
 
 func (s *Server) startStateSubscription() error {
-	subject := fmt.Sprintf("%s>.state", s.cfg.StateSubjectPrefix)
+	subject := fmt.Sprintf("%s*.state", s.cfg.StateSubjectPrefix)
 	sub, err := s.nc.Subscribe(subject, s.handleState)
 	if err != nil {
 		return fmt.Errorf("subscribe state: %w", err)
