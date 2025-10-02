@@ -316,6 +316,7 @@ type sessionScalingParams struct {
 	max              int32
 	scaleUpThreshold int64
 	scaleDownIdle    time.Duration
+	desired          int32
 }
 
 func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
@@ -341,6 +342,9 @@ func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 		if sc.ScaleDownIdleSeconds > 0 {
 			params.scaleDownIdle = time.Duration(sc.ScaleDownIdleSeconds) * time.Second
 		}
+		if sc.DesiredDllamas > 0 {
+			params.desired = sc.DesiredDllamas
+		}
 	}
 
 	if params.min <= 0 {
@@ -354,10 +358,13 @@ func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 }
 
 func (p sessionScalingParams) shouldScaleUp(state sessionPoolState) bool {
-	if p.scaleUpThreshold <= 0 {
+	if p.max > 0 && int32(state.total()) >= p.max {
 		return false
 	}
-	if p.max > 0 && int32(state.total()) >= p.max {
+	if p.desired > 0 && int32(state.total()) < p.desired {
+		return true
+	}
+	if p.scaleUpThreshold <= 0 {
 		return false
 	}
 	if state.backlog < p.scaleUpThreshold {
@@ -374,6 +381,9 @@ func (p sessionScalingParams) shouldScaleDown(state sessionPoolState) bool {
 		return false
 	}
 	if int32(state.total()) <= p.min {
+		return false
+	}
+	if p.desired > 0 && int32(state.total()) <= p.desired {
 		return false
 	}
 	if state.idleCount() == 0 {

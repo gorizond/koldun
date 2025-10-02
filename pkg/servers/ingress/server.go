@@ -271,9 +271,34 @@ func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig) (nats.KeyV
 	}
 	kv, err := js.KeyValue(cfg.Bucket)
 	if err == nats.ErrBucketNotFound {
-		kv, err = js.CreateKeyValue(cfg)
+		return js.CreateKeyValue(cfg)
 	}
-	return kv, err
+	if err != nil {
+		return nil, err
+	}
+
+	status, sErr := kv.Status()
+	if sErr != nil {
+		return nil, sErr
+	}
+	if desired := cfg.TTL; desired > 0 {
+		current := status.TTL()
+		if current <= 0 || absDuration(current-desired) > time.Second {
+			if dErr := js.DeleteKeyValue(cfg.Bucket); dErr != nil {
+				return nil, fmt.Errorf("delete kv bucket %s: %w", cfg.Bucket, dErr)
+			}
+			return js.CreateKeyValue(cfg)
+		}
+	}
+
+	return kv, nil
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error) {
@@ -467,10 +492,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ResponseTimeout)
+	reqCtx := r.Context()
+	authCtx, cancel := context.WithTimeout(reqCtx, s.cfg.ResponseTimeout)
 	defer cancel()
 
-	if err := s.validateToken(ctx, token); err != nil {
+	if err := s.validateToken(authCtx, token); err != nil {
 		s.log.WithError(err).Warn("token rejected")
 		writeError(w, http.StatusUnauthorized, "invalid api token")
 		return
@@ -511,7 +537,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	load := s.incrementSessionLoad(hash)
 
-	record, err := s.ensureConversation(ctx, hash, model, load)
+	record, err := s.ensureConversation(authCtx, hash, model, load)
 	if err != nil {
 		s.decrementSessionLoad(hash)
 		s.log.WithError(err).Error("ensure conversation record")
@@ -541,6 +567,28 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		responsePrefix = responseSubjectPrefix(s.cfg.OutPrefix, hash)
 	}
 	responseSubject := responsePrefix + newRequestID()
+
+	respCtx := reqCtx
+	var respCancel context.CancelFunc
+	if req.Stream {
+		respCtx, respCancel = context.WithCancel(reqCtx)
+	} else {
+		respCtx, respCancel = context.WithTimeout(reqCtx, s.cfg.ResponseTimeout)
+	}
+	defer respCancel()
+
+	dllamaPrefix := record.Queue.DllamaSubjectPrefix
+	if strings.TrimSpace(dllamaPrefix) == "" {
+		dllamaPrefix = dllamaSubjectPrefix(hash)
+	}
+	if load == 1 {
+		warmCtx, warmCancel := context.WithTimeout(reqCtx, s.cfg.ResponseTimeout)
+		err := s.waitForIdleWorker(warmCtx, dllamaPrefix)
+		warmCancel()
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			s.log.WithError(err).WithField("hash", hash).Warn("wait for idle worker")
+		}
+	}
 
 	msgs := make(chan *nats.Msg, 32)
 	sub, err := s.raw.ChanSubscribe(responseSubject, msgs)
@@ -602,11 +650,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		s.streamResponse(ctx, w, msgs)
+		s.streamResponse(respCtx, w, msgs)
 		return
 	}
 
-	msg, err := waitForMessage(ctx, msgs)
+	msg, err := waitForMessage(respCtx, msgs)
 	if err != nil {
 		writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
 		return
@@ -1077,21 +1125,40 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	writeSSE(w, "info", "initialising session")
+	flusher.Flush()
+	warmup := true
+
 	for {
-		msg, err := waitForMessage(ctx, msgs)
-		if err != nil {
-			writeSSE(w, "error", err.Error())
+		select {
+		case <-ticker.C:
+			if warmup {
+				writeSSE(w, "info", "warming up")
+				flusher.Flush()
+			}
+		case msg := <-msgs:
+			if msg == nil {
+				writeSSE(w, "error", "subscription closed")
+				flusher.Flush()
+				return
+			}
+			line := strings.TrimSpace(string(msg.Data))
+			if strings.EqualFold(line, "[DONE]") {
+				writeSSE(w, "done", "")
+				flusher.Flush()
+				return
+			}
+			warmup = false
+			writeSSE(w, "message", line)
+			flusher.Flush()
+		case <-ctx.Done():
+			writeSSE(w, "error", ctx.Err().Error())
 			flusher.Flush()
 			return
 		}
-		line := strings.TrimSpace(string(msg.Data))
-		if strings.EqualFold(line, "[DONE]") {
-			writeSSE(w, "done", "")
-			flusher.Flush()
-			return
-		}
-		writeSSE(w, "message", line)
-		flusher.Flush()
 	}
 }
 
@@ -1104,6 +1171,47 @@ func waitForMessage(ctx context.Context, msgs <-chan *nats.Msg) (*nats.Msg, erro
 			return nil, errors.New("subscription closed")
 		}
 		return msg, nil
+	}
+}
+
+func (s *Server) waitForIdleWorker(ctx context.Context, prefix string) error {
+	if s.raw == nil {
+		return nil
+	}
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return nil
+	}
+	if !strings.HasSuffix(prefix, ".") {
+		prefix += "."
+	}
+	subject := fmt.Sprintf("%s*.state", prefix)
+
+	msgs := make(chan *nats.Msg, 8)
+	sub, err := s.raw.ChanSubscribe(subject, msgs)
+	if err != nil {
+		return fmt.Errorf("subscribe state %s: %w", subject, err)
+	}
+	defer func() {
+		_ = sub.Unsubscribe()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg := <-msgs:
+			if msg == nil {
+				return fmt.Errorf("state subscription closed")
+			}
+			var event conversation.WorkerStateEvent
+			if err := json.Unmarshal(msg.Data, &event); err != nil {
+				continue
+			}
+			if strings.EqualFold(event.State, "idle") {
+				return nil
+			}
+		}
 	}
 }
 

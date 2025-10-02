@@ -72,10 +72,24 @@ func rootStatefulSetName(name string) string {
 		baseMax = 1
 	}
 	base := strings.TrimSuffix(name, suffix)
-	if len(base) > baseMax {
-		base = base[:baseMax]
+	if len(base) <= baseMax {
+		return base + suffix
 	}
-	return base + suffix
+	lastDash := strings.LastIndex(base, "-")
+	if lastDash <= 0 {
+		return base[:baseMax] + suffix
+	}
+	tail := base[lastDash+1:]
+	keep := baseMax - len(tail) - 1 // account for '-' separator
+	if keep <= 0 {
+		return base[:baseMax] + suffix
+	}
+	prefix := base[:keep]
+	prefix = strings.TrimRight(prefix, "-")
+	if prefix == "" {
+		return base[:baseMax] + suffix
+	}
+	return fmt.Sprintf("%s-%s%s", prefix, tail, suffix)
 }
 
 func (h *rootHandler) onChange(key string, obj *v1.Root) (*v1.Root, error) {

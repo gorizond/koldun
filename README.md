@@ -338,6 +338,13 @@ Notes:
 - Override `conversion.converterVersion` to pin a specific distributed-llama converter release (default `v0.16.2`).
 - When `spec.conversion` is defined, the controller runs a follow-up Job that (a) fetches the converter scripts from GitHub, (b) reads the model via an S3 CSI mount at `/mnt/s3`, (c) executes `convert-hf.py`/`convert-tokenizer-hf.py`, and (d) uploads the GGUF + tokenizer bundles back to the target S3 prefix using boto3.
 
+### Conversation runtime behaviour
+
+- The backend keeps conversation manifests in a JetStream KV bucket (`koldun_ttl`) with `Maximum Age` matching `backend.conversationTTL`. On startup the backend now recreates the bucket if the TTL differs, so conversations disappear automatically after the configured window.
+- For the very first request of a conversation the ingress waits for an `idle` heartbeat on `sessions.<hash>.dllama.*.state` before pushing the backlog message. This guarantees the dispatcher picks up the request as soon as the first dllama finishes booting and prevents it from being dropped into the queue too early.
+- Streaming responses (`stream: true`) send periodic `info: warming up` heartbeats while the model is loading; once a worker starts returning tokens the stream switches to `message:` events. Non-streaming requests still honour `backend.responseTimeout`.
+- The dispatcher now logs each issued assignment at `info` level, which is handy when tracing scaling behaviour (`dispatcher dispatched assignment`).
+
 ### S3 mount via CSI (github.com/yandex-cloud/k8s-csi-s3)
 
 - The controller creates a static PV and PVC and mounts the PVC at `/mnt/s3` for the conversion container.

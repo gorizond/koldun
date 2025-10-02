@@ -238,7 +238,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		"idleWorkers":  nowIdle,
 		"totalWorkers": total,
 		"inflight":     nowInflight,
-	}).Debug("dispatcher dispatched assignment")
+	}).Info("dispatcher dispatched assignment")
 }
 
 func (s *Server) handleState(msg *nats.Msg) {
