@@ -84,7 +84,7 @@ stringData:
 - `stringData.disabled` (or annotation `koldun.gorizond.io/token-disabled`) disables the token when set to a truthy value (`true`, `1`, `yes`, `on`).
 - `stringData.metadata` accepts an optional JSON object mirrored to the registry. Additional metadata entries can also be supplied via annotations prefixed with `koldun.gorizond.io/token-metadata-`.
 
-The operator mirrors every labelled Secret into the JetStream registry bucket (`koldun_tokens` by default). The backend hashes the provided `KOLDUN_API_TOKEN` header (SHA-256 hex) and validates it against that registry; disabled tokens are rejected with HTTP 401.
+The operator mirrors every labelled Secret into the JetStream registry bucket (`koldun_tokens` by default). The backend hashes the provided `KOLDUN_API_TOKEN` header (SHA-256 hex) — or the compatibility alias `OLLMANA_API_KEY` — and validates it against that registry; disabled tokens are rejected with HTTP 401.
 
 #### Backend Edge (`--mode=backend`)
 
@@ -105,7 +105,7 @@ go run ./cmd/operator \
 Request flow:
 
 1. `POST /v1/chat/completions`
-   - Validates `KOLDUN_API_TOKEN` against the token entries published by the operator.
+   - Validates `KOLDUN_API_TOKEN` (or `OLLMANA_API_KEY`) against the token entries published by the operator.
    - Extracts `chat_id`/`chat_start_time` (headers `X-Chat-ID`, `X-Chat-Start` or `request.metadata`).
    - Computes `hash_koldun = make_id(token, chat_id, chat_start_time)` per the supplied Python reference (now re-implemented in Go).
    - Ensures a JetStream KeyValue entry `nats_ttl_<hash>` exists with JSON payload describing the requested model, namespace, replica power, and session metadata. The entry TTL is refreshed on every request and reconciled into a `Session` resource (`session-<hash>`) that supervises the backing Dllama workers.
@@ -181,7 +181,7 @@ The controller renders a Deployment with `--mode=backend`, a ClusterIP Service e
 - `spec.service.type` may be set to `LoadBalancer` or `NodePort` when required.
 - TLS hosts and annotations map directly to the `Ingress` manifest.
 
-The Helm chart bundles the `Ingress` CRD; API tokens rely on standard Secrets labelled `koldun.gorizond.io/token`. You can declare multiple ingress instances via `values.yaml` under the `ingresses` array—`helm install` renders one manifest per entry using `templates/ingress-cr.yaml`.
+The Helm chart bundles the `Ingress` CRD; API tokens rely on standard Secrets labelled `koldun.gorizond.io/token`. Set `spec.backend.allowAnonymous: true` if you want a KIND-style demo ingress that accepts traffic without an API token (token validation stays on by default). You can declare multiple ingress instances via `values.yaml` under the `ingresses` array—`helm install` renders one manifest per entry using `templates/ingress-cr.yaml`.
 
 #### LLM Worker (`--mode=llm`)
 

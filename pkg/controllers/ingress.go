@@ -433,6 +433,9 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	if spec.Backend.HashSecret != "" {
 		args = append(args, fmt.Sprintf("--backend-hash-secret=%s", spec.Backend.HashSecret))
 	}
+	if spec.Backend.AllowAnonymous {
+		args = append(args, "--backend-allow-anonymous")
+	}
 
 	return args
 }

@@ -55,6 +55,7 @@ func main() {
 		backendSessionScaleDownIdleSeconds int
 		backendSessionDispatcherImage      string
 		backendHashSecret                  string
+		backendAllowAnonymous              bool
 		backendRootImage                   string
 		backendWorkerImage                 string
 
@@ -123,6 +124,7 @@ func main() {
 	fs.IntVar(&backendSessionScaleDownIdleSeconds, "backend-session-scale-down-idle-seconds", 0, "Idle seconds before scaling down Dllama instances")
 	fs.StringVar(&backendSessionDispatcherImage, "backend-session-dispatcher-image", "", "Container image for session dispatcher pods (defaults to backend image)")
 	fs.StringVar(&backendHashSecret, "backend-hash-secret", "", "Optional secret used for hash_koldun HMAC (base64/plain)")
+	fs.BoolVar(&backendAllowAnonymous, "backend-allow-anonymous", false, "Allow ingress backend to accept requests without API tokens")
 	fs.StringVar(&backendRootImage, "backend-root-image", "", "Container image for Dllama root pods")
 	fs.StringVar(&backendWorkerImage, "backend-worker-image", "", "Container image for Dllama worker pods")
 
@@ -206,6 +208,7 @@ func main() {
 			SessionScaleDownIdleSeconds: int32(backendSessionScaleDownIdleSeconds),
 			SessionDispatcherImage:      backendSessionDispatcherImage,
 			HashSecret:                  []byte(backendHashSecret),
+			AllowAnonymous:              backendAllowAnonymous,
 		})
 	case "dispatcher":
 		runDispatcher(ctx, dispatcher.Config{

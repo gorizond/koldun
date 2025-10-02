@@ -108,7 +108,8 @@ type Config struct {
 	SessionScaleDownIdleSeconds int32
 	SessionDispatcherImage      string
 
-	HashSecret []byte
+	HashSecret     []byte
+	AllowAnonymous bool
 
 	Logger *logrus.Entry
 }
@@ -126,6 +127,7 @@ type Server struct {
 
 	httpServer *http.Server
 	streamName string
+	stateSub   *nats.Subscription
 
 	tokenCache struct {
 		mu      sync.RWMutex
@@ -137,10 +139,21 @@ type Server struct {
 		mu     sync.Mutex
 		values map[string]int32
 	}
+
+	stateCache struct {
+		mu      sync.RWMutex
+		workers map[string]map[string]cachedWorkerState
+	}
 }
 
 type tokenEntry struct {
 	disabled bool
+}
+
+type cachedWorkerState struct {
+	state   string
+	active  int32
+	updated time.Time
 }
 
 // New constructs the ingress server.
@@ -241,13 +254,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("models kv bucket: %w", err)
 	}
 
-	tokensKV, err := ensureBucket(js, &nats.KeyValueConfig{
-		Bucket:  cfg.TokensBucket,
-		History: 1,
-	})
-	if err != nil {
-		raw.Close()
-		return nil, fmt.Errorf("tokens kv bucket: %w", err)
+	var tokensKV nats.KeyValue
+	if !cfg.AllowAnonymous {
+		tokensKV, err = ensureBucket(js, &nats.KeyValueConfig{
+			Bucket:  cfg.TokensBucket,
+			History: 1,
+		})
+		if err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("tokens kv bucket: %w", err)
+		}
 	}
 
 	srv := &Server{
@@ -262,6 +278,12 @@ func New(cfg Config) (*Server, error) {
 	}
 	srv.tokenCache.values = make(map[string]tokenEntry)
 	srv.sessionLoad.values = make(map[string]int32)
+	srv.stateCache.workers = make(map[string]map[string]cachedWorkerState)
+
+	if err := srv.startStateObserver(); err != nil {
+		srv.log.WithError(err).Warn("subscribe dllama state events")
+	}
+
 	return srv, nil
 }
 
@@ -402,6 +424,9 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
 			s.log.WithError(err).Warn("HTTP shutdown error")
 		}
+		if s.stateSub != nil {
+			_ = s.stateSub.Drain()
+		}
 		s.raw.Drain()
 	}()
 
@@ -435,7 +460,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "models bucket unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if s.tokensKV == nil {
+	if s.tokensKV == nil && !s.cfg.AllowAnonymous {
 		http.Error(w, "tokens bucket unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -486,20 +511,23 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token := strings.TrimSpace(r.Header.Get("KOLDUN_API_TOKEN"))
-	if token == "" {
-		writeError(w, http.StatusUnauthorized, "missing api token")
-		return
-	}
-
 	reqCtx := r.Context()
 	authCtx, cancel := context.WithTimeout(reqCtx, s.cfg.ResponseTimeout)
 	defer cancel()
 
-	if err := s.validateToken(authCtx, token); err != nil {
-		s.log.WithError(err).Warn("token rejected")
-		writeError(w, http.StatusUnauthorized, "invalid api token")
-		return
+	var tokenHash string
+	if !s.cfg.AllowAnonymous {
+		token := extractAPIToken(r)
+		if token == "" {
+			writeError(w, http.StatusUnauthorized, "missing api token")
+			return
+		}
+		if err := s.validateToken(authCtx, token); err != nil {
+			s.log.WithError(err).Warn("token rejected")
+			writeError(w, http.StatusUnauthorized, "invalid api token")
+			return
+		}
+		tokenHash = sha256Hex(token)
 	}
 
 	payload, err := readAll(r)
@@ -618,7 +646,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Hash:            hash,
 		ChatID:          chatID,
 		ChatStart:       chatStart,
-		TokenHash:       sha256Hex(token),
+		TokenHash:       tokenHash,
 		Model:           record.Model,
 		Namespace:       record.Namespace,
 		Request:         req,
@@ -925,6 +953,16 @@ func (s *Server) sessionLoadValue(hash string) int32 {
 }
 
 func (s *Server) loadTokenCache(ctx context.Context) map[string]tokenEntry {
+	if s.tokensKV == nil {
+		s.tokenCache.mu.Lock()
+		if s.tokenCache.values == nil {
+			s.tokenCache.values = make(map[string]tokenEntry)
+		}
+		s.tokenCache.expires = time.Now().Add(tokenCacheTTL)
+		s.tokenCache.mu.Unlock()
+		return s.tokenCache.values
+	}
+
 	s.tokenCache.mu.RLock()
 	if time.Now().Before(s.tokenCache.expires) {
 		defer s.tokenCache.mu.RUnlock()
@@ -1178,13 +1216,15 @@ func (s *Server) waitForIdleWorker(ctx context.Context, prefix string) error {
 	if s.raw == nil {
 		return nil
 	}
-	prefix = strings.TrimSpace(prefix)
+	prefix = ensureTrailingDot(strings.TrimSpace(prefix))
 	if prefix == "" {
 		return nil
 	}
-	if !strings.HasSuffix(prefix, ".") {
-		prefix += "."
+
+	if s.hasCachedIdleWorker(prefix) {
+		return nil
 	}
+
 	subject := fmt.Sprintf("%s*.state", prefix)
 
 	msgs := make(chan *nats.Msg, 8)
@@ -1208,11 +1248,161 @@ func (s *Server) waitForIdleWorker(ctx context.Context, prefix string) error {
 			if err := json.Unmarshal(msg.Data, &event); err != nil {
 				continue
 			}
-			if strings.EqualFold(event.State, "idle") {
+			worker := strings.TrimSpace(event.Dllama)
+			if worker == "" {
+				worker = stateWorkerFromSubject(msg.Subject)
+			}
+			s.cacheWorkerState(prefix, worker, event.State, event.Active, eventTimestamp(event.Timestamp))
+			if strings.EqualFold(event.State, "idle") && event.Active <= 0 {
 				return nil
 			}
 		}
 	}
+}
+
+const globalStateSubject = "sessions.*.dllama.*.state"
+
+func (s *Server) startStateObserver() error {
+	if s.raw == nil {
+		return nil
+	}
+	sub, err := s.raw.Subscribe(globalStateSubject, func(msg *nats.Msg) {
+		if msg == nil {
+			return
+		}
+		s.consumeStateEvent(msg.Subject, msg.Data)
+	})
+	if err != nil {
+		return fmt.Errorf("subscribe dllama state events: %w", err)
+	}
+	s.stateSub = sub
+	return nil
+}
+
+func (s *Server) consumeStateEvent(subject string, data []byte) {
+	prefix := statePrefixFromSubject(subject)
+	if prefix == "" {
+		return
+	}
+	var event conversation.WorkerStateEvent
+	if err := json.Unmarshal(data, &event); err != nil {
+		if s.log != nil {
+			s.log.WithError(err).WithField("subject", subject).Debug("invalid state event")
+		}
+		return
+	}
+	worker := strings.TrimSpace(event.Dllama)
+	if worker == "" {
+		worker = stateWorkerFromSubject(subject)
+	}
+	if worker == "" {
+		return
+	}
+	s.cacheWorkerState(prefix, worker, event.State, event.Active, eventTimestamp(event.Timestamp))
+}
+
+func (s *Server) cacheWorkerState(prefix, worker, state string, active int32, ts time.Time) {
+	prefix = ensureTrailingDot(strings.TrimSpace(prefix))
+	worker = strings.TrimSpace(worker)
+	if prefix == "" || worker == "" {
+		return
+	}
+	if active < 0 {
+		active = 0
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+
+	s.stateCache.mu.Lock()
+	defer s.stateCache.mu.Unlock()
+
+	if s.stateCache.workers == nil {
+		s.stateCache.workers = make(map[string]map[string]cachedWorkerState)
+	}
+
+	workers := s.stateCache.workers[prefix]
+	if workers == nil {
+		workers = make(map[string]cachedWorkerState)
+		s.stateCache.workers[prefix] = workers
+	}
+
+	workers[worker] = cachedWorkerState{
+		state:   strings.TrimSpace(state),
+		active:  active,
+		updated: ts,
+	}
+}
+
+func (s *Server) hasCachedIdleWorker(prefix string) bool {
+	prefix = ensureTrailingDot(strings.TrimSpace(prefix))
+	if prefix == "" {
+		return false
+	}
+
+	cutoff := time.Now().Add(-45 * time.Second)
+
+	s.stateCache.mu.Lock()
+	defer s.stateCache.mu.Unlock()
+
+	workers := s.stateCache.workers[prefix]
+	if len(workers) == 0 {
+		return false
+	}
+
+	idle := false
+	for name, st := range workers {
+		if st.updated.Before(cutoff) {
+			delete(workers, name)
+			continue
+		}
+		if strings.EqualFold(st.state, "idle") && st.active <= 0 {
+			idle = true
+		}
+	}
+	if len(workers) == 0 {
+		delete(s.stateCache.workers, prefix)
+	}
+	return idle
+}
+
+func statePrefixFromSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return ""
+	}
+	parts := strings.Split(subject, ".")
+	if len(parts) < 3 {
+		return ""
+	}
+	prefix := strings.Join(parts[:len(parts)-2], ".")
+	if prefix == "" {
+		return ""
+	}
+	return ensureTrailingDot(prefix)
+}
+
+func stateWorkerFromSubject(subject string) string {
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return ""
+	}
+	parts := strings.Split(subject, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[len(parts)-2])
+}
+
+func eventTimestamp(ts int64) time.Time {
+	if ts <= 0 {
+		return time.Now()
+	}
+	t := time.Unix(ts, 0)
+	if t.IsZero() {
+		return time.Now()
+	}
+	return t
 }
 
 func writeSSE(w http.ResponseWriter, event, data string) {
@@ -1243,6 +1433,15 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, openai.ErrorResponse{Error: openai.ErrorBody{Message: message}})
+}
+
+func extractAPIToken(r *http.Request) string {
+	for _, header := range []string{"KOLDUN_API_TOKEN", "OLLMANA_API_KEY"} {
+		if token := strings.TrimSpace(r.Header.Get(header)); token != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

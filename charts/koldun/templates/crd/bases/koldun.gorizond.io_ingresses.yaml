@@ -55,6 +55,8 @@ spec:
                     type: array
                   hashSecret:
                     type: string
+                  allowAnonymous:
+                    type: boolean
                   image:
                     type: string
                   imagePullPolicy:

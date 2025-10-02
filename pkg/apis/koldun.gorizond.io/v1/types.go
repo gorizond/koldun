@@ -1115,6 +1115,7 @@ type IngressBackendSpec struct {
 	WorkerImage     string                      `json:"workerImage"`
 	DispatcherImage string                      `json:"dispatcherImage,omitempty"`
 	HashSecret      string                      `json:"hashSecret,omitempty"`
+	AllowAnonymous  bool                        `json:"allowAnonymous,omitempty"`
 	NATS            IngressNATSConfig           `json:"nats"`
 	ConversationTTL *metav1.Duration            `json:"conversationTTL,omitempty"`
 	ResponseTimeout *metav1.Duration            `json:"responseTimeout,omitempty"`
