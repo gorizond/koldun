@@ -1109,11 +1109,13 @@ type IngressSpec struct {
 
 // IngressBackendSpec defines runtime configuration for the backend deployment.
 type IngressBackendSpec struct {
-	Image           string                      `json:"image"`
-	ImagePullPolicy string                      `json:"imagePullPolicy,omitempty"`
-	RootImage       string                      `json:"rootImage"`
-	WorkerImage     string                      `json:"workerImage"`
-	DispatcherImage string                      `json:"dispatcherImage,omitempty"`
+	Image           string `json:"image"`
+	ImagePullPolicy string `json:"imagePullPolicy,omitempty"`
+	RootImage       string `json:"rootImage"`
+	WorkerImage     string `json:"workerImage"`
+	DispatcherImage string `json:"dispatcherImage,omitempty"`
+	// ReplicaPower overrides the replica power configured on models when ensuring Sessions.
+	ReplicaPower    int32                       `json:"replicaPower,omitempty"`
 	HashSecret      string                      `json:"hashSecret,omitempty"`
 	AllowAnonymous  bool                        `json:"allowAnonymous,omitempty"`
 	NATS            IngressNATSConfig           `json:"nats"`

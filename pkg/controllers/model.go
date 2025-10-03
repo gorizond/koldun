@@ -40,6 +40,14 @@ const (
 	annotationForceSizeRerun = "koldun.gorizond.io/force-size-rerun"
 )
 
+func normalizeForceToken(value string, requested bool, resourceVersion string) string {
+	token := strings.TrimSpace(value)
+	if requested && token == "" {
+		token = fmt.Sprintf("annotation-rv-%s", resourceVersion)
+	}
+	return token
+}
+
 type modelHandler struct {
 	ctx    context.Context
 	apply  apply.Apply
@@ -1014,13 +1022,14 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 
 	jobName := sizeJobName(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
-	forceToken := strings.TrimSpace(obj.Annotations[annotationForceSizeRerun])
+	forceTokenRaw, forceRequested := obj.Annotations[annotationForceSizeRerun]
+	forceToken := normalizeForceToken(forceTokenRaw, forceRequested, obj.ResourceVersion)
 	processedToken := strings.TrimSpace(obj.Status.ConversionSizeForceToken)
 
 	alreadySucceeded := obj.Status.ConversionSizeGeneration == obj.Generation &&
 		strings.EqualFold(obj.Status.ConversionSizeState, "Succeeded") &&
 		obj.Status.ConversionSizeJobName == jobName
-	if alreadySucceeded && (forceToken == "" || forceToken == processedToken) {
+	if alreadySucceeded && (!forceRequested || forceToken == processedToken) {
 		return nil
 	}
 
@@ -1102,7 +1111,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 		"  echo 'Converted artifacts size: 0 (directory missing)'",
 		"  exit 0",
 		"fi",
-		"BYTES=$(du -sk \"${TARGET}\" | awk '{printf \"%d\", $1 * 1024}')",
+		"BYTES=$(du -sb \"${TARGET}\" | awk '{print $1}')",
 		"HUMAN=$(du -sh \"${TARGET}\" | awk '{print $1}')",
 		"printf '{\"bytes\":%s,\"human\":\"%s\"}\n' \"${BYTES}\" \"${HUMAN}\" > /dev/termination-log",
 		"echo \"Converted artifacts size: ${HUMAN} (${BYTES} bytes)\"",
@@ -1455,7 +1464,9 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	updated.Status.ConversionSizeForceToken = ""
 	updated.Status.OutputPVCName = ""
 
-	forceToken := strings.TrimSpace(obj.Annotations[annotationForceSizeRerun])
+	forceTokenRaw, forceAnnotationPresent := obj.Annotations[annotationForceSizeRerun]
+	forceToken := normalizeForceToken(forceTokenRaw, forceAnnotationPresent, obj.ResourceVersion)
+	shouldClearForceAnnotation := false
 
 	storage := obj.Spec.ObjectStorage
 	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
@@ -1565,6 +1576,9 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 						updated.Status.ConversionSizeHuman = measurement.Human
 						updated.Status.ConversionSizeGeneration = obj.Generation
 						updated.Status.ConversionSizeForceToken = forceToken
+						if forceAnnotationPresent {
+							shouldClearForceAnnotation = true
+						}
 					}
 				}
 			} else {
@@ -1689,6 +1703,10 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		changed = true
 	}
 
+	if shouldClearForceAnnotation {
+		changed = true
+	}
+
 	if obj.Annotations != nil && updated.Annotations == nil {
 		updated.Annotations = make(map[string]string)
 	}
@@ -1708,7 +1726,24 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		return obj, nil
 	}
 
-	return h.models.UpdateStatus(updated)
+	result, err := h.models.UpdateStatus(updated)
+	if err != nil {
+		return result, err
+	}
+
+	if shouldClearForceAnnotation {
+		if _, ok := result.Annotations[annotationForceSizeRerun]; ok {
+			cleared := result.DeepCopy()
+			delete(cleared.Annotations, annotationForceSizeRerun)
+			updatedModel, updateErr := h.models.Update(cleared)
+			if updateErr != nil {
+				return result, updateErr
+			}
+			return updatedModel, nil
+		}
+	}
+
+	return result, nil
 }
 
 func effectiveDownloadSpec(spec *v1.ModelDownloadSpec) *v1.ModelDownloadSpec {

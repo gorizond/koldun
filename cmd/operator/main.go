@@ -54,6 +54,7 @@ func main() {
 		backendSessionScaleUpBacklog       int
 		backendSessionScaleDownIdleSeconds int
 		backendSessionDispatcherImage      string
+		backendReplicaPower                int
 		backendHashSecret                  string
 		backendAllowAnonymous              bool
 		backendRootImage                   string
@@ -127,6 +128,7 @@ func main() {
 	fs.BoolVar(&backendAllowAnonymous, "backend-allow-anonymous", false, "Allow ingress backend to accept requests without API tokens")
 	fs.StringVar(&backendRootImage, "backend-root-image", "", "Container image for Dllama root pods")
 	fs.StringVar(&backendWorkerImage, "backend-worker-image", "", "Container image for Dllama worker pods")
+	fs.IntVar(&backendReplicaPower, "backend-replica-power", 0, "Override replica power for Sessions created by the backend (0 uses model setting)")
 
 	fs.StringVar(&operatorNATSURL, "operator-nats-url", "", "NATS endpoint used by the operator to reconcile conversations and publish registry data")
 	fs.StringVar(&operatorKVBucket, "operator-kv-bucket", "", "JetStream KeyValue bucket containing conversation records")
@@ -209,6 +211,7 @@ func main() {
 			SessionDispatcherImage:      backendSessionDispatcherImage,
 			HashSecret:                  []byte(backendHashSecret),
 			AllowAnonymous:              backendAllowAnonymous,
+			ReplicaPower:                int32(backendReplicaPower),
 		})
 	case "dispatcher":
 		runDispatcher(ctx, dispatcher.Config{

@@ -29,6 +29,9 @@ const (
 	annotationSessionBacklogSubject    = "koldun.gorizond.io/session-backlog-subject"
 	annotationSessionStateStream       = "koldun.gorizond.io/session-state-stream"
 
+	annotationConversionSizeHuman = "koldun.gorizond.io/conversion-size-human"
+	annotationMemoryPlan          = "koldun.gorizond.io/memory-plan"
+
 	conditionReady      = "Ready"
 	conditionDownloaded = "Downloaded"
 	conditionConverted  = "Converted"

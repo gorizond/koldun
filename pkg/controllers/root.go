@@ -199,6 +199,13 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		threads = 2
 	}
 
+	workerReplicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
+	if workerReplicas <= 0 {
+		workerReplicas = 1
+	}
+
+	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas)
+
 	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, weightsFloatType)
 	tokenizerFile := fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
 
@@ -222,8 +229,28 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		selector[k] = v
 	}
 
-	rootContainer := h.rootContainer(root, modelFile, tokenizerFile, weightsFloatType, threads, workerEndpoints)
+	rootResources := corev1.ResourceRequirements{}
+	if haveMemoryPlan {
+		rootResources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: rootMemory},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: rootMemory},
+		}
+	}
+
+	rootContainer := h.rootContainer(root, modelFile, tokenizerFile, weightsFloatType, threads, workerEndpoints, rootResources)
 	llmContainer := h.llmSidecarContainer(root)
+
+	var podAnnotations map[string]string
+	if haveMemoryPlan {
+		podAnnotations = map[string]string{}
+		sizeHuman := strings.TrimSpace(model.Status.ConversionSizeHuman)
+		if sizeHuman == "" {
+			sizeHuman = fmt.Sprintf("%dB", model.Status.ConversionSizeBytes)
+		}
+		totalNodes := workerReplicas + 1
+		podAnnotations[annotationConversionSizeHuman] = sizeHuman
+		podAnnotations[annotationMemoryPlan] = fmt.Sprintf("model=%s nodes=%d root=%s worker=%s", sizeHuman, totalNodes, rootMemory.String(), workerMemory.String())
+	}
 
 	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
@@ -240,7 +267,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 			Replicas:    pointer.Int32(1),
 			Selector:    &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
 					Volumes: []corev1.Volume{
@@ -372,7 +399,7 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 	return allReady, readyCount, endpoints, nil
 }
 
-func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string) corev1.Container {
+func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string, resources corev1.ResourceRequirements) corev1.Container {
 	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", weightsFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
 	if len(workers) > 0 {
 		args = append(args, "--workers")
@@ -421,7 +448,7 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		}
 	}
 
-	return corev1.Container{
+	container := corev1.Container{
 		Name:            "root",
 		Image:           root.Spec.Image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
@@ -448,6 +475,12 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 			},
 		},
 	}
+
+	if !isResourceRequirementsEmpty(resources) {
+		container.Resources = resources
+	}
+
+	return container
 }
 
 func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/utils/pointer"
@@ -20,6 +22,7 @@ type workerHandler struct {
 	ctx          context.Context
 	apply        apply.Apply
 	dllamas      generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
+	models       generic.ControllerInterface[*v1.Model, *v1.ModelList]
 	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
 	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
 	services     generic.ControllerInterface[*corev1.Service, *corev1.ServiceList]
@@ -30,6 +33,7 @@ func registerWorkerController(ctx context.Context, m *Manager) error {
 		ctx:          ctx,
 		apply:        m.Apply(ctx),
 		dllamas:      m.Kold.Dllama(),
+		models:       m.Kold.Model(),
 		workers:      m.Kold.Worker(),
 		statefulsets: m.Apps.StatefulSet(),
 		services:     m.Core.Service(),
@@ -41,6 +45,8 @@ func registerWorkerController(ctx context.Context, m *Manager) error {
 	handler.services.OnChange(ctx, "koldun-worker-service-watch", handler.onRelatedService)
 	handler.dllamas.OnChange(ctx, "koldun-worker-dllama-watch", handler.onRelatedDllama)
 	handler.dllamas.OnRemove(ctx, "koldun-worker-dllama-remove", handler.onRelatedDllama)
+	handler.models.OnChange(ctx, "koldun-worker-model-watch", handler.onRelatedModel)
+	handler.models.OnRemove(ctx, "koldun-worker-model-remove", handler.onRelatedModel)
 	return nil
 }
 
@@ -106,9 +112,68 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		labels[labelConversationHash] = sanitizeLabelValue(hash)
 	}
 
-	replicas, threads := h.workerReplicaConfig(worker)
-	if replicas <= 0 {
-		replicas = 1
+	dllamaName := labelValue(worker.Labels, labelDllamaName)
+	var dllama *v1.Dllama
+	if dllamaName != "" {
+		d, err := h.dllamas.Cache().Get(worker.Namespace, dllamaName)
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+		} else {
+			dllama = d
+		}
+	}
+
+	replicas := int32(1)
+	threads := int32(2)
+	if dllama != nil {
+		replicas = workersForReplicaPower(dllama.Spec.ReplicaPower)
+		if replicas <= 0 {
+			replicas = 1
+		}
+		threads = dllama.Spec.ReplicaPower * 2
+		if threads <= 0 {
+			threads = 2
+		}
+	}
+
+	var model *v1.Model
+	if dllama != nil {
+		modelName := strings.TrimSpace(dllama.Spec.ModelRef.Name)
+		if modelName != "" {
+			modelNamespace := referencedModelNamespace(dllama)
+			m, err := h.models.Cache().Get(modelNamespace, modelName)
+			if err != nil {
+				if !apierrors.IsNotFound(err) {
+					return err
+				}
+			} else {
+				model = m
+			}
+		}
+	}
+
+	slotValue := strconv.Itoa(int(worker.Spec.Slot))
+	serviceAnnotations := map[string]string{annotationSlotKey: slotValue}
+	stsAnnotations := map[string]string{annotationSlotKey: slotValue}
+	podAnnotations := map[string]string{annotationSlotKey: slotValue}
+
+	workerResources := corev1.ResourceRequirements{}
+	if model != nil {
+		if rootMemory, workerMemory, ok := calculateMemoryRequests(model.Status.ConversionSizeBytes, replicas); ok {
+			workerResources = corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceMemory: workerMemory},
+				Limits:   corev1.ResourceList{corev1.ResourceMemory: workerMemory},
+			}
+			sizeHuman := strings.TrimSpace(model.Status.ConversionSizeHuman)
+			if sizeHuman == "" {
+				sizeHuman = fmt.Sprintf("%dB", model.Status.ConversionSizeBytes)
+			}
+			totalNodes := replicas + 1
+			podAnnotations[annotationConversionSizeHuman] = sizeHuman
+			podAnnotations[annotationMemoryPlan] = fmt.Sprintf("model=%s nodes=%d root=%s worker=%s", sizeHuman, totalNodes, rootMemory.String(), workerMemory.String())
+		}
 	}
 
 	svc := &corev1.Service{
@@ -120,7 +185,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 			Name:        name,
 			Namespace:   worker.Namespace,
 			Labels:      labels,
-			Annotations: map[string]string{annotationSlotKey: strconv.Itoa(int(worker.Spec.Slot))},
+			Annotations: serviceAnnotations,
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP:                corev1.ClusterIPNone,
@@ -144,7 +209,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 			Name:        name,
 			Namespace:   worker.Namespace,
 			Labels:      labels,
-			Annotations: map[string]string{annotationSlotKey: strconv.Itoa(int(worker.Spec.Slot))},
+			Annotations: stsAnnotations,
 		},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: name,
@@ -153,11 +218,11 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
-					Annotations: map[string]string{annotationSlotKey: strconv.Itoa(int(worker.Spec.Slot))},
+					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
-					Containers:                    []corev1.Container{h.workerContainer(worker, threads)},
+					Containers:                    []corev1.Container{h.workerContainer(worker, threads, workerResources)},
 				},
 			},
 		},
@@ -169,7 +234,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		ApplyObjects(svc, sts)
 }
 
-func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32) corev1.Container {
+func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resources corev1.ResourceRequirements) corev1.Container {
 	args := []string{"worker", "--port", "9999", "--nthreads", fmt.Sprintf("%d", threads)}
 	if len(worker.Spec.Args) > 0 {
 		args = append(args, worker.Spec.Args...)
@@ -214,7 +279,7 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32) corev1
 		}
 	}
 
-	return corev1.Container{
+	container := corev1.Container{
 		Name:            "worker",
 		Image:           worker.Spec.Image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
@@ -223,6 +288,12 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32) corev1
 		Env:             env,
 		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
 	}
+
+	if !isResourceRequirementsEmpty(resources) {
+		container.Resources = resources
+	}
+
+	return container
 }
 
 func (h *workerHandler) ensureStatus(worker *v1.Worker) (*v1.Worker, error) {
@@ -260,26 +331,6 @@ func (h *workerHandler) ensureStatus(worker *v1.Worker) (*v1.Worker, error) {
 	return h.workers.UpdateStatus(updated)
 }
 
-func (h *workerHandler) workerReplicaConfig(worker *v1.Worker) (replicas int32, threads int32) {
-	dllamaName := labelValue(worker.Labels, labelDllamaName)
-	if dllamaName == "" {
-		return 1, 2
-	}
-	dllama, err := h.dllamas.Cache().Get(worker.Namespace, dllamaName)
-	if err != nil {
-		return 1, 2
-	}
-	replicas = workersForReplicaPower(dllama.Spec.ReplicaPower)
-	if replicas <= 0 {
-		replicas = 1
-	}
-	threads = dllama.Spec.ReplicaPower * 2
-	if threads <= 0 {
-		threads = 2
-	}
-	return replicas, threads
-}
-
 func (h *workerHandler) onRelatedDllama(key string, obj *v1.Dllama) (*v1.Dllama, error) {
 	if obj == nil {
 		return nil, nil
@@ -292,6 +343,30 @@ func (h *workerHandler) onRelatedDllama(key string, obj *v1.Dllama) (*v1.Dllama,
 	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
 	for _, worker := range workers {
 		h.workers.Enqueue(worker.Namespace, worker.Name)
+	}
+	return obj, nil
+}
+
+func (h *workerHandler) onRelatedModel(key string, obj *v1.Model) (*v1.Model, error) {
+	namespace, name := "", ""
+	if obj != nil {
+		namespace, name = obj.Namespace, obj.Name
+	} else {
+		namespace, name = splitKey(key)
+	}
+	if namespace == "" || name == "" {
+		return obj, nil
+	}
+
+	dllamas, err := h.dllamas.Cache().List("", labels.Everything())
+	if err != nil {
+		return obj, err
+	}
+	for _, dllama := range dllamas {
+		if referencesModel(dllama, namespace, name) {
+			workerName := workerResourceName(dllama.Name)
+			h.workers.Enqueue(dllama.Namespace, workerName)
+		}
 	}
 	return obj, nil
 }

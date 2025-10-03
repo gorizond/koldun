@@ -354,6 +354,9 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 	if strings.TrimSpace(spec.Route.Host) == "" {
 		return fmt.Errorf("route.host is required")
 	}
+	if spec.Backend.ReplicaPower < 0 {
+		return fmt.Errorf("backend.replicaPower must be >= 0")
+	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {
 		if scaling.MinDllamas < 0 {
 			return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
@@ -375,6 +378,10 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 		"--backend-namespace=$(POD_NAMESPACE)",
 		fmt.Sprintf("--backend-root-image=%s", spec.Backend.RootImage),
 		fmt.Sprintf("--backend-worker-image=%s", spec.Backend.WorkerImage),
+	}
+
+	if spec.Backend.ReplicaPower > 0 {
+		args = append(args, fmt.Sprintf("--backend-replica-power=%d", spec.Backend.ReplicaPower))
 	}
 
 	dispatcherImage := spec.Backend.DispatcherImage

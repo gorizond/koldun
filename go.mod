@@ -6,9 +6,11 @@ toolchain go1.24.2
 
 require (
 	github.com/nats-io/nats.go v1.46.0
+	github.com/nats-io/nuid v1.0.1
 	github.com/rancher/lasso v0.2.3
 	github.com/rancher/wrangler/v3 v3.2.4
 	github.com/sirupsen/logrus v1.9.3
+	go.uber.org/mock v0.5.2
 	k8s.io/api v0.33.1
 	k8s.io/apimachinery v0.33.1
 	k8s.io/client-go v0.33.1
@@ -39,7 +41,6 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
-	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.22.0 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect

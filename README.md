@@ -1,4 +1,4 @@
-# Koldun Operator
+# Koldun Operator 🧙‍♂️
 
 Koldun (kubernetes operator for serverless distributed-llama) manages distributed-llama topologies on Kubernetes using the [Rancher Wrangler](https://github.com/rancher/wrangler) framework. The operator introduces a set of custom resources for orchestrating model distribution, root coordination, and worker execution tuned for the [distributed-llama](https://github.com/b4rtaz/distributed-llama) runtime.
 
@@ -148,6 +148,7 @@ spec:
     rootImage: ghcr.io/gorizond/koldun:latest
     workerImage: ghcr.io/gorizond/koldun:latest
     dispatcherImage: ghcr.io/gorizond/koldun:latest
+    replicaPower: 2
     nats:
       url: nats://koldun:k0ldun@nats.default:4222
       kvBucket: koldun_ttl
@@ -177,6 +178,7 @@ The controller renders a Deployment with `--mode=backend`, a ClusterIP Service e
 - `spec.backend.nats.url` supports embedded credentials (`nats://koldun:k0ldun@host:4222`). Use `spec.backend.extraArgs` plus projected env vars if you prefer to avoid literals.
 - `spec.backend.nats.modelsBucket` / `spec.backend.nats.tokensBucket` let you point at alternative registry buckets if you want per-tenant isolation.
 - `spec.backend.sessionScaling` defines minimum/maximum Dllama pools per session and backlog/idle thresholds used by the operator for auto-scaling.
+- `spec.backend.replicaPower` forces a specific worker fan-out (power-of-two minus one workers) for every Session managed by this ingress; when omitted, the Model's `spec.replicaPower` value is used (defaults to 1).
 - `spec.backend.dispatcherImage` overrides the image used by dispatcher Deployments that fan out backlog entries to Dllamas.
 - `spec.service.type` may be set to `LoadBalancer` or `NodePort` when required.
 - TLS hosts and annotations map directly to the `Ingress` manifest.
@@ -287,7 +289,7 @@ spec:
       name: my-hf
     image: python:3.11
     memory: 2Gi
-  localPath: s3://my-bucket-model/Qwen/Qwen3-1.7B
+  localPath: s3://my-bucket-model/mistralai/Mistral-7B-v0.3
   objectStorage:
     bucketForConvert: my-bucket-convert
     bucketForSource: my-bucket-model
@@ -295,7 +297,7 @@ spec:
     secretRef:
       name: minio-creds
   pipProxy: http://192.168.205.2:4001
-  sourceUrl: https://huggingface.co/Qwen/Qwen3-1.7B
+  sourceUrl: https://huggingface.co/mistralai/Mistral-7B-v0.3
 ```
 
 Example `Dllama` referencing the converted model:
@@ -337,6 +339,7 @@ Notes:
 - `objectStorage.bucketForConvert` is mounted directly into the conversion job and becomes the working directory for converter scripts.
 - Override `conversion.converterVersion` to pin a specific distributed-llama converter release (default `v0.16.2`).
 - When `spec.conversion` is defined, the controller runs a follow-up Job that (a) fetches the converter scripts from GitHub, (b) reads the model via an S3 CSI mount at `/mnt/s3`, (c) executes `convert-hf.py`/`convert-tokenizer-hf.py`, and (d) uploads the GGUF + tokenizer bundles back to the target S3 prefix using boto3.
+- Add the annotation `koldun.gorizond.io/force-size-rerun` to a `Model` (value optional) to force the operator to re-run the sizing job; the annotation is removed automatically once `status.conversionSizeBytes`/`status.conversionSizeHuman` are refreshed.
 
 ### Conversation runtime behaviour
 

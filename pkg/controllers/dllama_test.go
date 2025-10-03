@@ -1,10 +1,16 @@
 package controllers
 
 import (
+	"errors"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"go.uber.org/mock/gomock"
+	appsv1 "k8s.io/api/apps/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func TestWorkersForReplicaPower(t *testing.T) {
@@ -17,8 +23,8 @@ func TestWorkersForReplicaPower(t *testing.T) {
 		{"negative power", -1, 0},
 		{"power of 1", 1, 1},
 		{"power of 2", 2, 3},
-		{"power of 3", 3, 5},
-		{"power of 10", 10, 19},
+		{"power of 3", 3, 7},
+		{"power of 5", 5, 31},
 	}
 
 	for _, tt := range tests {
@@ -259,6 +265,81 @@ func TestReferencesModel(t *testing.T) {
 				t.Errorf("referencesModel() = %v, want %v", result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestReadyReplicasForWorker(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	stsCache := fake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	stsController := fake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+
+	handler := &dllamaHandler{statefulsets: stsController}
+
+	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns"}}
+
+	stsController.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("ns", "worker").Return(&appsv1.StatefulSet{
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 3},
+	}, nil)
+
+	ready, err := handler.readyReplicasForWorker(worker)
+	if err != nil {
+		t.Fatalf("readyReplicasForWorker returned error: %v", err)
+	}
+	if ready != 3 {
+		t.Fatalf("readyReplicasForWorker = %d, want %d", ready, 3)
+	}
+}
+
+func TestReadyReplicasForWorkerNotFound(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	stsCache := fake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	stsController := fake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+
+	handler := &dllamaHandler{statefulsets: stsController}
+
+	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns"}}
+
+	notFound := apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "worker")
+
+	stsController.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("ns", "worker").Return((*appsv1.StatefulSet)(nil), notFound)
+
+	ready, err := handler.readyReplicasForWorker(worker)
+	if err != nil {
+		t.Fatalf("readyReplicasForWorker returned error: %v", err)
+	}
+	if ready != 0 {
+		t.Fatalf("readyReplicasForWorker = %d, want %d", ready, 0)
+	}
+}
+
+func TestReadyReplicasForWorkerError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	stsCache := fake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	stsController := fake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+
+	handler := &dllamaHandler{statefulsets: stsController}
+
+	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "ns"}}
+
+	expectedErr := errors.New("cache failure")
+
+	stsController.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("ns", "worker").Return((*appsv1.StatefulSet)(nil), expectedErr)
+
+	ready, err := handler.readyReplicasForWorker(worker)
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("readyReplicasForWorker error = %v, want %v", err, expectedErr)
+	}
+	if ready != 0 {
+		t.Fatalf("readyReplicasForWorker = %d, want %d", ready, 0)
 	}
 }
 

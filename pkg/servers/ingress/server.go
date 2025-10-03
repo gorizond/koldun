@@ -111,6 +111,8 @@ type Config struct {
 	HashSecret     []byte
 	AllowAnonymous bool
 
+	ReplicaPower int32
+
 	Logger *logrus.Entry
 }
 
@@ -211,6 +213,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if strings.TrimSpace(cfg.SessionDispatcherImage) == "" {
 		cfg.SessionDispatcherImage = cfg.RootImage
+	}
+	if cfg.ReplicaPower < 0 {
+		cfg.ReplicaPower = 0
 	}
 
 	log := cfg.Logger
@@ -706,10 +711,7 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 		record, parseErr := conversation.ParseRecord(rev.Value())
 		if parseErr == nil {
 			recordChanged := false
-			requiredReplica := model.ReplicaPower
-			if requiredReplica <= 0 {
-				requiredReplica = 1
-			}
+			requiredReplica := s.replicaPowerForModel(model)
 			if record.ReplicaPower != requiredReplica {
 				record.ReplicaPower = requiredReplica
 				recordChanged = true
@@ -819,10 +821,7 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 		return nil, err
 	}
 
-	requiredReplica := model.ReplicaPower
-	if requiredReplica <= 0 {
-		requiredReplica = 1
-	}
+	requiredReplica := s.replicaPowerForModel(model)
 
 	modelNamespace := model.Namespace
 	if strings.TrimSpace(modelNamespace) == "" {
@@ -1103,6 +1102,16 @@ func (s *Server) populateModelDefaults(model *registry.Model, key string) {
 			model.Name = parts[1]
 		}
 	}
+}
+
+func (s *Server) replicaPowerForModel(model *registry.Model) int32 {
+	if s.cfg.ReplicaPower > 0 {
+		return s.cfg.ReplicaPower
+	}
+	if model != nil && model.ReplicaPower > 0 {
+		return model.ReplicaPower
+	}
+	return 1
 }
 
 func (s *Server) modelKey(namespace, name string) string {

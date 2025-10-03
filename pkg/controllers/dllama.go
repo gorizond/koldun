@@ -8,6 +8,7 @@ import (
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
+	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -15,24 +16,26 @@ import (
 )
 
 type dllamaHandler struct {
-	ctx       context.Context
-	apply     apply.Apply
-	dllamas   generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
-	models    generic.ControllerInterface[*v1.Model, *v1.ModelList]
-	roots     generic.ControllerInterface[*v1.Root, *v1.RootList]
-	workers   generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
-	ingresses generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
+	ctx          context.Context
+	apply        apply.Apply
+	dllamas      generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
+	models       generic.ControllerInterface[*v1.Model, *v1.ModelList]
+	roots        generic.ControllerInterface[*v1.Root, *v1.RootList]
+	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
+	ingresses    generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
 }
 
 func registerDllamaController(ctx context.Context, m *Manager) error {
 	handler := &dllamaHandler{
-		ctx:       ctx,
-		apply:     m.Apply(ctx),
-		dllamas:   m.Kold.Dllama(),
-		models:    m.Kold.Model(),
-		roots:     m.Kold.Root(),
-		workers:   m.Kold.Worker(),
-		ingresses: m.Kold.Ingress(),
+		ctx:          ctx,
+		apply:        m.Apply(ctx),
+		dllamas:      m.Kold.Dllama(),
+		models:       m.Kold.Model(),
+		roots:        m.Kold.Root(),
+		workers:      m.Kold.Worker(),
+		statefulsets: m.Apps.StatefulSet(),
+		ingresses:    m.Kold.Ingress(),
 	}
 
 	handler.dllamas.OnChange(ctx, "koldun-dllama-controller", handler.onChange)
@@ -287,6 +290,22 @@ func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1
 	return []*v1.Worker{worker}
 }
 
+func (h *dllamaHandler) readyReplicasForWorker(worker *v1.Worker) (int32, error) {
+	if worker == nil {
+		return 0, nil
+	}
+
+	sts, err := h.statefulsets.Cache().Get(worker.Namespace, worker.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	return sts.Status.ReadyReplicas, nil
+}
+
 const maxInt32 = int64(^uint32(0) >> 1)
 
 func workersForReplicaPower(power int32) int32 {
@@ -294,7 +313,10 @@ func workersForReplicaPower(power int32) int32 {
 		return 0
 	}
 
-	result := int64(power)*2 - 1
+	if power >= 31 {
+		return int32(maxInt32)
+	}
+	result := int64(1<<power) - 1
 	if result > maxInt32 {
 		return int32(maxInt32)
 	}
@@ -384,14 +406,22 @@ func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
 		}
 
 		selector := labels.SelectorFromSet(map[string]string{labelDllamaName: dllama.Name})
-		workers, _ := h.workers.Cache().List(dllama.Namespace, selector)
+		workers, err := h.workers.Cache().List(dllama.Namespace, selector)
+		if err != nil {
+			return dllama, err
+		}
 		for _, worker := range workers {
-			if isConditionTrue(worker.Status.Conditions, conditionReady) {
-				readyWorkers++
+			readyReplicas, err := h.readyReplicasForWorker(worker)
+			if err != nil {
+				return dllama, err
 			}
+			readyWorkers += readyReplicas
 		}
 
 		expectedWorkers := workersForReplicaPower(dllama.Spec.ReplicaPower)
+		if expectedWorkers <= 0 {
+			expectedWorkers = 1
+		}
 		if readyRoot && readyWorkers >= expectedWorkers {
 			condition.Status = metav1.ConditionTrue
 			condition.Reason = "TopologyReady"

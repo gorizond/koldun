@@ -138,6 +138,7 @@ ingresses: []
 #       image: ghcr.io/gorizond/koldun:latest
 #       rootImage: ghcr.io/gorizond/koldun-root:latest
 #       workerImage: ghcr.io/gorizond/koldun-worker:latest
+#       replicaPower: 3
 #       nats:
 #         url: nats://nats:4222
 #         kvBucket: koldun_ttl

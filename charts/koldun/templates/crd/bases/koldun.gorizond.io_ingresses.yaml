@@ -161,6 +161,9 @@ spec:
                     type: object
                   rootImage:
                     type: string
+                  replicaPower:
+                    format: int32
+                    type: integer
                   workerImage:
                     type: string
                   dispatcherImage:
