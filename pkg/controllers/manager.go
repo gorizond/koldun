@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	koldv1 "github.com/gorizond/koldun/pkg/controllers/koldunv1"
+	lassocontroller "github.com/rancher/lasso/pkg/controller"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	appsv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
 	batchv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/batch/v1"
@@ -16,8 +17,11 @@ import (
 
 // Manager wires together Wrangler factories, controllers, and reconcilers for the operator.
 type Manager struct {
-	factory *generic.Factory
-	apply   apply.Apply
+	factory           *generic.Factory
+	controllerFactory lassocontroller.SharedControllerFactory
+	apply             apply.Apply
+
+	health *Health
 
 	Core  corev1.Interface
 	Apps  appsv1.Interface
@@ -31,7 +35,11 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		return nil, fmt.Errorf("register base schemes: %w", err)
 	}
 
-	factory, err := generic.NewFactoryFromConfigWithOptions(cfg, nil)
+	health := NewHealth()
+
+	factory, err := generic.NewFactoryFromConfigWithOptions(cfg, &generic.FactoryOptions{
+		HealthCallback: health.SetAPIHealthy,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("build controller factory: %w", err)
 	}
@@ -68,12 +76,14 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		)
 
 	return &Manager{
-		factory: factory,
-		apply:   applier,
-		Core:    core,
-		Apps:    apps,
-		Batch:   batch,
-		Kold:    kold,
+		factory:           factory,
+		controllerFactory: ctrlFactory,
+		apply:             applier,
+		health:            health,
+		Core:              core,
+		Apps:              apps,
+		Batch:             batch,
+		Kold:              kold,
 	}, nil
 }
 
@@ -102,14 +112,27 @@ func (m *Manager) Register(ctx context.Context) error {
 
 // Start runs the shared informers and controllers.
 func (m *Manager) Start(ctx context.Context) error {
-	if err := m.factory.Start(ctx, 2); err != nil {
+	m.health.SetCachesSynced(false)
+
+	if err := m.factory.Sync(ctx); err != nil {
 		return fmt.Errorf("start controller factory: %w", err)
 	}
-	<-ctx.Done()
+
+	m.health.SetCachesSynced(true)
+
+	if err := m.controllerFactory.Start(ctx, 2); err != nil {
+		return fmt.Errorf("start controller factory: %w", err)
+	}
+
 	return nil
 }
 
 // Apply returns a copy of the apply helper bound to the given context.
 func (m *Manager) Apply(ctx context.Context) apply.Apply {
 	return m.apply.WithContext(ctx)
+}
+
+// Health exposes the manager health tracker for readiness endpoints.
+func (m *Manager) Health() *Health {
+	return m.health
 }

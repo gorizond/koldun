@@ -54,6 +54,9 @@ spec:
             {{- if .Values.operator.conversation.pollInterval }}
             - "--operator-poll-interval={{ .Values.operator.conversation.pollInterval }}"
             {{- end }}
+            {{- if .Values.operator.health.port }}
+            - "--operator-health-listen=:{{ .Values.operator.health.port }}"
+            {{- end }}
             {{- with .Values.operator.registry }}
             {{- if .modelsBucket }}
             - "--operator-models-bucket={{ .modelsBucket }}"
@@ -72,8 +75,8 @@ spec:
             - {{ . | quote }}
             {{- end }}
           ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
+            - name: health
+              containerPort: {{ .Values.operator.health.port | default .Values.service.port }}
               protocol: TCP
           {{- with .Values.livenessProbe }}
           livenessProbe:
