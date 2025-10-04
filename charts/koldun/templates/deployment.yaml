@@ -54,6 +54,20 @@ spec:
             {{- if .Values.operator.conversation.pollInterval }}
             - "--operator-poll-interval={{ .Values.operator.conversation.pollInterval }}"
             {{- end }}
+            {{- with .Values.operator.registry }}
+            {{- if .modelsBucket }}
+            - "--operator-models-bucket={{ .modelsBucket }}"
+            {{- end }}
+            {{- if .tokensBucket }}
+            - "--operator-tokens-bucket={{ .tokensBucket }}"
+            {{- end }}
+            {{- if .modelPrefix }}
+            - "--operator-model-prefix={{ .modelPrefix }}"
+            {{- end }}
+            {{- if .tokenPrefix }}
+            - "--operator-token-prefix={{ .tokenPrefix }}"
+            {{- end }}
+            {{- end }}
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}
             {{- end }}

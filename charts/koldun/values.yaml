@@ -66,6 +66,11 @@ operator:
     kvBucket: ""
     ttlPrefix: nats_ttl_
     pollInterval: 10s
+  registry:
+    modelsBucket: ""
+    tokensBucket: ""
+    modelPrefix: ""
+    tokenPrefix: ""
   extraArgs: []
 
 # This block is for setting up the ingress for more information can be found here: https://kubernetes.io/docs/concepts/services-networking/ingress/
