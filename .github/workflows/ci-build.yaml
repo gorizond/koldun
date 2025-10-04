@@ -21,41 +21,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Detect relevant changes
-        id: changes
-        run: |
-          before="${{ github.event.before }}"
-          if [ "$before" = "0000000000000000000000000000000000000000" ] || ! git rev-list --quiet "$before"; then
-            if git rev-parse HEAD^ >/dev/null 2>&1; then
-              files=$(git diff --name-only HEAD^ HEAD)
-            else
-              files=$(git ls-files)
-            fi
-          else
-            files=$(git diff --name-only "$before" HEAD)
-          fi
-          filtered=$(echo "$files" | grep -v '^charts/koldun/fleet.yaml$' | sed '/^$/d' || true)
-          if [ -n "$filtered" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Skip build if only fleet.yaml changed
-        if: steps.changes.outputs.changed == 'false'
-        run: |
-          echo "No relevant changes detected, skipping build"
-          exit 0
 
       - name: Set up Docker Buildx
-        if: steps.changes.outputs.changed == 'true'
         uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226
 
       - name: Log into registry ${{ env.REGISTRY }}
-        if: steps.changes.outputs.changed == 'true'
         uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d
         with:
           registry: ${{ env.REGISTRY }}
@@ -63,19 +33,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract Docker metadata
-        if: steps.changes.outputs.changed == 'true'
         id: meta
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=ci-${{ github.run_number }}
-            type=raw,value=v0.0.${{ github.run_number }}
             type=raw,value=sha-${{ github.sha }}
             type=ref,event=branch
 
       - name: Build and push Docker image
-        if: steps.changes.outputs.changed == 'true'
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09
         with:
           context: .
