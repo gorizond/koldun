@@ -3,6 +3,16 @@ entries:
   koldun:
   - apiVersion: v2
     appVersion: 1.16.0
+    created: "2025-10-04T15:38:44.580821429Z"
+    description: Operator for distributed-llama
+    digest: e047f0909c1785b50ab9f8acbf089f6dd647a1b669010685fd4b277cc92dffcb
+    name: koldun
+    type: application
+    urls:
+    - https://github.com/gorizond/koldun/releases/download/koldun-0.0.2/koldun-0.0.2.tgz
+    version: 0.0.2
+  - apiVersion: v2
+    appVersion: 1.16.0
     created: "2025-09-24T18:01:35.285022096Z"
     description: Operator for distributed-llama
     digest: e1b73d526979fd9f85c923248a4907f332891ab6cd9ea70008468e0dede78d40
@@ -11,4 +21,4 @@ entries:
     urls:
     - https://gorizond.github.io/koldun/koldun-0.0.1.tgz
     version: 0.0.1
-generated: "2025-09-24T18:01:35.284414547Z"
+generated: "2025-10-04T15:38:44.580834373Z"
