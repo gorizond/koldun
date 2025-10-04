@@ -4,7 +4,7 @@ helm:
   chart: .
   values: 
     image:
-      tag: "" # {"$imagescan": "koldun:tag"}
+      tag: v0.0.7 # {"$imagescan": "koldun:tag"}
 
 imageScans:
   - policy:
