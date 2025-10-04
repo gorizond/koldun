@@ -16,20 +16,20 @@ RUN make dllama && make dllama-api && \
 # Use the official Golang image as a base image
 FROM golang:1.24.2 AS builder
 
-# Set the Current Working Directory inside the container
-WORKDIR /app
+WORKDIR /workspace
 
 # Copy go mod and sum files
 COPY go.mod go.sum ./
 
-# Download all dependencies. Dependencies will be cached if the go.mod and go.sum files are not changed
+# Download module dependencies; cached unless module files change
 RUN go mod download
 
-# Copy the source from the current directory to the Working Directory inside the container
-COPY . .
+# Copy only the Go sources required to build the operator
+COPY cmd ./cmd
+COPY pkg ./pkg
 
 # Build the Go app
-RUN CGO_ENABLED=0 GOOS=linux go build -o koldun ./cmd/operator
+RUN mkdir -p /out && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/koldun ./cmd/operator
 
 # Start a new stage from scratch
 FROM alpine:latest
@@ -38,7 +38,7 @@ RUN apk add --no-cache libstdc++ libgcc
 # Copy the Pre-built binary file from the previous stage
 COPY --from=dllama-builder /out/dllama /usr/local/bin/dllama
 COPY --from=dllama-builder /out/dllama-api /usr/local/bin/dllama-api
-COPY --from=builder /app/koldun /koldun
+COPY --from=builder /out/koldun /koldun
 
 # Command to run the executable
 ENTRYPOINT ["/koldun"]

@@ -1,1 +1,7 @@
-.gocache
+**
+!Dockerfile
+!.dockerignore
+!go.mod
+!go.sum
+!cmd/**
+!pkg/**
