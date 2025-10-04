@@ -9,7 +9,7 @@ helm:
 imageScans:
   - policy:
       semver:
-        range: "*"
+        range: "ci-*"
       alphabetical:
         order: asc
     image: "ghcr.io/gorizond/koldun"
