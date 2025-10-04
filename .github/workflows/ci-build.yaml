@@ -37,6 +37,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=ci-${{ github.run_number }}
+            type=raw,value=v0.0.${{ github.run_number }}
             type=raw,value=sha-${{ github.sha }}
             type=ref,event=branch
 
