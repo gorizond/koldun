@@ -12,6 +12,7 @@ import (
 	"github.com/gorizond/koldun/pkg/servers/dispatcher"
 	"github.com/gorizond/koldun/pkg/servers/ingress"
 	"github.com/gorizond/koldun/pkg/servers/llm"
+	operatorhealth "github.com/gorizond/koldun/pkg/servers/operator"
 	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"k8s.io/klog/v2"
@@ -79,6 +80,7 @@ func main() {
 		operatorTokensBucket string
 		operatorModelPrefix  string
 		operatorTokenPrefix  string
+		operatorHealthListen string
 	)
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -138,6 +140,7 @@ func main() {
 	fs.StringVar(&operatorTokensBucket, "operator-tokens-bucket", "", "JetStream KeyValue bucket where API tokens are published (default koldun_tokens)")
 	fs.StringVar(&operatorModelPrefix, "operator-model-prefix", "", "Key prefix for model entries in the registry bucket (default model/)")
 	fs.StringVar(&operatorTokenPrefix, "operator-token-prefix", "", "Key prefix for token entries in the registry bucket (default token/)")
+	fs.StringVar(&operatorHealthListen, "operator-health-listen", ":8080", "Operator health endpoint listen address")
 
 	klog.InitFlags(fs)
 
@@ -172,6 +175,7 @@ func main() {
 				ModelPrefix:  operatorModelPrefix,
 				TokenPrefix:  operatorTokenPrefix,
 			},
+			operatorHealthListen,
 		)
 	case "llm":
 		runLLM(ctx, llm.Config{
@@ -229,7 +233,7 @@ func main() {
 	}
 }
 
-func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.ConversationConfig, registryCfg controllers.RegistryConfig) {
+func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.ConversationConfig, registryCfg controllers.RegistryConfig, healthListen string) {
 	cfg, err := kube.BuildConfig(kubeconfig)
 	if err != nil {
 		logrus.Fatalf("failed to build Kubernetes config: %v", err)
@@ -238,6 +242,14 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 	manager, err := controllers.NewManager(cfg)
 	if err != nil {
 		logrus.Fatalf("failed to create controller manager: %v", err)
+	}
+
+	healthServer, err := operatorhealth.New(operatorhealth.Config{
+		ListenAddress: healthListen,
+		Health:        manager.Health(),
+	})
+	if err != nil {
+		logrus.Fatalf("failed to create health server: %v", err)
 	}
 
 	if err := manager.Register(ctx); err != nil {
@@ -251,6 +263,18 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 	if err := controllers.StartConversationReconciler(ctx, manager, convCfg); err != nil {
 		logrus.Fatalf("failed to start conversation reconciler: %v", err)
 	}
+
+	go func() {
+		if err := healthServer.Run(ctx); err != nil {
+			logrus.Fatalf("health server exited with error: %v", err)
+		}
+	}()
+
+	go func() {
+		<-ctx.Done()
+		manager.Health().SetAPIHealthy(false)
+		manager.Health().SetCachesSynced(false)
+	}()
 
 	logrus.Info("starting koldun operator")
 	klog.Info("koldun operator is starting up")

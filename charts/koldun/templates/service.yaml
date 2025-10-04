@@ -8,8 +8,8 @@ spec:
   type: {{ .Values.service.type }}
   ports:
     - port: {{ .Values.service.port }}
-      targetPort: http
+      targetPort: health
       protocol: TCP
-      name: http
+      name: health
   selector:
     {{- include "koldun.selectorLabels" . | nindent 4 }}
