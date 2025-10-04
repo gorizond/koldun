@@ -19,14 +19,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Detect relevant changes
         id: changes
         run: |
-          if git rev-parse HEAD^ >/dev/null 2>&1; then
-            files=$(git diff --name-only HEAD^ HEAD)
+          before="${{ github.event.before }}"
+          if [ "$before" = "0000000000000000000000000000000000000000" ] || ! git rev-list --quiet "$before"; then
+            if git rev-parse HEAD^ >/dev/null 2>&1; then
+              files=$(git diff --name-only HEAD^ HEAD)
+            else
+              files=$(git ls-files)
+            fi
           else
-            files=$(git ls-files)
+            files=$(git diff --name-only "$before" HEAD)
           fi
           filtered=$(echo "$files" | grep -v '^charts/koldun/fleet.yaml$' | sed '/^$/d' || true)
           if [ -n "$filtered" ]; then
