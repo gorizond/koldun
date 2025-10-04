@@ -1,0 +1,17 @@
+defaultNamespace: koldun
+
+helm:
+  chart: .
+  values: 
+    image:
+      tag: "" # {"$imagescan": "koldun:tag"}
+
+imageScans:
+  - policy:
+      semver:
+        range: "*"
+      alphabetical:
+        order: asc
+    image: "ghcr.io/gorizond/koldun"
+    tagName: koldun
+    interval: 10s
