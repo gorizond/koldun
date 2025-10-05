@@ -92,7 +92,6 @@ func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) erro
 	sync.models.OnChange(ctx, "registry-sync-model", sync.onModelChange)
 	sync.models.OnRemove(ctx, "registry-sync-model-remove", sync.onModelRemove)
 	sync.secrets.OnChange(ctx, "registry-sync-token", sync.onSecretChange)
-	sync.secrets.OnRemove(ctx, "registry-sync-token-remove", sync.onSecretRemove)
 
 	go func() {
 		<-ctx.Done()
@@ -158,14 +157,16 @@ func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev
 	}
 
 	hash := tokens.Hash(secret)
-	if !tokens.IsTokenSecret(secret) {
-		if hash != "" {
-			if err := r.deleteToken(hash); err != nil {
-				r.log.WithError(err).
-					WithField("token", hash).
-					WithField("secret", modelKey(secret.Namespace, secret.Name)).
-					Warn("remove token from registry")
-			}
+	if hash == "" {
+		return nil, nil
+	}
+
+	if secret.DeletionTimestamp != nil || !tokens.IsTokenSecret(secret) {
+		if err := r.deleteToken(hash); err != nil {
+			r.log.WithError(err).
+				WithField("token", hash).
+				WithField("secret", modelKey(secret.Namespace, secret.Name)).
+				Warn("remove token from registry")
 		}
 		return nil, nil
 	}
@@ -182,24 +183,6 @@ func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev
 		r.log.WithError(err).
 			WithField("token", entry.Hash).
 			Error("publish token registry entry")
-		return nil, err
-	}
-	return nil, nil
-}
-
-func (r *registrySync) onSecretRemove(key string, secret *corev1.Secret) (*corev1.Secret, error) {
-	if secret == nil {
-		return nil, nil
-	}
-	hash := tokens.Hash(secret)
-	if hash == "" {
-		return nil, nil
-	}
-	if err := r.deleteToken(hash); err != nil {
-		r.log.WithError(err).
-			WithField("token", hash).
-			WithField("secret", modelKey(secret.Namespace, secret.Name)).
-			Warn("remove token from registry")
 		return nil, err
 	}
 	return nil, nil
