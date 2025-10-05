@@ -85,6 +85,9 @@ spec:
                     description: WeightsFloatType dictates the target precision (for
                       example, "q40").
                     type: string
+                  convertWeights:
+                    description: ConvertWeights selects quantization preset for convert-hf.py (e.g. "q80"); use values like "skip" to disable conversion.
+                    type: string
                 type: object
               download:
                 description: Download contains configuration for how the model artifacts
