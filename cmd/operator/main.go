@@ -282,6 +282,9 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 		klog.Errorf("controller manager exited with error: %v", err)
 		logrus.Fatalf("controller manager exited with error: %v", err)
 	}
+
+	<-ctx.Done()
+	logrus.Info("koldun operator context cancelled, shutting down")
 }
 
 func runLLM(ctx context.Context, cfg llm.Config) {
