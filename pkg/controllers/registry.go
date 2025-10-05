@@ -167,7 +167,7 @@ func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev
 					Warn("remove token from registry")
 			}
 		}
-		return secret, nil
+		return nil, nil
 	}
 
 	entry, err := tokens.ExtractRegistryToken(secret)
@@ -175,16 +175,16 @@ func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev
 		r.log.WithError(err).
 			WithField("secret", modelKey(secret.Namespace, secret.Name)).
 			Warn("skip token secret")
-		return secret, nil
+		return nil, nil
 	}
 
 	if err := r.putToken(entry); err != nil {
 		r.log.WithError(err).
 			WithField("token", entry.Hash).
 			Error("publish token registry entry")
-		return secret, err
+		return nil, err
 	}
-	return secret, nil
+	return nil, nil
 }
 
 func (r *registrySync) onSecretRemove(key string, secret *corev1.Secret) (*corev1.Secret, error) {
@@ -193,15 +193,16 @@ func (r *registrySync) onSecretRemove(key string, secret *corev1.Secret) (*corev
 	}
 	hash := tokens.Hash(secret)
 	if hash == "" {
-		return secret, nil
+		return nil, nil
 	}
 	if err := r.deleteToken(hash); err != nil {
 		r.log.WithError(err).
 			WithField("token", hash).
 			WithField("secret", modelKey(secret.Namespace, secret.Name)).
 			Warn("remove token from registry")
+		return nil, err
 	}
-	return secret, nil
+	return nil, nil
 }
 
 func (r *registrySync) putModel(model *registry.Model) error {
