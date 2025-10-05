@@ -23,6 +23,8 @@ type Manager struct {
 
 	health *Health
 
+	ensureObjectStorageBuckets bool
+
 	Core  corev1.Interface
 	Apps  appsv1.Interface
 	Batch batchv1.Interface
@@ -76,14 +78,15 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		)
 
 	return &Manager{
-		factory:           factory,
-		controllerFactory: ctrlFactory,
-		apply:             applier,
-		health:            health,
-		Core:              core,
-		Apps:              apps,
-		Batch:             batch,
-		Kold:              kold,
+		factory:                    factory,
+		controllerFactory:          ctrlFactory,
+		apply:                      applier,
+		health:                     health,
+		Core:                       core,
+		Apps:                       apps,
+		Batch:                      batch,
+		Kold:                       kold,
+		ensureObjectStorageBuckets: true,
 	}, nil
 }
 
@@ -135,4 +138,14 @@ func (m *Manager) Apply(ctx context.Context) apply.Apply {
 // Health exposes the manager health tracker for readiness endpoints.
 func (m *Manager) Health() *Health {
 	return m.health
+}
+
+// SetEnsureObjectStorageBuckets toggles automatic S3 bucket provisioning for model reconcilers.
+func (m *Manager) SetEnsureObjectStorageBuckets(enabled bool) {
+	m.ensureObjectStorageBuckets = enabled
+}
+
+// EnsureObjectStorageBuckets reports whether model reconciliation should attempt to provision object storage buckets.
+func (m *Manager) EnsureObjectStorageBuckets() bool {
+	return m.ensureObjectStorageBuckets
 }
