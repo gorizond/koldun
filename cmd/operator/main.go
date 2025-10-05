@@ -72,15 +72,16 @@ func main() {
 		dispatcherAckWait           time.Duration
 
 		// Operator conversation/registry flags
-		operatorNATSURL      string
-		operatorKVBucket     string
-		operatorTTLPrefix    string
-		operatorPollInterval time.Duration
-		operatorModelsBucket string
-		operatorTokensBucket string
-		operatorModelPrefix  string
-		operatorTokenPrefix  string
-		operatorHealthListen string
+		operatorNATSURL             string
+		operatorKVBucket            string
+		operatorTTLPrefix           string
+		operatorPollInterval        time.Duration
+		operatorModelsBucket        string
+		operatorTokensBucket        string
+		operatorModelPrefix         string
+		operatorTokenPrefix         string
+		operatorHealthListen        string
+		operatorDisableBucketEnsure bool
 	)
 
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -141,6 +142,7 @@ func main() {
 	fs.StringVar(&operatorModelPrefix, "operator-model-prefix", "", "Key prefix for model entries in the registry bucket (default model/)")
 	fs.StringVar(&operatorTokenPrefix, "operator-token-prefix", "", "Key prefix for token entries in the registry bucket (default token/)")
 	fs.StringVar(&operatorHealthListen, "operator-health-listen", ":8080", "Operator health endpoint listen address")
+	fs.BoolVar(&operatorDisableBucketEnsure, "operator-disable-bucket-ensure", false, "Skip automatic verification and creation of Model objectStorage buckets")
 
 	klog.InitFlags(fs)
 
@@ -176,6 +178,7 @@ func main() {
 				TokenPrefix:  operatorTokenPrefix,
 			},
 			operatorHealthListen,
+			operatorDisableBucketEnsure,
 		)
 	case "llm":
 		runLLM(ctx, llm.Config{
@@ -233,7 +236,7 @@ func main() {
 	}
 }
 
-func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.ConversationConfig, registryCfg controllers.RegistryConfig, healthListen string) {
+func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.ConversationConfig, registryCfg controllers.RegistryConfig, healthListen string, disableBucketEnsure bool) {
 	cfg, err := kube.BuildConfig(kubeconfig)
 	if err != nil {
 		logrus.Fatalf("failed to build Kubernetes config: %v", err)
@@ -243,6 +246,7 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 	if err != nil {
 		logrus.Fatalf("failed to create controller manager: %v", err)
 	}
+	manager.SetEnsureObjectStorageBuckets(!disableBucketEnsure)
 
 	healthServer, err := operatorhealth.New(operatorhealth.Config{
 		ListenAddress: healthListen,

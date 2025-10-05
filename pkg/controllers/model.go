@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	corectlv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/generic"
@@ -29,6 +32,7 @@ const (
 	defaultConversionImage = "python:3.11-alpine"
 	defaultToolsImage      = "alpine:3.18"
 	defaultWeightsType     = "q40"
+	bucketEnsureTimeout    = 30 * time.Second
 
 	jobSuffixDownload = "-download"
 	jobSuffixConvert  = "-convert"
@@ -49,24 +53,28 @@ func normalizeForceToken(value string, requested bool, resourceVersion string) s
 }
 
 type modelHandler struct {
-	ctx    context.Context
-	apply  apply.Apply
-	models generic.ControllerInterface[*v1.Model, *v1.ModelList]
-	jobs   generic.ControllerInterface[*batchv1.Job, *batchv1.JobList]
-	pvcs   corectlv1.PersistentVolumeClaimController
-	pvs    corectlv1.PersistentVolumeController
-	pods   corectlv1.PodController
+	ctx           context.Context
+	apply         apply.Apply
+	models        generic.ControllerInterface[*v1.Model, *v1.ModelList]
+	jobs          generic.ControllerInterface[*batchv1.Job, *batchv1.JobList]
+	pvcs          corectlv1.PersistentVolumeClaimController
+	pvs           corectlv1.PersistentVolumeController
+	pods          corectlv1.PodController
+	secrets       corectlv1.SecretController
+	ensureBuckets bool
 }
 
 func registerModelController(ctx context.Context, m *Manager) error {
 	handler := &modelHandler{
-		ctx:    ctx,
-		apply:  m.Apply(ctx),
-		models: m.Kold.Model(),
-		jobs:   m.Batch.Job(),
-		pvcs:   m.Core.PersistentVolumeClaim(),
-		pvs:    m.Core.PersistentVolume(),
-		pods:   m.Core.Pod(),
+		ctx:           ctx,
+		apply:         m.Apply(ctx),
+		models:        m.Kold.Model(),
+		jobs:          m.Batch.Job(),
+		pvcs:          m.Core.PersistentVolumeClaim(),
+		pvs:           m.Core.PersistentVolume(),
+		pods:          m.Core.Pod(),
+		secrets:       m.Core.Secret(),
+		ensureBuckets: m.EnsureObjectStorageBuckets(),
 	}
 
 	handler.models.OnChange(ctx, "koldun-model-controller", handler.onChange)
@@ -90,6 +98,10 @@ func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
 		return obj, err
 	}
 	if err := h.ensureScriptConfigMap(obj); err != nil {
+		return obj, err
+	}
+	if err := h.ensureObjectStorageBuckets(obj); err != nil {
+		klog.Errorf("Model %s/%s: failed to ensure object storage buckets: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
 	if err := h.ensureDownloadJob(obj); err != nil {
@@ -290,6 +302,110 @@ func (h *modelHandler) ensureScriptConfigMap(obj *v1.Model) error {
 	}
 
 	klog.V(1).Infof("Model %s/%s: successfully created script ConfigMap %s", obj.Namespace, obj.Name, scriptName)
+	return nil
+}
+
+func (h *modelHandler) ensureObjectStorageBuckets(obj *v1.Model) error {
+	if !h.ensureBuckets {
+		return nil
+	}
+
+	storage := obj.Spec.ObjectStorage
+	if storage == nil {
+		return nil
+	}
+
+	endpoint := strings.TrimSpace(storage.Endpoint)
+	buckets := uniqueNonEmpty(storage.BucketForSource, storage.BucketForConvert)
+	if endpoint == "" || len(buckets) == 0 {
+		return nil
+	}
+
+	if storage.SecretRef == nil {
+		klog.V(2).Infof("Model %s/%s: objectStorage.secretRef not set, skipping bucket ensure", obj.Namespace, obj.Name)
+		return nil
+	}
+
+	secretNamespace := storage.SecretRef.Namespace
+	if strings.TrimSpace(secretNamespace) == "" {
+		secretNamespace = obj.Namespace
+	}
+
+	secret, err := h.secrets.Cache().Get(secretNamespace, storage.SecretRef.Name)
+	if err != nil {
+		return fmt.Errorf("fetch object storage secret %s/%s: %w", secretNamespace, storage.SecretRef.Name, err)
+	}
+
+	accessKey := valueFromSecret(secret, "AWS_ACCESS_KEY_ID", "aws_access_key_id")
+	secretKey := valueFromSecret(secret, "AWS_SECRET_ACCESS_KEY", "aws_secret_access_key")
+	sessionToken := valueFromSecret(secret, "AWS_SESSION_TOKEN", "aws_session_token")
+	region := valueFromSecret(secret, "AWS_REGION", "AWS_DEFAULT_REGION", "aws_region", "aws_default_region")
+
+	if accessKey == "" || secretKey == "" {
+		return fmt.Errorf("secret %s/%s missing AWS credentials", secretNamespace, storage.SecretRef.Name)
+	}
+
+	parsedEndpoint, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("parse object storage endpoint %q: %w", endpoint, err)
+	}
+	host := parsedEndpoint.Host
+	if host == "" {
+		host = parsedEndpoint.Path
+	}
+	if host == "" {
+		return fmt.Errorf("object storage endpoint %q missing host", endpoint)
+	}
+
+	secure := true
+	switch strings.ToLower(parsedEndpoint.Scheme) {
+	case "http":
+		secure = false
+	case "https", "":
+		secure = true
+	default:
+		secure = parsedEndpoint.Scheme != "http"
+	}
+
+	client, err := minio.New(host, &minio.Options{
+		Creds:        credentials.NewStaticV4(accessKey, secretKey, sessionToken),
+		Secure:       secure,
+		Region:       region,
+		BucketLookup: minio.BucketLookupPath,
+	})
+	if err != nil {
+		return fmt.Errorf("initialise object storage client: %w", err)
+	}
+
+	for _, bucket := range buckets {
+		ctx, cancel := context.WithTimeout(h.ctx, bucketEnsureTimeout)
+		exists, err := client.BucketExists(ctx, bucket)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("check bucket %s existence: %w", bucket, err)
+		}
+		if exists {
+			continue
+		}
+
+		opts := minio.MakeBucketOptions{}
+		if region != "" {
+			opts.Region = region
+		}
+		ctx, cancel = context.WithTimeout(h.ctx, bucketEnsureTimeout)
+		err = client.MakeBucket(ctx, bucket, opts)
+		cancel()
+		if err != nil {
+			resp := minio.ToErrorResponse(err)
+			if resp.Code == "BucketAlreadyOwnedByYou" || resp.Code == "BucketAlreadyExists" {
+				klog.V(2).Infof("Model %s/%s: bucket %s already present", obj.Namespace, obj.Name, bucket)
+				continue
+			}
+			return fmt.Errorf("create bucket %s: %w", bucket, err)
+		}
+		klog.Infof("Model %s/%s: created object storage bucket %s", obj.Namespace, obj.Name, bucket)
+	}
+
 	return nil
 }
 
@@ -1993,6 +2109,43 @@ func parseS3Path(value string) (bucket string, key string, ok bool) {
 		key = strings.TrimLeft(parts[1], "/")
 	}
 	return bucket, key, true
+}
+
+func uniqueNonEmpty(values ...string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func valueFromSecret(secret *corev1.Secret, keys ...string) string {
+	if secret == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if data, ok := secret.Data[key]; ok {
+			if v := strings.TrimSpace(string(data)); v != "" {
+				return v
+			}
+		}
+		lower := strings.ToLower(key)
+		if data, ok := secret.Data[lower]; ok {
+			if v := strings.TrimSpace(string(data)); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func hasCondition(conditions []metav1.Condition, condType string) bool {
