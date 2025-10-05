@@ -1397,6 +1397,8 @@ type ModelConversionSpec struct {
 	Args []string `json:"args,omitempty"`
 	// WeightsFloatType dictates the target precision (for example, "q40").
 	WeightsFloatType string `json:"weightsFloatType,omitempty"`
+	// ConvertWeights controls execution of HF weight conversion (handled by convert-hf.py).
+	ConvertWeights string `json:"convertWeights,omitempty"`
 	// OutputPath optionally overrides the cache destination for converted artifacts (may be s3:// URI).
 	OutputPath string `json:"outputPath,omitempty"`
 	// Memory specifies memory limit for the conversion job container.

@@ -281,6 +281,7 @@ spec:
     memory: 8Gi
     outputPath: s3://my-bucket-convert
     toolsImage: alpine:3.18
+    convertWeights: "q80"   # use "skip" to disable weight conversion
     weightsFloatType: f32 #q80
   download:
     chunkMaxMiB: 256
