@@ -1046,6 +1046,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		fmt.Sprintf("wget -q -O writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/writer.py", converterVersion),
 		fmt.Sprintf("wget -q -O convert-tokenizer-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-tokenizer-hf.py", converterVersion),
 		fmt.Sprintf("wget -q -O tokenizer-writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/tokenizer-writer.py", converterVersion),
+		fmt.Sprintf("wget -q -O requirements.txt https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/requirements.txt", converterVersion),
 	}, "\n")
 
 	fetchScripts := corev1.Container{
@@ -1529,7 +1530,12 @@ func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionS
 		// create pip.conf if proxy provided (PIP_PROXY comes from spec.pipProxy via envFrom later if needed)
 		"if [ -n \"${PIP_PROXY:-}\" ]; then mkdir -p ~/.pip; cat > ~/.pip/pip.conf <<CONF\n[global]\nproxy = ${PIP_PROXY}\nindex-url = https://pypi.org/simple/\n\n[install]\ndefault-timeout = 500\ntrusted-host = pypi.python.org\n               pypi.org\n               files.pythonhosted.org\nCONF\nfi",
 
-		"pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython",
+		"if [ -f /workspace/converter/requirements.txt ]; then \\",
+		"  pip install --no-cache-dir -r /workspace/converter/requirements.txt; \\",
+		"else \\",
+		"  echo 'requirements.txt not found; installing default dependency set' >&2; \\",
+		"  pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython; \\",
+		"fi",
 	}
 	cmdLines = append(cmdLines,
 		"python -u /workspace/converter/convert-hf.py /mnt/s3 ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}",
