@@ -16,7 +16,21 @@ spec:
     singular: model
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.downloadState
+      name: Download
+      type: string
+    - jsonPath: .status.conversionState
+      name: Conversion
+      type: string
+    - jsonPath: .status.outputPVCName
+      name: OutputPVC
+      priority: 1
+      type: string
+    name: v1
     schema:
       openAPIV3Schema:
         description: Model represents the lifecycle of downloading and caching a language

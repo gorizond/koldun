@@ -16,7 +16,17 @@ spec:
     singular: dllama
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.readyWorkers
+      name: ReadyWorkers
+      type: integer
+    - jsonPath: .spec.replicaPower
+      name: ReplicaPower
+      type: integer
+    name: v1
     schema:
       openAPIV3Schema:
         description: Dllama describes a distributed-llama topology managed by the

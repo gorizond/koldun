@@ -50,6 +50,9 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=dll
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="ReadyWorkers",type=integer,JSONPath=`.status.readyWorkers`
+// +kubebuilder:printcolumn:name="ReplicaPower",type=integer,JSONPath=`.spec.replicaPower`
 
 // Dllama describes a distributed-llama topology managed by the operator.
 type Dllama struct {
@@ -192,6 +195,10 @@ type DllamaList struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=mdl
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Download",type=string,JSONPath=`.status.downloadState`
+// +kubebuilder:printcolumn:name="Conversion",type=string,JSONPath=`.status.conversionState`
+// +kubebuilder:printcolumn:name="OutputPVC",type=string,priority=1,JSONPath=`.status.outputPVCName`
 
 // Model represents the lifecycle of downloading and caching a language model artifact.
 type Model struct {
@@ -1115,6 +1122,10 @@ func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=ing
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Host",type=string,JSONPath=`.spec.route.host`
+// +kubebuilder:printcolumn:name="Service",type=string,priority=1,JSONPath=`.spec.service.type`
+// +kubebuilder:printcolumn:name="ReplicaPower",type=integer,priority=1,JSONPath=`.spec.backend.replicaPower`
 
 // Ingress defines an HTTP entrypoint backed by a managed backend deployment.
 type Ingress struct {
