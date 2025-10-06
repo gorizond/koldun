@@ -288,6 +288,14 @@ type RootSpec struct {
 	WorkerSelector map[string]string `json:"workerSelector,omitempty"`
 	// NATS contains connection information inherited by the LLM sidecar.
 	NATS *RootNATSConfig `json:"nats,omitempty"`
+	// Memory allows overriding root memory planning parameters.
+	Memory *RootMemorySpec `json:"memory,omitempty"`
+}
+
+// RootMemorySpec customizes root memory calculations.
+type RootMemorySpec struct {
+	// OverheadMaxRatio overrides the maximum memory multiplier for the root.
+	OverheadMaxRatio *float64 `json:"overheadMaxRatio,omitempty"`
 }
 
 // RootStatus indicates readiness for the root component.
@@ -735,6 +743,23 @@ func (in *RootSpec) DeepCopy() *RootSpec {
 		natsCopy := *in.NATS.DeepCopy()
 		out.NATS = &natsCopy
 	}
+	if in.Memory != nil {
+		memCopy := *in.Memory.DeepCopy()
+		out.Memory = &memCopy
+	}
+	return out
+}
+
+func (in *RootMemorySpec) DeepCopy() *RootMemorySpec {
+	if in == nil {
+		return nil
+	}
+	out := new(RootMemorySpec)
+	*out = *in
+	if in.OverheadMaxRatio != nil {
+		value := *in.OverheadMaxRatio
+		out.OverheadMaxRatio = &value
+	}
 	return out
 }
 
@@ -1124,6 +1149,12 @@ type IngressBackendSpec struct {
 	SessionScaling  *IngressSessionScalingSpec  `json:"sessionScaling,omitempty"`
 	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
 	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
+	RootMemory      *IngressRootMemorySpec      `json:"rootMemory,omitempty"`
+}
+
+// IngressRootMemorySpec customises root memory calculation.
+type IngressRootMemorySpec struct {
+	OverheadMaxRatio *float64 `json:"overheadMaxRatio,omitempty"`
 }
 
 // IngressSessionScalingSpec controls auto-scaling behaviour for Session-managed Dllamas.
@@ -1409,6 +1440,8 @@ type ModelConversionSpec struct {
 	ToolsImage string `json:"toolsImage,omitempty"`
 	// ConverterVersion selects the distributed-llama converter release tag (default: v0.16.2).
 	ConverterVersion string `json:"converterVersion,omitempty"`
+	// Dependencies enumerates additional Python packages required for conversion, keyed by package name with optional version.
+	Dependencies map[string]string `json:"dependencies,omitempty"`
 }
 
 func (in *ModelConversionSpec) DeepCopy() *ModelConversionSpec {
@@ -1424,6 +1457,12 @@ func (in *ModelConversionSpec) DeepCopy() *ModelConversionSpec {
 	if in.Args != nil {
 		out.Args = make([]string, len(in.Args))
 		copy(out.Args, in.Args)
+	}
+	if in.Dependencies != nil {
+		out.Dependencies = make(map[string]string, len(in.Dependencies))
+		for k, v := range in.Dependencies {
+			out.Dependencies[k] = v
+		}
 	}
 	return out
 }

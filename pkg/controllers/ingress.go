@@ -357,6 +357,11 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 	if spec.Backend.ReplicaPower < 0 {
 		return fmt.Errorf("backend.replicaPower must be >= 0")
 	}
+	if rm := spec.Backend.RootMemory; rm != nil && rm.OverheadMaxRatio != nil {
+		if *rm.OverheadMaxRatio <= 0 {
+			return fmt.Errorf("backend.rootMemory.overheadMaxRatio must be > 0")
+		}
+	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {
 		if scaling.MinDllamas < 0 {
 			return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")

@@ -88,6 +88,11 @@ spec:
                   convertWeights:
                     description: ConvertWeights selects quantization preset for convert-hf.py (e.g. "q80"); use values like "skip" to disable conversion.
                     type: string
+                  dependencies:
+                    description: Dependencies lists additional Python packages (name; version) to install before conversion.
+                    type: object
+                    additionalProperties:
+                      type: string
                 type: object
               download:
                 description: Download contains configuration for how the model artifacts

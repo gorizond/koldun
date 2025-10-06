@@ -98,6 +98,13 @@ spec:
                 required:
                 - url
                 type: object
+              memory:
+                description: Memory allows overriding root memory planning parameters.
+                properties:
+                  overheadMaxRatio:
+                    description: OverheadMaxRatio overrides the maximum memory multiplier for the root.
+                    type: number
+                type: object
               workerSelector:
                 additionalProperties:
                   type: string

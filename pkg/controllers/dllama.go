@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/pointer"
 )
 
 type dllamaHandler struct {
@@ -218,7 +219,7 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 		}
 	}
 
-	return &v1.Root{
+	root := &v1.Root{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
 			Kind:       "Root",
@@ -236,6 +237,10 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 			NATS:           natsConfig,
 		},
 	}
+	if ratio := h.getIngressRootOverheadMaxRatio(dllama); ratio != nil {
+		root.Spec.Memory = &v1.RootMemorySpec{OverheadMaxRatio: pointer.Float64(*ratio)}
+	}
+	return root
 }
 
 func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1.Worker {
@@ -353,6 +358,30 @@ func (h *dllamaHandler) getIngressNatsURL(dllama *v1.Dllama) string {
 	}
 
 	return ""
+}
+
+func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float64 {
+	lookup := func(ings []*v1.Ingress) *float64 {
+		for _, ing := range ings {
+			if ing.Spec.Backend.RootMemory != nil && ing.Spec.Backend.RootMemory.OverheadMaxRatio != nil {
+				val := *ing.Spec.Backend.RootMemory.OverheadMaxRatio
+				return &val
+			}
+		}
+		return nil
+	}
+
+	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
+		if v := lookup(ingresses); v != nil {
+			return v
+		}
+	}
+	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
+		if v := lookup(allIngresses); v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {

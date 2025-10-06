@@ -204,7 +204,11 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		workerReplicas = 1
 	}
 
-	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas)
+	var override *float64
+	if root.Spec.Memory != nil && root.Spec.Memory.OverheadMaxRatio != nil {
+		override = root.Spec.Memory.OverheadMaxRatio
+	}
+	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas, override)
 
 	quantType := ""
 	if model.Spec.Conversion != nil {

@@ -161,7 +161,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 
 	workerResources := corev1.ResourceRequirements{}
 	if model != nil {
-		if rootMemory, workerMemory, ok := calculateMemoryRequests(model.Status.ConversionSizeBytes, replicas); ok {
+		if rootMemory, workerMemory, ok := calculateMemoryRequests(model.Status.ConversionSizeBytes, replicas, nil); ok {
 			workerResources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceMemory: workerMemory},
 				Limits:   corev1.ResourceList{corev1.ResourceMemory: workerMemory},
