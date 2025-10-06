@@ -13,7 +13,14 @@ const (
 	rootOverheadMinRatio      = 1.20
 )
 
-func rootMemoryOverheadRatio(workerReplicas int32) float64 {
+func rootMemoryOverheadRatio(workerReplicas int32, override *float64) float64 {
+	if override != nil && *override > 0 {
+		val := *override
+		if val < rootOverheadMinRatio {
+			return rootOverheadMinRatio
+		}
+		return val
+	}
 	if workerReplicas <= 1 {
 		return rootOverheadMaxRatio
 	}
@@ -28,7 +35,7 @@ func rootMemoryOverheadRatio(workerReplicas int32) float64 {
 	return ratio
 }
 
-func calculateMemoryRequests(conversionSizeBytes int64, workerReplicas int32) (root resource.Quantity, worker resource.Quantity, ok bool) {
+func calculateMemoryRequests(conversionSizeBytes int64, workerReplicas int32, override *float64) (root resource.Quantity, worker resource.Quantity, ok bool) {
 	if conversionSizeBytes <= 0 {
 		return resource.Quantity{}, resource.Quantity{}, false
 	}
@@ -45,7 +52,7 @@ func calculateMemoryRequests(conversionSizeBytes int64, workerReplicas int32) (r
 		workerMi = 1
 	}
 
-	rootMi := int64(math.Ceil(perNodeMi * rootMemoryOverheadRatio(workerReplicas)))
+	rootMi := int64(math.Ceil(perNodeMi * rootMemoryOverheadRatio(workerReplicas, override)))
 	if rootMi < workerMi {
 		rootMi = workerMi
 	}

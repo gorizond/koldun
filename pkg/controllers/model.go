@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1046,7 +1047,6 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		fmt.Sprintf("wget -q -O writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/writer.py", converterVersion),
 		fmt.Sprintf("wget -q -O convert-tokenizer-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-tokenizer-hf.py", converterVersion),
 		fmt.Sprintf("wget -q -O tokenizer-writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/tokenizer-writer.py", converterVersion),
-		fmt.Sprintf("wget -q -O requirements.txt https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/requirements.txt", converterVersion),
 	}, "\n")
 
 	fetchScripts := corev1.Container{
@@ -1529,13 +1529,14 @@ func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionS
 		"set -euo pipefail",
 		// create pip.conf if proxy provided (PIP_PROXY comes from spec.pipProxy via envFrom later if needed)
 		"if [ -n \"${PIP_PROXY:-}\" ]; then mkdir -p ~/.pip; cat > ~/.pip/pip.conf <<CONF\n[global]\nproxy = ${PIP_PROXY}\nindex-url = https://pypi.org/simple/\n\n[install]\ndefault-timeout = 500\ntrusted-host = pypi.python.org\n               pypi.org\n               files.pythonhosted.org\nCONF\nfi",
+	}
 
-		"if [ -f /workspace/converter/requirements.txt ]; then \\",
-		"  pip install --no-cache-dir -r /workspace/converter/requirements.txt; \\",
-		"else \\",
-		"  echo 'requirements.txt not found; installing default dependency set' >&2; \\",
-		"  pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython; \\",
-		"fi",
+	if len(spec.Dependencies) > 0 {
+		if depScript := buildDependencyInstallScript(spec.Dependencies); depScript != "" {
+			cmdLines = append(cmdLines, depScript)
+		}
+	} else {
+		cmdLines = append(cmdLines, "pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython")
 	}
 	cmdLines = append(cmdLines,
 		"python -u /workspace/converter/convert-hf.py /mnt/s3 ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}",
@@ -1543,6 +1544,40 @@ func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionS
 	)
 
 	return []string{strings.Join(cmdLines, "\n")}
+}
+
+func buildDependencyInstallScript(deps map[string]string) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	packages := make([]string, 0, len(deps))
+	for name, version := range deps {
+		cleanName := strings.TrimSpace(name)
+		if cleanName == "" {
+			continue
+		}
+		cleanVersion := strings.TrimSpace(version)
+		if cleanVersion != "" {
+			packages = append(packages, fmt.Sprintf("%s==%s", cleanName, cleanVersion))
+		} else {
+			packages = append(packages, cleanName)
+		}
+	}
+	if len(packages) == 0 {
+		return ""
+	}
+	sort.Strings(packages)
+	var b strings.Builder
+	b.WriteString("for dep in")
+	for _, pkg := range packages {
+		b.WriteString(" '")
+		b.WriteString(pkg)
+		b.WriteString("'")
+	}
+	b.WriteString("; do \\")
+	b.WriteString("\n  pip install --no-cache-dir \"$dep\"; \\")
+	b.WriteString("\n done")
+	return b.String()
 }
 
 func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {

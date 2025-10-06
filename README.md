@@ -277,18 +277,23 @@ metadata:
 spec:
   conversion:
     converterVersion: v0.16.2
-    image: python:3.11
+    image: python:3.10
     memory: 8Gi
     outputPath: s3://my-bucket-convert
     toolsImage: alpine:3.18
     convertWeights: q40   # use "skip" to disable weight conversion
+    dependencies:
+      torch: 2.0.1
+      safetensors: 0.4.2
+      sentencepiece: 0.1.99
+      numpy: 1.23.5
     weightsFloatType: q80
   download:
     chunkMaxMiB: 256
     concurrency: 6
     huggingFaceTokenSecretRef:
       name: my-hf
-    image: python:3.11
+    image: python:3.10
     memory: 2Gi
   localPath: s3://my-bucket-model/mistralai/Mistral-7B-v0.3
   objectStorage:
