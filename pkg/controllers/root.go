@@ -206,7 +206,14 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 
 	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas)
 
-	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, weightsFloatType)
+	quantType := ""
+	if model.Spec.Conversion != nil {
+		quantType = strings.TrimSpace(model.Spec.Conversion.ConvertWeights)
+	}
+	if quantType == "" {
+		quantType = weightsFloatType
+	}
+	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, quantType)
 	tokenizerFile := fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
 
 	if strings.TrimSpace(root.Spec.ModelRef) == "" {
