@@ -1724,15 +1724,23 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 				if strings.EqualFold(sizeState, "Succeeded") {
 					measurement, err := h.collectSizeMeasurement(obj.Namespace, job.Name)
 					if err != nil {
-						sizeCond.Status = metav1.ConditionFalse
-						sizeCond.Reason = "ResultCollectionFailed"
-						sizeCond.Message = fmt.Sprintf("Failed to read sizing result: %v", err)
-						sizeState = "Failed"
+						if reuseExistingSizeMeasurement(obj, updated, &sizeCond) {
+							sizeState = "Succeeded"
+						} else {
+							sizeCond.Status = metav1.ConditionFalse
+							sizeCond.Reason = "ResultCollectionFailed"
+							sizeCond.Message = fmt.Sprintf("Failed to read sizing result: %v", err)
+							sizeState = "Failed"
+						}
 					} else if measurement == nil {
-						sizeCond.Status = metav1.ConditionFalse
-						sizeCond.Reason = "ResultPending"
-						sizeCond.Message = "Sizing job completed; waiting for termination message"
-						sizeState = "Pending"
+						if reuseExistingSizeMeasurement(obj, updated, &sizeCond) {
+							sizeState = "Succeeded"
+						} else {
+							sizeCond.Status = metav1.ConditionFalse
+							sizeCond.Reason = "ResultPending"
+							sizeCond.Message = "Sizing job completed; waiting for termination message"
+							sizeState = "Pending"
+						}
 					} else {
 						sizeCond.Status = metav1.ConditionTrue
 						sizeCond.Reason = "SizingSucceeded"
@@ -2058,6 +2066,34 @@ func (h *modelHandler) collectSizeMeasurement(namespace, jobName string) (*sizeM
 		}
 	}
 	return nil, nil
+}
+
+func reuseExistingSizeMeasurement(obj *v1.Model, updated *v1.Model, cond *metav1.Condition) bool {
+	if obj == nil || updated == nil || cond == nil {
+		return false
+	}
+	if obj.Status.ConversionSizeGeneration != obj.Generation {
+		return false
+	}
+
+	human := strings.TrimSpace(obj.Status.ConversionSizeHuman)
+	if human == "" && obj.Status.ConversionSizeBytes == 0 {
+		return false
+	}
+	if human == "" {
+		human = fmt.Sprintf("%d bytes", obj.Status.ConversionSizeBytes)
+	}
+
+	cond.Status = metav1.ConditionTrue
+	cond.Reason = "SizingSucceeded"
+	cond.Message = fmt.Sprintf("Converted artifacts size: %s", human)
+
+	updated.Status.ConversionSizeBytes = obj.Status.ConversionSizeBytes
+	updated.Status.ConversionSizeHuman = obj.Status.ConversionSizeHuman
+	updated.Status.ConversionSizeGeneration = obj.Status.ConversionSizeGeneration
+	updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
+
+	return true
 }
 
 func parseSizeMeasurement(payload string) (*sizeMeasurement, error) {
