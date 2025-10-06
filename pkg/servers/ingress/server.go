@@ -80,6 +80,10 @@ const (
 	tokenCacheTTL             = 5 * time.Minute
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
+
+	corsAllowHeaders  = "Authorization, Content-Type, X-Requested-With, X-Api-Key, X-API-Key, X-Auth-Token, KOLDUN_API_TOKEN, OLLMANA_API_KEY"
+	corsAllowMethods  = "GET, POST, OPTIONS"
+	corsExposeHeaders = "Content-Type"
 )
 
 // Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
@@ -393,6 +397,12 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.applyCORSHeaders(w, r)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
 		start := time.Now()
 		s.log.WithFields(logrus.Fields{
 			"method": r.Method,
@@ -474,6 +484,12 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, OPTIONS")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	models, err := s.listModels()
 	if err != nil {
 		s.log.WithError(err).Error("list models from registry")
@@ -511,7 +527,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
+		w.Header().Set("Allow", "POST, OPTIONS")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -1444,12 +1460,62 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, openai.ErrorResponse{Error: openai.ErrorBody{Message: message}})
 }
 
+func (s *Server) applyCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		origin = "*"
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	if origin != "*" {
+		addVaryHeader(w.Header(), "Origin")
+	}
+	w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
+	w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+	w.Header().Set("Access-Control-Expose-Headers", corsExposeHeaders)
+	w.Header().Set("Access-Control-Max-Age", "3600")
+}
+
+func addVaryHeader(header http.Header, value string) {
+	current := header.Get("Vary")
+	if current == "" {
+		header.Set("Vary", value)
+		return
+	}
+	for _, part := range strings.Split(current, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), value) {
+			return
+		}
+	}
+	header.Set("Vary", current+", "+value)
+}
+
 func extractAPIToken(r *http.Request) string {
-	for _, header := range []string{"KOLDUN_API_TOKEN", "OLLMANA_API_KEY"} {
+	for _, header := range []string{"KOLDUN_API_TOKEN", "OLLMANA_API_KEY", "X-API-KEY", "X-Api-Key", "X-Auth-Token"} {
 		if token := strings.TrimSpace(r.Header.Get(header)); token != "" {
 			return token
 		}
 	}
+
+	if auth := strings.TrimSpace(r.Header.Get("Authorization")); auth != "" {
+		lower := strings.ToLower(auth)
+		switch {
+		case strings.HasPrefix(lower, "bearer "):
+			return strings.TrimSpace(auth[7:])
+		case strings.HasPrefix(lower, "token "):
+			return strings.TrimSpace(auth[6:])
+		default:
+			if !strings.Contains(auth, " ") {
+				return auth
+			}
+		}
+	}
+
+	for _, key := range []string{"api_key", "api-key"} {
+		if token := strings.TrimSpace(r.URL.Query().Get(key)); token != "" {
+			return token
+		}
+	}
+
 	return ""
 }
 

@@ -6,7 +6,7 @@ import requests
 
 # URL = "http://koldun.localtest.me/v1/chat/completions"
 URL = "http://anonymous-koldun.localtest.me/v1/chat/completions"
-MODEL = "default/hf-convert-script"
+MODEL = "default/qwen3"
 HEADERS = {
     # "KOLDUN_API_TOKEN": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "Content-Type": "application/json",
