@@ -40,6 +40,12 @@ const (
 	sidecarChatCompletionsPath = "/v1/chat/completions"
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
+
+	maxNonStreamResponseSize = 4 << 20 // 4 MiB cap for single-response payloads
+
+	consumerCleanupInterval = 5 * time.Minute
+	inactiveConsumerGrace   = 10 * time.Minute
+	consumerListTimeout     = 5 * time.Second
 )
 
 var (
@@ -257,16 +263,7 @@ func (s *Server) Run(ctx context.Context) error {
 		ackWait += 30 * time.Second
 	}
 
-	sub, err := s.js.QueueSubscribe(
-		s.inSubject,
-		queueName,
-		s.handleMessage,
-		nats.ManualAck(),
-		nats.Durable(queueName),
-		nats.BindStream(s.streamName),
-		nats.AckWait(ackWait),
-		nats.MaxAckPending(32),
-	)
+	sub, err := s.ensureQueueSubscription(queueName, ackWait)
 	if err != nil {
 		return fmt.Errorf("subscribe %s: %w", s.inSubject, err)
 	}
@@ -278,6 +275,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}).Info("subscribed to request stream")
 
 	s.startHeartbeatLoop(runCtx)
+	s.startConsumerCleanup(runCtx)
 	go s.monitorSidecar(runCtx)
 
 	errCh := make(chan error, 1)
@@ -562,7 +560,14 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	reqCtx := context.Background()
+	if s.cfg.SidecarTimeout > 0 {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(context.Background(), s.cfg.SidecarTimeout)
+		defer cancel()
+	}
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		s.log.WithError(err).Error("build sidecar request")
 		return err
@@ -583,8 +588,27 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 		return err
 	}
 
-	if _, err := io.Copy(io.Discard, res.Body); err != nil {
-		s.log.WithError(err).Warn("drain sidecar response")
+	limit := int64(maxNonStreamResponseSize)
+	data, err := io.ReadAll(io.LimitReader(res.Body, limit+1))
+	if err != nil {
+		s.publishError(target, fmt.Sprintf("read sidecar response: %v", err))
+		return err
+	}
+	if int64(len(data)) > limit {
+		err := fmt.Errorf("sidecar response exceeded %d bytes", limit)
+		s.publishError(target, err.Error())
+		return err
+	}
+
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		err := errors.New("sidecar returned empty body")
+		s.publishError(target, err.Error())
+		return err
+	}
+
+	if err := s.nc.Publish(target, trimmed); err != nil {
+		return fmt.Errorf("publish response: %w", err)
 	}
 
 	return nil
@@ -612,6 +636,35 @@ func (s *Server) publishState(state, assignmentID string, active int32, errMsg s
 	}
 }
 
+func (s *Server) startConsumerCleanup(ctx context.Context) {
+	if s.js == nil || strings.TrimSpace(s.streamName) == "" {
+		return
+	}
+
+	cleanupInactiveConsumers(s.js, s.streamName, s.log)
+
+	if consumerCleanupInterval <= 0 {
+		return
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+
+		ticker := time.NewTicker(consumerCleanupInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanupInactiveConsumers(s.js, s.streamName, s.log)
+			}
+		}
+	}()
+}
+
 func (s *Server) startHeartbeatLoop(ctx context.Context) {
 	// Emit an immediate idle heartbeat so the dispatcher can register this worker.
 	s.publishState("idle", "", 0, "")
@@ -632,6 +685,63 @@ func (s *Server) startHeartbeatLoop(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (s *Server) ensureQueueSubscription(queueName string, ackWait time.Duration) (*nats.Subscription, error) {
+	info, err := s.js.ConsumerInfo(s.streamName, queueName)
+	switch {
+	case err == nil:
+		cfg := info.Config
+		if strings.TrimSpace(cfg.FilterSubject) != s.inSubject {
+			return nil, fmt.Errorf("existing consumer %s has unexpected filter %s", queueName, cfg.FilterSubject)
+		}
+
+		updated := false
+		if ackWait > 0 && cfg.AckWait != ackWait {
+			cfg.AckWait = ackWait
+			updated = true
+		}
+		if cfg.MaxAckPending != 32 {
+			cfg.MaxAckPending = 32
+			updated = true
+		}
+		if inactiveConsumerGrace > 0 && cfg.InactiveThreshold != inactiveConsumerGrace {
+			cfg.InactiveThreshold = inactiveConsumerGrace
+			updated = true
+		}
+		if updated {
+			if _, updateErr := s.js.UpdateConsumer(s.streamName, &cfg); updateErr != nil {
+				s.log.WithError(updateErr).WithFields(logrus.Fields{
+					"consumer": queueName,
+					"stream":   s.streamName,
+				}).Warn("update consumer configuration")
+			}
+		}
+
+		return s.js.QueueSubscribe(
+			s.inSubject,
+			queueName,
+			s.handleMessage,
+			nats.ManualAck(),
+			nats.Bind(s.streamName, queueName),
+		)
+	case errors.Is(err, nats.ErrConsumerNotFound):
+		opts := []nats.SubOpt{
+			nats.ManualAck(),
+			nats.Durable(queueName),
+			nats.BindStream(s.streamName),
+			nats.AckWait(ackWait),
+			nats.MaxAckPending(32),
+		}
+		if inactiveConsumerGrace > 0 {
+			opts = append(opts, nats.InactiveThreshold(inactiveConsumerGrace))
+		}
+		return s.js.QueueSubscribe(s.inSubject, queueName, s.handleMessage, opts...)
+	case err != nil:
+		return nil, fmt.Errorf("lookup consumer %s: %w", queueName, err)
+	default:
+		return nil, fmt.Errorf("unknown consumer lookup state for %s", queueName)
+	}
 }
 
 func (s *Server) shutdownError() error {
@@ -759,6 +869,78 @@ func (s *Server) publishError(target, msg string) {
 	body, _ := json.Marshal(errPayload)
 	_ = s.nc.Publish(target, body)
 	_ = s.nc.Publish(target, []byte("[DONE]"))
+}
+
+func cleanupInactiveConsumers(js nats.JetStreamContext, stream string, logger *logrus.Entry) {
+	if js == nil {
+		return
+	}
+	stream = strings.TrimSpace(stream)
+	if stream == "" {
+		return
+	}
+
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+		opts   []nats.JSOpt
+	)
+	if consumerListTimeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), consumerListTimeout)
+		opts = append(opts, nats.Context(ctx))
+		defer cancel()
+	}
+
+	now := time.Now()
+	for info := range js.Consumers(stream, opts...) {
+		if info == nil {
+			continue
+		}
+		durable := strings.TrimSpace(info.Config.Durable)
+		if durable == "" || !strings.HasPrefix(durable, "llm-") {
+			continue
+		}
+		if info.PushBound {
+			continue
+		}
+		if info.NumPending == 0 && info.NumAckPending == 0 {
+			continue
+		}
+		last := consumerLastActivity(info)
+		if now.Sub(last) < inactiveConsumerGrace {
+			continue
+		}
+		if err := js.DeleteConsumer(stream, info.Name); err != nil {
+			if logger != nil {
+				logger.WithError(err).WithFields(logrus.Fields{
+					"consumer": info.Name,
+					"stream":   stream,
+				}).Warn("jetstream cleanup: delete inactive consumer")
+			}
+			continue
+		}
+		if logger != nil {
+			logger.WithFields(logrus.Fields{
+				"consumer":    info.Name,
+				"stream":      stream,
+				"pending":     info.NumPending,
+				"ack_pending": info.NumAckPending,
+			}).Info("jetstream cleanup: pruned inactive consumer")
+		}
+	}
+}
+
+func consumerLastActivity(info *nats.ConsumerInfo) time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	if info.Delivered.Last != nil && !info.Delivered.Last.IsZero() {
+		return *info.Delivered.Last
+	}
+	if info.AckFloor.Last != nil && !info.AckFloor.Last.IsZero() {
+		return *info.AckFloor.Last
+	}
+	return info.Created
 }
 
 func ensureRequestStream(js nats.JetStreamContext, prefix string) (string, error) {

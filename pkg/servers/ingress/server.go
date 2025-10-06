@@ -142,8 +142,10 @@ type Server struct {
 	}
 
 	sessionLoad struct {
-		mu     sync.Mutex
-		values map[string]int32
+		mu           sync.Mutex
+		values       map[string]int32
+		lastActivity map[string]time.Time
+		idleTimers   map[string]*time.Timer
 	}
 
 	stateCache struct {
@@ -936,7 +938,20 @@ func (s *Server) incrementSessionLoad(hash string) int32 {
 	if s.sessionLoad.values == nil {
 		s.sessionLoad.values = make(map[string]int32)
 	}
+	if s.sessionLoad.lastActivity == nil {
+		s.sessionLoad.lastActivity = make(map[string]time.Time)
+	}
+	if s.sessionLoad.idleTimers == nil {
+		s.sessionLoad.idleTimers = make(map[string]*time.Timer)
+	}
+	if timer := s.sessionLoad.idleTimers[hash]; timer != nil {
+		if timer.Stop() {
+			delete(s.sessionLoad.idleTimers, hash)
+		}
+	}
+
 	s.sessionLoad.values[hash]++
+	s.sessionLoad.lastActivity[hash] = time.Now()
 	return s.sessionLoad.values[hash]
 }
 
@@ -946,16 +961,33 @@ func (s *Server) decrementSessionLoad(hash string) int32 {
 	if s.sessionLoad.values == nil {
 		return 0
 	}
-	if current, ok := s.sessionLoad.values[hash]; ok {
-		current--
-		if current <= 0 {
-			delete(s.sessionLoad.values, hash)
-			return 0
-		}
-		s.sessionLoad.values[hash] = current
-		return current
+	current, ok := s.sessionLoad.values[hash]
+	if !ok {
+		return 0
 	}
-	return 0
+
+	current--
+	now := time.Now()
+	if current <= 0 {
+		delete(s.sessionLoad.values, hash)
+		if s.sessionLoad.lastActivity == nil {
+			s.sessionLoad.lastActivity = make(map[string]time.Time)
+		}
+		s.sessionLoad.lastActivity[hash] = now
+		if s.cfg.SessionScaleDownIdleSeconds > 0 {
+			s.scheduleSessionCleanupLocked(hash, now)
+		} else {
+			delete(s.sessionLoad.lastActivity, hash)
+		}
+		return 0
+	}
+
+	s.sessionLoad.values[hash] = current
+	if s.sessionLoad.lastActivity == nil {
+		s.sessionLoad.lastActivity = make(map[string]time.Time)
+	}
+	s.sessionLoad.lastActivity[hash] = now
+	return current
 }
 
 func (s *Server) sessionLoadValue(hash string) int32 {
@@ -965,6 +997,68 @@ func (s *Server) sessionLoadValue(hash string) int32 {
 		return 0
 	}
 	return s.sessionLoad.values[hash]
+}
+
+func (s *Server) scheduleSessionCleanupLocked(hash string, last time.Time) {
+	idleAfter := time.Duration(s.cfg.SessionScaleDownIdleSeconds) * time.Second
+	if idleAfter <= 0 {
+		return
+	}
+	if s.sessionLoad.idleTimers == nil {
+		s.sessionLoad.idleTimers = make(map[string]*time.Timer)
+	}
+	if timer := s.sessionLoad.idleTimers[hash]; timer != nil {
+		timer.Stop()
+	}
+
+	deadline := last.Add(idleAfter)
+	timer := time.AfterFunc(idleAfter, func() {
+		s.finalizeSessionCleanup(hash, deadline)
+	})
+	s.sessionLoad.idleTimers[hash] = timer
+}
+
+func (s *Server) finalizeSessionCleanup(hash string, deadline time.Time) {
+	idleAfter := time.Duration(s.cfg.SessionScaleDownIdleSeconds) * time.Second
+	if idleAfter <= 0 {
+		return
+	}
+
+	s.sessionLoad.mu.Lock()
+	var load int32
+	if s.sessionLoad.values != nil {
+		load = s.sessionLoad.values[hash]
+	}
+	var last time.Time
+	if s.sessionLoad.lastActivity != nil {
+		last = s.sessionLoad.lastActivity[hash]
+	}
+	delete(s.sessionLoad.idleTimers, hash)
+	if load > 0 || (!last.IsZero() && last.After(deadline)) {
+		s.sessionLoad.mu.Unlock()
+		return
+	}
+	delete(s.sessionLoad.lastActivity, hash)
+	s.sessionLoad.mu.Unlock()
+
+	if err := s.deleteConversationRecord(hash); err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			s.log.WithField("hash", hash).Debug("conversation record already deleted during idle cleanup")
+			return
+		}
+		s.log.WithError(err).WithField("hash", hash).Warn("delete idle conversation record")
+		return
+	}
+
+	s.log.WithField("hash", hash).Info("removed idle conversation record")
+}
+
+func (s *Server) deleteConversationRecord(hash string) error {
+	if s.convKV == nil {
+		return nil
+	}
+	key := s.cfg.TTLPrefix + hash
+	return s.convKV.Delete(key)
 }
 
 func (s *Server) loadTokenCache(ctx context.Context) map[string]tokenEntry {
@@ -1212,7 +1306,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 		writeChunk(string(payload))
 	}
 
-	roleSent := false
+	state := streamingNormaliserState{}
 
 	for {
 		select {
@@ -1231,7 +1325,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 				return
 			}
 
-			normalised, err := normaliseStreamingChunk(line, &roleSent)
+			normalised, err := normaliseStreamingChunk(line, &state)
 			if err != nil {
 				s.log.WithError(err).Debug("normalise chunk")
 				writeChunk(line)
@@ -1451,6 +1545,16 @@ func eventTimestamp(ts int64) time.Time {
 	return t
 }
 
+type streamingNormaliserState struct {
+	roleSent bool
+	think    thinkRedactor
+}
+
+type thinkRedactor struct {
+	buffer  string
+	inThink bool
+}
+
 type streamingChunk struct {
 	ID      string                 `json:"id,omitempty"`
 	Object  string                 `json:"object,omitempty"`
@@ -1460,7 +1564,7 @@ type streamingChunk struct {
 }
 
 type streamingChunkChoice struct {
-	Index        int                 `json:"index,omitempty"`
+	Index        int                 `json:"index"`
 	FinishReason *string             `json:"finish_reason"`
 	Delta        streamingChunkDelta `json:"delta"`
 }
@@ -1470,7 +1574,85 @@ type streamingChunkDelta struct {
 	Content string `json:"content,omitempty"`
 }
 
-func normaliseStreamingChunk(raw string, roleSent *bool) (string, error) {
+func (s *streamingNormaliserState) scrubContent(content string) string {
+	if s == nil || content == "" {
+		return content
+	}
+	return s.think.filter(content)
+}
+
+func (r *thinkRedactor) filter(content string) string {
+	if content == "" {
+		return ""
+	}
+
+	r.buffer += content
+	var out strings.Builder
+
+	for {
+		lower := strings.ToLower(r.buffer)
+
+		if r.inThink {
+			closeIdx := strings.Index(lower, "</think>")
+			if closeIdx == -1 {
+				if len(r.buffer) > len("</think>")-1 {
+					r.buffer = r.buffer[len(r.buffer)-(len("</think>")-1):]
+				}
+				return out.String()
+			}
+			r.buffer = r.buffer[closeIdx+len("</think>"):]
+			r.inThink = false
+			continue
+		}
+
+		openIdx := strings.Index(lower, "<think>")
+		closeIdx := strings.Index(lower, "</think>")
+		if closeIdx != -1 && (openIdx == -1 || closeIdx < openIdx) {
+			// Drop stray closing tag when we aren't tracking a think block.
+			r.buffer = r.buffer[closeIdx+len("</think>"):]
+			continue
+		}
+
+		if openIdx == -1 {
+			emitLen := len(r.buffer) - longestThinkSuffix(lower)
+			if emitLen <= 0 {
+				return out.String()
+			}
+			out.WriteString(r.buffer[:emitLen])
+			r.buffer = r.buffer[emitLen:]
+			return out.String()
+		}
+
+		if openIdx > 0 {
+			out.WriteString(r.buffer[:openIdx])
+		}
+		r.buffer = r.buffer[openIdx+len("<think>"):]
+		r.inThink = true
+	}
+}
+
+func longestThinkSuffix(lower string) int {
+	patterns := []string{"<think>", "</think>"}
+	max := 0
+	length := len(lower)
+	for _, pattern := range patterns {
+		limit := len(pattern) - 1
+		if limit <= 0 {
+			continue
+		}
+		if limit > length {
+			limit = length
+		}
+		for i := 1; i <= limit; i++ {
+			if strings.HasSuffix(lower, pattern[:i]) && i > max {
+				max = i
+			}
+		}
+	}
+	return max
+}
+
+func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (string, error) {
 	var chunk streamingChunk
 	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
 		return raw, nil
@@ -1479,24 +1661,31 @@ func normaliseStreamingChunk(raw string, roleSent *bool) (string, error) {
 
 	for i := range chunk.Choices {
 		choice := &chunk.Choices[i]
+		choice.Index = i
 		if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) == "" {
 			choice.FinishReason = nil
 		}
 
 		role := strings.TrimSpace(choice.Delta.Role)
 		if role != "" {
-			if roleSent != nil && *roleSent {
+			if state != nil && state.roleSent {
 				choice.Delta.Role = ""
-			} else if roleSent != nil {
-				*roleSent = true
+			} else if state != nil {
+				state.roleSent = true
 			}
 		}
 		if strings.TrimSpace(choice.Delta.Role) == "" {
 			choice.Delta.Role = ""
 		}
 
-		if strings.TrimSpace(choice.Delta.Content) == "" {
+		content := choice.Delta.Content
+		if state != nil {
+			content = state.scrubContent(content)
+		}
+		if strings.TrimSpace(content) == "" {
 			choice.Delta.Content = ""
+		} else {
+			choice.Delta.Content = content
 		}
 
 		if choice.Delta.Role == "" && choice.Delta.Content == "" {
