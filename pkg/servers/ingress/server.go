@@ -1188,38 +1188,59 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	writeChunk := func(payload string) {
+		payload = strings.TrimSpace(payload)
+		if payload == "" {
+			_, _ = fmt.Fprint(w, "data: \n\n")
+		} else {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		}
+		flusher.Flush()
+	}
 
-	writeSSE(w, "info", "initialising session")
-	flusher.Flush()
-	warmup := true
+	errorChunk := func(message string) {
+		message = strings.TrimSpace(message)
+		if message == "" {
+			message = "stream cancelled"
+		}
+		payload, err := json.Marshal(openai.ErrorResponse{Error: openai.ErrorBody{Message: message}})
+		if err != nil {
+			escaped := strings.ReplaceAll(message, "\"", "\\\"")
+			writeChunk(fmt.Sprintf(`{"error":{"message":"%s"}}`, escaped))
+			return
+		}
+		writeChunk(string(payload))
+	}
+
+	roleSent := false
 
 	for {
 		select {
-		case <-ticker.C:
-			if warmup {
-				writeSSE(w, "info", "warming up")
-				flusher.Flush()
-			}
 		case msg := <-msgs:
 			if msg == nil {
-				writeSSE(w, "error", "subscription closed")
-				flusher.Flush()
+				errorChunk("subscription closed")
+				writeChunk("[DONE]")
 				return
 			}
 			line := strings.TrimSpace(string(msg.Data))
+			if line == "" {
+				continue
+			}
 			if strings.EqualFold(line, "[DONE]") {
-				writeSSE(w, "done", "")
-				flusher.Flush()
+				writeChunk("[DONE]")
 				return
 			}
-			warmup = false
-			writeSSE(w, "message", line)
-			flusher.Flush()
+
+			normalised, err := normaliseStreamingChunk(line, &roleSent)
+			if err != nil {
+				s.log.WithError(err).Debug("normalise chunk")
+				writeChunk(line)
+				continue
+			}
+			writeChunk(normalised)
 		case <-ctx.Done():
-			writeSSE(w, "error", ctx.Err().Error())
-			flusher.Flush()
+			errorChunk(ctx.Err().Error())
+			writeChunk("[DONE]")
 			return
 		}
 	}
@@ -1430,11 +1451,64 @@ func eventTimestamp(ts int64) time.Time {
 	return t
 }
 
-func writeSSE(w http.ResponseWriter, event, data string) {
-	if event != "" {
-		_, _ = fmt.Fprintf(w, "event: %s\n", event)
+type streamingChunk struct {
+	ID      string                 `json:"id,omitempty"`
+	Object  string                 `json:"object,omitempty"`
+	Created int64                  `json:"created,omitempty"`
+	Model   string                 `json:"model,omitempty"`
+	Choices []streamingChunkChoice `json:"choices"`
+}
+
+type streamingChunkChoice struct {
+	Index        int                 `json:"index,omitempty"`
+	FinishReason *string             `json:"finish_reason"`
+	Delta        streamingChunkDelta `json:"delta"`
+}
+
+type streamingChunkDelta struct {
+	Role    string `json:"role,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
+func normaliseStreamingChunk(raw string, roleSent *bool) (string, error) {
+	var chunk streamingChunk
+	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
+		return raw, nil
 	}
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	chunk.Object = "chat.completion.chunk"
+
+	for i := range chunk.Choices {
+		choice := &chunk.Choices[i]
+		if choice.FinishReason != nil && strings.TrimSpace(*choice.FinishReason) == "" {
+			choice.FinishReason = nil
+		}
+
+		role := strings.TrimSpace(choice.Delta.Role)
+		if role != "" {
+			if roleSent != nil && *roleSent {
+				choice.Delta.Role = ""
+			} else if roleSent != nil {
+				*roleSent = true
+			}
+		}
+		if strings.TrimSpace(choice.Delta.Role) == "" {
+			choice.Delta.Role = ""
+		}
+
+		if strings.TrimSpace(choice.Delta.Content) == "" {
+			choice.Delta.Content = ""
+		}
+
+		if choice.Delta.Role == "" && choice.Delta.Content == "" {
+			choice.Delta = streamingChunkDelta{}
+		}
+	}
+
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return raw, err
+	}
+	return string(payload), nil
 }
 
 func sha256Hex(value string) string {
