@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,18 +33,28 @@ type sessionHandler struct {
 
 	httpClient *http.Client
 	log        *logrus.Entry
+
+	mu               sync.RWMutex
+	resourceSessions map[string]string
 }
+
+const (
+	resourceDllama = "dllama"
+	resourceRoot   = "root"
+	resourceWorker = "worker"
+)
 
 func registerSessionController(ctx context.Context, m *Manager) error {
 	handler := &sessionHandler{
-		ctx:        ctx,
-		apply:      m.Apply(ctx),
-		sessions:   m.Kold.Session(),
-		dllamas:    m.Kold.Dllama(),
-		roots:      m.Kold.Root(),
-		workers:    m.Kold.Worker(),
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-		log:        logrus.StandardLogger().WithField("component", "session-controller"),
+		ctx:              ctx,
+		apply:            m.Apply(ctx),
+		sessions:         m.Kold.Session(),
+		dllamas:          m.Kold.Dllama(),
+		roots:            m.Kold.Root(),
+		workers:          m.Kold.Worker(),
+		httpClient:       &http.Client{Timeout: 3 * time.Second},
+		log:              logrus.StandardLogger().WithField("component", "session-controller"),
+		resourceSessions: map[string]string{},
 	}
 
 	handler.sessions.OnChange(ctx, "koldun-session-controller", handler.onChange)
@@ -75,30 +86,57 @@ func (h *sessionHandler) onRemove(key string, sess *v1.Session) (*v1.Session, er
 }
 
 func (h *sessionHandler) onRelatedDllama(key string, dllama *v1.Dllama) (*v1.Dllama, error) {
+	ns, name := splitNamespaceName(key)
 	if dllama == nil {
+		session := h.popResourceSession(resourceDllama, ns, name)
+		if session == "" {
+			session = guessSessionFromDllamaName(name)
+		}
+		if session != "" && ns != "" {
+			h.sessions.Enqueue(ns, session)
+		}
 		return nil, nil
 	}
 	if session := labelValue(dllama.Labels, labelSessionName); session != "" {
+		h.trackResourceSession(resourceDllama, dllama.Namespace, dllama.Name, session)
 		h.sessions.Enqueue(dllama.Namespace, session)
 	}
 	return dllama, nil
 }
 
 func (h *sessionHandler) onRelatedRoot(key string, root *v1.Root) (*v1.Root, error) {
+	ns, name := splitNamespaceName(key)
 	if root == nil {
+		session := h.popResourceSession(resourceRoot, ns, name)
+		if session == "" {
+			session = guessSessionFromRootName(name)
+		}
+		if session != "" && ns != "" {
+			h.sessions.Enqueue(ns, session)
+		}
 		return nil, nil
 	}
 	if session := labelValue(root.Labels, labelSessionName); session != "" {
+		h.trackResourceSession(resourceRoot, root.Namespace, root.Name, session)
 		h.sessions.Enqueue(root.Namespace, session)
 	}
 	return root, nil
 }
 
 func (h *sessionHandler) onRelatedWorker(key string, worker *v1.Worker) (*v1.Worker, error) {
+	ns, name := splitNamespaceName(key)
 	if worker == nil {
+		session := h.popResourceSession(resourceWorker, ns, name)
+		if session == "" {
+			session = guessSessionFromWorkerName(name)
+		}
+		if session != "" && ns != "" {
+			h.sessions.Enqueue(ns, session)
+		}
 		return nil, nil
 	}
 	if session := labelValue(worker.Labels, labelSessionName); session != "" {
+		h.trackResourceSession(resourceWorker, worker.Namespace, worker.Name, session)
 		h.sessions.Enqueue(worker.Namespace, session)
 	}
 	return worker, nil
@@ -478,6 +516,63 @@ func pointerTime(t *metav1.Time) time.Time {
 		return time.Time{}
 	}
 	return t.Time
+}
+
+func (h *sessionHandler) trackResourceSession(resource, namespace, name, session string) {
+	if session == "" || name == "" {
+		return
+	}
+	key := resourceSessionKey(resource, namespace, name)
+	h.mu.Lock()
+	h.resourceSessions[key] = session
+	h.mu.Unlock()
+}
+
+func (h *sessionHandler) popResourceSession(resource, namespace, name string) string {
+	key := resourceSessionKey(resource, namespace, name)
+	h.mu.Lock()
+	session := h.resourceSessions[key]
+	if key != "" {
+		delete(h.resourceSessions, key)
+	}
+	h.mu.Unlock()
+	return session
+}
+
+func resourceSessionKey(resource, namespace, name string) string {
+	if resource == "" || name == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%s/%s", resource, namespace, name)
+}
+
+func splitNamespaceName(key string) (string, string) {
+	if key == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(key, "/", 2)
+	if len(parts) == 1 {
+		return "", parts[0]
+	}
+	return parts[0], parts[1]
+}
+
+func guessSessionFromDllamaName(name string) string {
+	if name == "" {
+		return ""
+	}
+	if idx := strings.Index(name, "-dllama"); idx > 0 {
+		return name[:idx]
+	}
+	return ""
+}
+
+func guessSessionFromRootName(name string) string {
+	return guessSessionFromDllamaName(strings.TrimSuffix(name, "-root"))
+}
+
+func guessSessionFromWorkerName(name string) string {
+	return guessSessionFromDllamaName(strings.TrimSuffix(name, "-workers"))
 }
 
 func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
