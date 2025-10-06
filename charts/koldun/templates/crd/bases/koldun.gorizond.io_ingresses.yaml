@@ -16,7 +16,22 @@ spec:
     singular: ingress
   scope: Namespaced
   versions:
-  - name: v1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .spec.route.host
+      name: Host
+      type: string
+    - jsonPath: .spec.service.type
+      name: Service
+      priority: 1
+      type: string
+    - jsonPath: .spec.backend.replicaPower
+      name: ReplicaPower
+      priority: 1
+      type: integer
+    name: v1
     schema:
       openAPIV3Schema:
         description: Ingress defines an HTTP entrypoint backed by a managed backend
