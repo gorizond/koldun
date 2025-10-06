@@ -1434,28 +1434,26 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 		cacheEndpoint = storage.Endpoint
 	}
 	quantType := strings.TrimSpace(spec.ConvertWeights)
-	skippedConversion := false
+	if quantType == "" {
+		quantType = strings.TrimSpace(spec.WeightsFloatType)
+	}
 	if quantType == "" {
 		quantType = defaultWeightsType
 	}
-	switch strings.ToLower(quantType) {
-	case "false", "0", "no", "off", "skip", "disabled", "disable", "none":
-		skippedConversion = true
-	}
 
-		env := []corev1.EnvVar{
-			{Name: "MODEL_NAME", Value: model.Name},
-			{Name: "CACHE_BUCKET", Value: sourceBucket},
-			{Name: "CACHE_OBJECT_KEY", Value: inputKey},
-			{Name: "CONVERSION_BUCKET", Value: outputBucket},
-			{Name: "CONVERSION_OBJECT_KEY", Value: outputKey},
-			{Name: "CONVERSION_OUTPUT_URI", Value: outputURI},
-			{Name: "CONVERSION_WEIGHTS_TYPE", Value: quantType},
-			{Name: "MODEL_GENERATION", Value: generation},
-			{Name: "CONVERSION_WORK_DIR", Value: workDir},
-			{Name: "PYTHONPATH", Value: "/workspace/converter"},
-			{Name: "PYTHONUNBUFFERED", Value: "1"},
-		}
+	env := []corev1.EnvVar{
+		{Name: "MODEL_NAME", Value: model.Name},
+		{Name: "CACHE_BUCKET", Value: sourceBucket},
+		{Name: "CACHE_OBJECT_KEY", Value: inputKey},
+		{Name: "CONVERSION_BUCKET", Value: outputBucket},
+		{Name: "CONVERSION_OBJECT_KEY", Value: outputKey},
+		{Name: "CONVERSION_OUTPUT_URI", Value: outputURI},
+		{Name: "CONVERSION_WEIGHTS_TYPE", Value: quantType},
+		{Name: "MODEL_GENERATION", Value: generation},
+		{Name: "CONVERSION_WORK_DIR", Value: workDir},
+		{Name: "PYTHONPATH", Value: "/workspace/converter"},
+		{Name: "PYTHONUNBUFFERED", Value: "1"},
+	}
 	if strings.TrimSpace(cacheEndpoint) != "" {
 		env = append(env, corev1.EnvVar{Name: "CACHE_ENDPOINT", Value: cacheEndpoint})
 	}
@@ -1500,7 +1498,7 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 		container.Command = []string{"/bin/sh", "-c"}
 	}
 	if len(container.Args) == 0 {
-		container.Args = h.conversionArgs(model, spec, model.Spec.SourceURL, inputKey, outputKey, quantType, skippedConversion)
+		container.Args = h.conversionArgs(model, spec, model.Spec.SourceURL, inputKey, outputKey)
 	}
 
 	if storage != nil && storage.SecretRef != nil {
@@ -1517,7 +1515,7 @@ func (h *modelHandler) buildConversionContainer(model *v1.Model, spec *v1.ModelC
 	return container
 }
 
-func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionSpec, sourceURL, inputKey, outputKey, weightsType string, convertWeights bool) []string {
+func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionSpec, sourceURL, inputKey, outputKey string) []string {
 	if len(spec.Args) > 0 {
 		return spec.Args
 	}
@@ -1533,10 +1531,10 @@ func (h *modelHandler) conversionArgs(model *v1.Model, spec *v1.ModelConversionS
 
 		"pip install --no-cache-dir torch safetensors sentencepiece transformers datasets huggingface_hub boto3 requests gitpython",
 	}
-	if convertWeights {
-		cmdLines = append(cmdLines, "python -u /workspace/converter/convert-hf.py /mnt/s3 ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}")
-	}
-	cmdLines = append(cmdLines, "python -u /workspace/converter/convert-tokenizer-hf.py /mnt/s3 ${MODEL_NAME}")
+	cmdLines = append(cmdLines,
+		"python -u /workspace/converter/convert-hf.py /mnt/s3 ${CONVERSION_WEIGHTS_TYPE} ${MODEL_NAME}",
+		"python -u /workspace/converter/convert-tokenizer-hf.py /mnt/s3 ${MODEL_NAME}",
+	)
 
 	return []string{strings.Join(cmdLines, "\n")}
 }
@@ -1903,7 +1901,7 @@ func effectiveConversionSpec(spec *v1.ModelConversionSpec) *v1.ModelConversionSp
 			Image:            defaultConversionImage,
 			WeightsFloatType: defaultWeightsType,
 			Memory:           "2Gi",
-			ConvertWeights:   "true",
+			ConvertWeights:   defaultWeightsType,
 		}
 	}
 	out := spec.DeepCopy()
@@ -1920,7 +1918,11 @@ func effectiveConversionSpec(spec *v1.ModelConversionSpec) *v1.ModelConversionSp
 		out.ConverterVersion = "v0.16.2"
 	}
 	if strings.TrimSpace(out.ConvertWeights) == "" {
-		out.ConvertWeights = "true"
+		if wt := strings.TrimSpace(out.WeightsFloatType); wt != "" {
+			out.ConvertWeights = wt
+		} else {
+			out.ConvertWeights = defaultWeightsType
+		}
 	}
 	return out
 }
