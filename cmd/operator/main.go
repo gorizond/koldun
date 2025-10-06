@@ -24,17 +24,20 @@ func main() {
 		mode       string
 
 		// LLM flags
-		llmListen         string
-		llmHash           string
-		llmNATSURL        string
-		llmInPrefix       string
-		llmOutPrefix      string
-		llmRequestSubject string
-		llmStateSubject   string
-		llmDllamaName     string
-		llmSidecarURL     string
-		llmSidecarTimeout time.Duration
-		llmHealthOnly     bool
+		llmListen                  string
+		llmHash                    string
+		llmNATSURL                 string
+		llmInPrefix                string
+		llmOutPrefix               string
+		llmRequestSubject          string
+		llmStateSubject            string
+		llmDllamaName              string
+		llmSidecarURL              string
+		llmSidecarTimeout          time.Duration
+		llmHealthOnly              bool
+		llmNamespace               string
+		llmSidecarMonitorInterval  time.Duration
+		llmSidecarFailureThreshold int
 
 		// Backend flags
 		backendListen                      string
@@ -99,6 +102,9 @@ func main() {
 	fs.StringVar(&llmSidecarURL, "llm-sidecar-url", "http://127.0.0.1:8080", "Base URL for dllama-api sidecar")
 	fs.DurationVar(&llmSidecarTimeout, "llm-sidecar-timeout", 2*time.Minute, "Timeout for sidecar HTTP calls")
 	fs.BoolVar(&llmHealthOnly, "llm-health-only", false, "Disable health server (useful for tests)")
+	fs.StringVar(&llmNamespace, "llm-namespace", os.Getenv("POD_NAMESPACE"), "Namespace containing the dllama resource (defaults to pod namespace when available)")
+	fs.DurationVar(&llmSidecarMonitorInterval, "llm-sidecar-monitor-interval", 15*time.Second, "Interval between dllama-api health probes")
+	fs.IntVar(&llmSidecarFailureThreshold, "llm-sidecar-failure-threshold", 4, "Consecutive failed dllama-api probes before the worker evicts itself")
 
 	fs.StringVar(&dispatcherHash, "dispatcher-hash", "", "Conversation hash this dispatcher serves")
 	fs.StringVar(&dispatcherNATSURL, "dispatcher-nats-url", "nats://nats.default:4222", "NATS endpoint for dispatcher")
@@ -182,17 +188,20 @@ func main() {
 		)
 	case "llm":
 		runLLM(ctx, llm.Config{
-			Hash:           llmHash,
-			ListenAddress:  llmListen,
-			NATSURL:        llmNATSURL,
-			InPrefix:       llmInPrefix,
-			OutPrefix:      llmOutPrefix,
-			RequestSubject: llmRequestSubject,
-			StateSubject:   llmStateSubject,
-			DllamaName:     llmDllamaName,
-			SidecarURL:     llmSidecarURL,
-			SidecarTimeout: llmSidecarTimeout,
-			HealthOnly:     llmHealthOnly,
+			Hash:                    llmHash,
+			ListenAddress:           llmListen,
+			NATSURL:                 llmNATSURL,
+			InPrefix:                llmInPrefix,
+			OutPrefix:               llmOutPrefix,
+			RequestSubject:          llmRequestSubject,
+			StateSubject:            llmStateSubject,
+			DllamaName:              llmDllamaName,
+			Namespace:               llmNamespace,
+			SidecarURL:              llmSidecarURL,
+			SidecarTimeout:          llmSidecarTimeout,
+			SidecarMonitorInterval:  llmSidecarMonitorInterval,
+			SidecarFailureThreshold: llmSidecarFailureThreshold,
+			HealthOnly:              llmHealthOnly,
 		})
 	case "backend", "ingress":
 		runIngress(ctx, ingress.Config{

@@ -1,24 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The operator entrypoint lives in `cmd/operator`, wiring Wrangler controllers and CLI modes. Custom resource types sit in `pkg/apis/koldun.gorizond.io/v1`, while reconcile logic and helpers are under `pkg/controllers` (see `common.go`, `manager.go`, and resource-specific files). Helm packaging for cluster installs is in `charts/`, and `k8s/` holds raw manifests for quick smoke deployment. Container build artifacts are defined in the root `Dockerfile` and `skaffold.yaml`; keep them aligned whenever dependencies or flags change. A prebuilt `operator` binary may exist for fast prototyping—regenerate it from source before publishing.
+Core entrypoints live in `cmd/operator`, which selects operator, backend, dispatcher, or LLM sidecar modes via the `--mode` flag. Runtime servers reside in `pkg/servers` while controllers and reconcilers stay in `pkg/controllers`; custom resource types and generated clients sit under `pkg/apis/koldun.gorizond.io/v1`. Deployment assets are split between `charts/` for Helm, `k8s/` for raw manifests, and the root `Dockerfile` plus `skaffold.yaml` for container packaging. Tests follow the code they exercise, for example `pkg/controllers/memory_test.go`.
 
 ## Build, Test, and Development Commands
-Use Go 1.21+.
-```bash
-go fmt ./...
-go build ./cmd/operator
-go run ./cmd/operator --mode=operator
-go test ./...
-skaffold build
-```
-`go fmt` enforces canonical formatting, `go build` produces the controller binary, `go run` executes it against your current kubeconfig, `go test` runs unit tests (currently focused on controller behaviour), and `skaffold build` rebuilds the container image `ghcr.io/gorizond/koldun` using the root Dockerfile.
+Run `go fmt ./... && gofmt -w` before committing to keep formatting consistent. Use `go build ./cmd/operator` to compile the unified binary or `go run ./cmd/operator --mode=operator` for a kubeconfig-backed smoke test. Execute `go test ./...` for unit coverage and add `-race` when debugging concurrency. Container images are produced with `skaffold build`, publishing to `ghcr.io/gorizond/koldun`.
 
 ## Coding Style & Naming Conventions
-Stick to idiomatic Go: tab indentation, PascalCase for exported API types, camelCase for locals, and snake_case file names. Group new controllers by resource (`dllama.go`, `model.go`, etc.) and reuse `common.go` for shared helpers. Always run `go fmt` and `goimports`, prefer structured logging via the Wrangler logger, and keep package boundaries clean (`pkg/apis` for types, `pkg/controllers` for logic).
+Write Go 1.21+ idiomatic code: tabs for indentation, camelCase for locals, PascalCase for exported symbols. Shared helpers belong in `pkg/controllers/common.go`; resource-specific logic should remain in files such as `root.go` or `worker.go`. CLI flags mirror the existing pattern in `cmd/operator/main.go`, using kebab-case names prefixed by the target mode. Always run gofmt tooling and avoid introducing non-ASCII characters unless already present in a file.
 
 ## Testing Guidelines
-Locate tests beside implementation under `pkg/`, naming them `*_test.go` (e.g. `pkg/controllers/dllama_test.go`). Use Go’s `testing` package with table-driven cases to cover reconciliation branches, NATS URL propagation, and error paths. Run `go test ./...` before submitting changes; add `-race` when investigating concurrency-sensitive bugs. Document any required Kubernetes fixtures or fake clients in the test file header.
+Adopt table-driven tests with `_test.go` suffixes co-located beside implementations. Prioritize reconciliation branches, memory sizing helpers, and NATS interactions, mocking JetStream or Kubernetes clients to keep tests hermetic. Collect coverage with `go test ./...`, and extend with `-race` when chasing data races.
 
 ## Commit & Pull Request Guidelines
-Write imperative, present-tense commit subjects (~72 chars). Prefix with a scope when it clarifies intent (`chore(ci): …`, `feat:`), mirroring the existing history. For pull requests, link issues, summarize operator or chart impact, list manual verification steps (`go test ./...`, cluster smoke install), and attach logs or screenshots when behaviour is user-visible. Request reviews from controller maintainers and ensure Helm values or manifests are updated in tandem with code changes.
+Prefer short, imperative commit subjects (for example `feat: add dispatcher autoscaling`), adding a scope when it clarifies impact. Pull requests should summarize behavioral changes, link issues, and list validation steps such as `go test ./...` or Helm smoke tests. Include relevant logs or screenshots for user-facing updates and confirm Helm charts, manifests, and Docker packaging stay in sync.
+
+## Security & Configuration Tips
+Keep credentials, NATS secrets, and hash keys in Kubernetes Secrets—never commit sensitive data. Revisit RBAC policies when shipping new controllers to ensure service accounts and JetStream permissions are scoped correctly. Update the Dockerfile and `skaffold.yaml` whenever build flags or binary names change so published images remain reproducible.

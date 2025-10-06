@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -19,18 +20,35 @@ import (
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/utils/pointer"
 )
 
 const (
-	defaultListenAddress = ":8081"
-	defaultSidecarURL    = "http://127.0.0.1:8080"
-	defaultInPrefix      = "in."
-	defaultOutPrefix     = "out."
+	defaultListenAddress           = ":8081"
+	defaultSidecarURL              = "http://127.0.0.1:8080"
+	defaultInPrefix                = "in."
+	defaultOutPrefix               = "out."
+	defaultSidecarMonitorInterval  = 15 * time.Second
+	defaultSidecarFailureThreshold = 4
 
 	sidecarModelsPath          = "/v1/models"
 	sidecarChatCompletionsPath = "/v1/chat/completions"
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
+)
+
+var (
+	dllamaGVR = schema.GroupVersionResource{
+		Group:    "koldun.gorizond.io",
+		Version:  "v1",
+		Resource: "dllamas",
+	}
+	errEvictionDisabled = errors.New("dllama eviction disabled: missing namespace or permissions")
 )
 
 func ensureTrailingDot(prefix string) string {
@@ -58,9 +76,12 @@ type Config struct {
 	RequestSubject string
 	StateSubject   string
 	DllamaName     string
+	Namespace      string
 
-	SidecarURL     string
-	SidecarTimeout time.Duration
+	SidecarURL              string
+	SidecarTimeout          time.Duration
+	SidecarMonitorInterval  time.Duration
+	SidecarFailureThreshold int
 
 	Logger *logrus.Entry
 }
@@ -81,6 +102,17 @@ type Server struct {
 	inSubject    string
 	outSubject   string
 	stateSubject string
+
+	namespace string
+	kube      dynamic.Interface
+
+	cancel      context.CancelFunc
+	shutdownMu  sync.Mutex
+	shutdownErr error
+	evictOnce   sync.Once
+
+	sidecarMonitorInterval  time.Duration
+	sidecarFailureThreshold int
 
 	wg sync.WaitGroup
 }
@@ -134,6 +166,17 @@ func New(cfg Config) (*Server, error) {
 		cfg.DllamaName = cfg.Hash
 	}
 
+	cfg.Namespace = strings.TrimSpace(cfg.Namespace)
+	if cfg.Namespace == "" {
+		cfg.Namespace = inClusterNamespace()
+	}
+	if cfg.SidecarMonitorInterval <= 0 {
+		cfg.SidecarMonitorInterval = defaultSidecarMonitorInterval
+	}
+	if cfg.SidecarFailureThreshold <= 0 {
+		cfg.SidecarFailureThreshold = defaultSidecarFailureThreshold
+	}
+
 	log := cfg.Logger
 	if log == nil {
 		log = logrus.StandardLogger().WithField("component", "koldun-llm")
@@ -158,27 +201,55 @@ func New(cfg Config) (*Server, error) {
 
 	client := &http.Client{Timeout: cfg.SidecarTimeout}
 
+	var dynClient dynamic.Interface
+	if cfg.Namespace != "" && strings.TrimSpace(cfg.DllamaName) != "" {
+		restCfg, restErr := rest.InClusterConfig()
+		if restErr != nil {
+			log.WithError(restErr).Debug("in-cluster config unavailable; dllama eviction disabled")
+		} else {
+			dynClient, err = dynamic.NewForConfig(restCfg)
+			if err != nil {
+				log.WithError(err).Warn("failed to initialise dynamic client; dllama eviction disabled")
+			}
+		}
+	}
+
 	srv := &Server{
-		cfg:          cfg,
-		log:          log,
-		nc:           nc,
-		js:           js,
-		client:       client,
-		inSubject:    cfg.RequestSubject,
-		outSubject:   cfg.OutPrefix + cfg.Hash,
-		stateSubject: cfg.StateSubject,
-		streamName:   streamName,
+		cfg:                     cfg,
+		log:                     log,
+		nc:                      nc,
+		js:                      js,
+		client:                  client,
+		inSubject:               cfg.RequestSubject,
+		outSubject:              cfg.OutPrefix + cfg.Hash,
+		stateSubject:            cfg.StateSubject,
+		streamName:              streamName,
+		namespace:               cfg.Namespace,
+		kube:                    dynClient,
+		sidecarMonitorInterval:  cfg.SidecarMonitorInterval,
+		sidecarFailureThreshold: cfg.SidecarFailureThreshold,
 	}
 	return srv, nil
 }
 
 // Run starts the subscription loop and health endpoint until the context is cancelled.
 func (s *Server) Run(ctx context.Context) error {
-	if err := s.waitForSidecar(ctx); err != nil {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	s.cancel = cancel
+
+	if err := s.waitForSidecar(runCtx); err != nil {
+		reason := fmt.Sprintf("dllama sidecar failed to become ready: %v", err)
+		s.triggerEviction(reason)
 		return fmt.Errorf("wait for dllama sidecar: %w", err)
 	}
 
+	// Use a durable name derived from the dllama identity so JetStream preserves
+	// per-worker consumers while allowing us to restart safely.
 	queueName := durableName(s.cfg.DllamaName)
+	if queueName == "llm-default" {
+		queueName = durableName(s.cfg.Hash)
+	}
 	ackWait := s.cfg.SidecarTimeout
 	if ackWait <= 0 {
 		ackWait = 2 * time.Minute
@@ -206,7 +277,8 @@ func (s *Server) Run(ctx context.Context) error {
 		"stream":  s.streamName,
 	}).Info("subscribed to request stream")
 
-	s.startHeartbeatLoop(ctx)
+	s.startHeartbeatLoop(runCtx)
+	go s.monitorSidecar(runCtx)
 
 	errCh := make(chan error, 1)
 
@@ -230,7 +302,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	go func() {
-		<-ctx.Done()
+		<-runCtx.Done()
 		s.log.Info("llm server shutting down")
 		if s.sub != nil {
 			if err := s.sub.Drain(); err != nil {
@@ -240,14 +312,19 @@ func (s *Server) Run(ctx context.Context) error {
 		s.wg.Wait()
 		s.nc.Drain()
 		if s.httpServer != nil {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_ = s.httpServer.Shutdown(shutdownCtx)
+			shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelShutdown()
+			if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+				s.log.WithError(err).Warn("HTTP shutdown error")
+			}
 		}
 	}()
 
 	select {
-	case <-ctx.Done():
+	case <-runCtx.Done():
+		if err := s.shutdownError(); err != nil {
+			return err
+		}
 		return nil
 	case err := <-errCh:
 		return err
@@ -557,6 +634,120 @@ func (s *Server) startHeartbeatLoop(ctx context.Context) {
 	}()
 }
 
+func (s *Server) shutdownError() error {
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	return s.shutdownErr
+}
+
+func (s *Server) setShutdownErr(err error) {
+	if err == nil {
+		return
+	}
+	s.shutdownMu.Lock()
+	if s.shutdownErr == nil {
+		s.shutdownErr = err
+	}
+	s.shutdownMu.Unlock()
+}
+
+func (s *Server) triggerEviction(reason string) {
+	s.evictOnce.Do(func() {
+		s.log.WithField("reason", reason).Warn("evicting dllama instance")
+		s.publishState("error", "", 0, reason)
+		if err := s.evictDllama(context.Background()); err != nil {
+			// Log at debug when eviction is intentionally disabled, warn otherwise.
+			if errors.Is(err, errEvictionDisabled) {
+				s.log.WithError(err).Debug("dllama eviction disabled")
+			} else {
+				s.log.WithError(err).Warn("failed to evict dllama instance")
+			}
+		}
+		s.setShutdownErr(errors.New(reason))
+		if s.cancel != nil {
+			s.cancel()
+		}
+	})
+}
+
+func (s *Server) evictDllama(ctx context.Context) error {
+	if s.kube == nil || s.namespace == "" || strings.TrimSpace(s.cfg.DllamaName) == "" {
+		return errEvictionDisabled
+	}
+
+	deleteCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	propagation := metav1.DeletePropagationBackground
+	options := metav1.DeleteOptions{
+		GracePeriodSeconds: pointer.Int64(0),
+		PropagationPolicy:  &propagation,
+	}
+
+	err := s.kube.Resource(dllamaGVR).Namespace(s.namespace).Delete(deleteCtx, s.cfg.DllamaName, options)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) monitorSidecar(ctx context.Context) {
+	if s.sidecarMonitorInterval <= 0 || s.sidecarFailureThreshold <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(s.sidecarMonitorInterval)
+	defer ticker.Stop()
+
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.probeSidecar(ctx) {
+				failures = 0
+				continue
+			}
+			failures++
+			if failures >= s.sidecarFailureThreshold {
+				reason := fmt.Sprintf("dllama sidecar health check failed %d times in a row", failures)
+				s.triggerEviction(reason)
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) probeSidecar(ctx context.Context) bool {
+	endpoint, err := s.sidecarEndpoint(sidecarModelsPath)
+	if err != nil {
+		return false
+	}
+
+	timeout := 5 * time.Second
+	if s.cfg.SidecarTimeout > 0 && s.cfg.SidecarTimeout < timeout {
+		timeout = s.cfg.SidecarTimeout
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return false
+	}
+
+	res, err := s.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
+
+	return res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices
+}
+
 func (s *Server) publishError(target, msg string) {
 	s.log.Warn(msg)
 	if target == "" {
@@ -624,6 +815,14 @@ func uniqueSubjects(values map[string]struct{}) []string {
 	}
 	sort.Strings(list)
 	return list
+}
+
+func inClusterNamespace() string {
+	data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 func durableName(hash string) string {

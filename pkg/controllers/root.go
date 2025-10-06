@@ -524,13 +524,24 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 		args = append(args, "--llm-dllama-name", dllamaName)
 	}
 
+	env := []corev1.EnvVar{
+		{Name: "HASH_KOLDUN", Value: hash},
+		{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		},
+	}
+	env = append(env, buildLLMNATSEnv(root.Spec.NATS)...)
+
 	return corev1.Container{
 		Name:            "llm",
 		Image:           root.Spec.Image,
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Command:         []string{"/koldun"},
 		Args:            args,
-		Env:             append([]corev1.EnvVar{{Name: "HASH_KOLDUN", Value: hash}}, buildLLMNATSEnv(root.Spec.NATS)...),
+		Env:             env,
 		Ports:           []corev1.ContainerPort{{ContainerPort: 8081}},
 	}
 }
