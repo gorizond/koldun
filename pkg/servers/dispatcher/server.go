@@ -43,6 +43,8 @@ type Server struct {
 	workers       map[string]*workerState
 	inflight      map[string]*assignment
 	lastNoIdleLog time.Time
+
+	retryConfig RetryConfig
 }
 
 type workerState struct {
@@ -123,6 +125,7 @@ func New(cfg Config) (*Server, error) {
 		assignments: kv,
 		workers:     make(map[string]*workerState),
 		inflight:    make(map[string]*assignment),
+		retryConfig: DefaultRetryConfig(),
 	}
 	return srv, nil
 }
@@ -192,8 +195,8 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 				"inflight":     inflight,
 			}).Info("dispatcher backlog: no idle workers available, requeuing")
 		}
-		if err := s.nc.Publish(s.cfg.BacklogSubject, msg.Data); err != nil {
-			s.log.WithError(err).Warn("requeue backlog message")
+		if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); err != nil {
+			s.log.WithError(err).Error("failed to requeue backlog message after retries")
 		}
 		return
 	}
@@ -211,13 +214,18 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 	}
 
 	subject := fmt.Sprintf("%s%s.in", s.cfg.DllamaSubjectPrefix, worker)
-	if err := s.nc.Publish(subject, payload); err != nil {
-		s.log.WithError(err).WithField("subject", subject).Warn("publish assignment")
+	if err := PublishWithRetry(s.nc, subject, payload, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithField("subject", subject).Error("failed to publish assignment after retries")
+		// Requeue the backlog item since we couldn't dispatch it
+		if requeueErr := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); requeueErr != nil {
+			s.log.WithError(requeueErr).Error("failed to requeue after publish failure")
+		}
 		return
 	}
 
-	if _, err := s.assignments.Put(backlog.ID, payload); err != nil {
-		s.log.WithError(err).Warn("record assignment kv")
+	if _, err := KVPutWithRetry(s.assignments, backlog.ID, payload, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).Error("failed to record assignment in KV after retries")
+		// Continue execution - assignment was sent, KV is for recovery only
 	}
 
 	s.mu.Lock()
@@ -296,8 +304,9 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 		s.requeueAssignment(asn)
 	}
 
-	if err := s.assignments.Delete(asn.requestID); err != nil && !errors.Is(err, nats.ErrKeyNotFound) {
-		s.log.WithError(err).WithField("requestID", asn.requestID).Warn("delete assignment kv")
+	if err := KVDeleteWithRetry(s.assignments, asn.requestID, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithField("requestID", asn.requestID).Error("failed to delete assignment from KV after retries")
+		// Continue - this is cleanup, not critical
 	}
 }
 
@@ -312,8 +321,8 @@ func (s *Server) requeueAssignment(asn *assignment) {
 		s.log.WithError(err).Warn("marshal backlog retry")
 		return
 	}
-	if err := s.nc.Publish(s.cfg.BacklogSubject, body); err != nil {
-		s.log.WithError(err).Warn("republish backlog")
+	if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, body, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).Error("failed to republish backlog after retries")
 	}
 }
 
@@ -362,8 +371,8 @@ func (s *Server) recoverAssignments() {
 			requestID:    env.RequestID,
 			payload:      env.Payload,
 		})
-		if err := s.assignments.Delete(key); err != nil {
-			s.log.WithError(err).WithField("key", key).Warn("cleanup assignment entry")
+		if err := KVDeleteWithRetry(s.assignments, key, s.retryConfig, s.log); err != nil {
+			s.log.WithError(err).WithField("key", key).Error("failed to cleanup assignment entry after retries")
 		}
 	}
 }
