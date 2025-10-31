@@ -1168,6 +1168,20 @@ type IngressRootMemorySpec struct {
 	OverheadMaxRatio *float64 `json:"overheadMaxRatio,omitempty"`
 }
 
+// DeepCopy for IngressRootMemorySpec.
+func (in *IngressRootMemorySpec) DeepCopy() *IngressRootMemorySpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressRootMemorySpec)
+	*out = *in
+	if in.OverheadMaxRatio != nil {
+		value := *in.OverheadMaxRatio
+		out.OverheadMaxRatio = &value
+	}
+	return out
+}
+
 // IngressSessionScalingSpec controls auto-scaling behaviour for Session-managed Dllamas.
 type IngressSessionScalingSpec struct {
 	MinDllamas           int32 `json:"minDllamas,omitempty"`
@@ -1288,6 +1302,10 @@ func (in *IngressBackendSpec) DeepCopy() *IngressBackendSpec {
 		copy(out.ExtraArgs, in.ExtraArgs)
 	}
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.RootMemory != nil {
+		memCopy := *in.RootMemory.DeepCopy()
+		out.RootMemory = &memCopy
+	}
 	return out
 }
 
