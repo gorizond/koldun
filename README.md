@@ -181,3 +181,7 @@ spec:
 - Sample CRs: `k8s/examples/*.yaml` (models, dllama topologies, ingress definitions).
 - Token tooling lives in `pkg/tokens`; registry helpers in `pkg/registry` show how JetStream buckets are structured.
 - File an issue or PR with validation steps (`go test ./...`, Helm installation logs, kube events) to document behavioural changes.
+
+## In Memoriam
+
+I dedicate this repository to my grandfather, Negashev Vyacheslav Ivanovich
