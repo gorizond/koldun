@@ -1,3 +1,6 @@
 .gocache
 .idea
 /operator
+
+# Documentation (local use only)
+docs/reasoning
