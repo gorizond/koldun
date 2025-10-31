@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/api/openai"
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -284,6 +285,9 @@ func (s *Server) Run(ctx context.Context) error {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", s.handleHealth)
 		mux.HandleFunc("/readyz", s.handleHealth)
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			metrics.Handler().ServeHTTP(w, r)
+		})
 
 		s.httpServer = &http.Server{
 			Addr:              s.cfg.ListenAddress,
@@ -444,9 +448,17 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		"assignmentId": assignmentID,
 	}).Info("processing request")
 
+	// Track active requests
+	metrics.LLMRequestsActive.Inc()
+	defer metrics.LLMRequestsActive.Dec()
+
+	start := time.Now()
 	s.publishState("busy", assignmentID, 1, "")
 	ackMode := "ack"
 	defer func() {
+		duration := time.Since(start)
+		metrics.LLMRequestDuration.Observe(duration.Seconds())
+
 		if ackMode == "ack" {
 			if err := msg.Ack(); err != nil {
 				s.log.WithError(err).Warn("ack request message")
@@ -465,12 +477,14 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		err = s.executeOnce(payload)
 	}
 	if err != nil {
+		metrics.LLMRequestsTotal.WithLabelValues("error").Inc()
 		s.publishState("error", assignmentID, 0, err.Error())
 		s.log.WithError(err).Warn("request handling failed")
 		ackMode = "nak"
 		return
 	}
 
+	metrics.LLMRequestsTotal.WithLabelValues("success").Inc()
 	s.publishState("idle", assignmentID, 0, "")
 }
 
@@ -855,7 +869,20 @@ func (s *Server) probeSidecar(ctx context.Context) bool {
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
 
-	return res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices
+	healthy := res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices
+
+	// Update health metric
+	dllamaName := s.cfg.DllamaName
+	if dllamaName == "" {
+		dllamaName = "unknown"
+	}
+	if healthy {
+		metrics.LLMSidecarHealthStatus.WithLabelValues(dllamaName).Set(1)
+	} else {
+		metrics.LLMSidecarHealthStatus.WithLabelValues(dllamaName).Set(0)
+	}
+
+	return healthy
 }
 
 func (s *Server) publishError(target, msg string) {

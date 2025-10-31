@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/api/openai"
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/gorizond/koldun/pkg/registry"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nuid"
@@ -395,6 +396,9 @@ func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		metrics.Handler().ServeHTTP(w, r)
+	})
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 
@@ -411,12 +415,23 @@ func (s *Server) Run(ctx context.Context) error {
 			"path":   r.URL.Path,
 			"addr":   r.RemoteAddr,
 		}).Info("inbound request")
-		mux.ServeHTTP(w, r)
+
+		// Wrap response writer to capture status code
+		wrw := &responseWriterWrapper{ResponseWriter: w, statusCode: http.StatusOK}
+		mux.ServeHTTP(wrw, r)
+
+		duration := time.Since(start)
+
+		// Record metrics
+		metrics.IngressRequestsTotal.WithLabelValues(r.Method, r.URL.Path, fmt.Sprintf("%d", wrw.statusCode)).Inc()
+		metrics.IngressRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(duration.Seconds())
+
 		s.log.WithFields(logrus.Fields{
 			"method": r.Method,
 			"path":   r.URL.Path,
 			"addr":   r.RemoteAddr,
-			"took":   time.Since(start),
+			"took":   duration,
+			"status": wrw.statusCode,
 		}).Info("completed request")
 	})
 
@@ -1823,4 +1838,15 @@ func minVal(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// responseWriterWrapper wraps http.ResponseWriter to capture the status code
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *responseWriterWrapper) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
 }

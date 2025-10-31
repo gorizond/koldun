@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 )
@@ -24,6 +26,7 @@ type Config struct {
 	StateSubjectPrefix  string
 	QueueGroup          string
 	AckWait             time.Duration
+	MetricsAddr         string // Address for metrics HTTP server (e.g., ":9090")
 	Logger              *logrus.Entry
 }
 
@@ -44,7 +47,8 @@ type Server struct {
 	inflight      map[string]*assignment
 	lastNoIdleLog time.Time
 
-	retryConfig RetryConfig
+	retryConfig   RetryConfig
+	metricsServer *http.Server
 }
 
 type workerState struct {
@@ -135,6 +139,40 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Run(ctx context.Context) error {
 	defer s.nc.Drain()
 
+	// Start metrics server if configured
+	if s.cfg.MetricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler())
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("ok"))
+		})
+
+		s.metricsServer = &http.Server{
+			Addr:    s.cfg.MetricsAddr,
+			Handler: mux,
+		}
+
+		go func() {
+			s.log.Infof("metrics server listening on %s", s.cfg.MetricsAddr)
+			if err := s.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				s.log.WithError(err).Error("metrics server error")
+			}
+		}()
+
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := s.metricsServer.Shutdown(shutdownCtx); err != nil {
+				s.log.WithError(err).Warn("metrics server shutdown error")
+			}
+		}()
+	}
+
+	// Track connection status
+	metrics.NATSConnectionStatus.WithLabelValues(s.cfg.NATSURL).Set(1)
+	defer metrics.NATSConnectionStatus.WithLabelValues(s.cfg.NATSURL).Set(0)
+
 	if err := s.startStateSubscription(); err != nil {
 		return err
 	}
@@ -144,6 +182,9 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	s.recoverAssignments()
+
+	// Start metrics update goroutine
+	go s.updateMetricsPeriodically(ctx)
 
 	<-ctx.Done()
 	return nil
@@ -436,4 +477,40 @@ func sanitizeIdentifier(value string) string {
 
 func newAssignmentID() string {
 	return fmt.Sprintf("assign-%d", time.Now().UnixNano())
+}
+
+func (s *Server) updateMetricsPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.updateMetrics()
+		}
+	}
+}
+
+func (s *Server) updateMetrics() {
+	s.mu.Lock()
+	activeWorkers := 0
+	for _, st := range s.workers {
+		if strings.ToLower(st.state) == "idle" && st.active == 0 {
+			activeWorkers++
+		}
+	}
+	inflightCount := len(s.inflight)
+	s.mu.Unlock()
+
+	metrics.DispatcherWorkersActive.Set(float64(activeWorkers))
+	metrics.DispatcherAssignmentsInflight.Set(float64(inflightCount))
+
+	// Update backlog size if possible
+	if s.backlogSub != nil {
+		if pending, _, err := s.backlogSub.Pending(); err == nil {
+			metrics.DispatcherBacklogSize.Set(float64(pending))
+		}
+	}
 }

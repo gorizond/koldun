@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 )
@@ -40,16 +41,25 @@ func PublishWithRetry(nc *nats.Conn, subject string, data []byte, cfg RetryConfi
 	backoff := cfg.InitialBackoff
 
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		start := time.Now()
 		err := nc.Publish(subject, data)
+		metrics.NATSOperationDuration.WithLabelValues("publish").Observe(time.Since(start).Seconds())
+
 		if err == nil {
-			if attempt > 0 && log != nil {
-				log.WithFields(logrus.Fields{
-					"subject": subject,
-					"attempt": attempt + 1,
-				}).Debug("publish succeeded after retry")
+			metrics.NATSOperationsTotal.WithLabelValues("publish", "success").Inc()
+			if attempt > 0 {
+				metrics.NATSRetries.WithLabelValues("publish").Add(float64(attempt))
+				if log != nil {
+					log.WithFields(logrus.Fields{
+						"subject": subject,
+						"attempt": attempt + 1,
+					}).Debug("publish succeeded after retry")
+				}
 			}
 			return nil
 		}
+
+		metrics.NATSOperationsTotal.WithLabelValues("publish", "error").Inc()
 
 		lastErr = err
 
@@ -105,20 +115,36 @@ func KVPutWithRetry(kv nats.KeyValue, key string, value []byte, cfg RetryConfig,
 		return 0, errors.New("key is empty")
 	}
 
+	bucketName := "unknown"
+	if kv != nil {
+		if status, err := kv.Status(); err == nil {
+			bucketName = status.Bucket()
+		}
+	}
+
 	var lastErr error
 	backoff := cfg.InitialBackoff
 
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		start := time.Now()
 		rev, err := kv.Put(key, value)
+		metrics.NATSKVOperationDuration.WithLabelValues("put", bucketName).Observe(time.Since(start).Seconds())
+
 		if err == nil {
-			if attempt > 0 && log != nil {
-				log.WithFields(logrus.Fields{
-					"key":     key,
-					"attempt": attempt + 1,
-				}).Debug("KV put succeeded after retry")
+			metrics.NATSKVOperations.WithLabelValues("put", bucketName, "success").Inc()
+			if attempt > 0 {
+				metrics.NATSRetries.WithLabelValues("kv_put").Add(float64(attempt))
+				if log != nil {
+					log.WithFields(logrus.Fields{
+						"key":     key,
+						"attempt": attempt + 1,
+					}).Debug("KV put succeeded after retry")
+				}
 			}
 			return rev, nil
 		}
+
+		metrics.NATSKVOperations.WithLabelValues("put", bucketName, "error").Inc()
 
 		lastErr = err
 
@@ -172,21 +198,37 @@ func KVDeleteWithRetry(kv nats.KeyValue, key string, cfg RetryConfig, log *logru
 		return errors.New("key is empty")
 	}
 
+	bucketName := "unknown"
+	if kv != nil {
+		if status, err := kv.Status(); err == nil {
+			bucketName = status.Bucket()
+		}
+	}
+
 	var lastErr error
 	backoff := cfg.InitialBackoff
 
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
+		start := time.Now()
 		err := kv.Delete(key)
+		metrics.NATSKVOperationDuration.WithLabelValues("delete", bucketName).Observe(time.Since(start).Seconds())
+
 		if err == nil || errors.Is(err, nats.ErrKeyNotFound) {
 			// Success or key doesn't exist (idempotent)
-			if attempt > 0 && log != nil {
-				log.WithFields(logrus.Fields{
-					"key":     key,
-					"attempt": attempt + 1,
-				}).Debug("KV delete succeeded after retry")
+			metrics.NATSKVOperations.WithLabelValues("delete", bucketName, "success").Inc()
+			if attempt > 0 {
+				metrics.NATSRetries.WithLabelValues("kv_delete").Add(float64(attempt))
+				if log != nil {
+					log.WithFields(logrus.Fields{
+						"key":     key,
+						"attempt": attempt + 1,
+					}).Debug("KV delete succeeded after retry")
+				}
 			}
 			return nil
 		}
+
+		metrics.NATSKVOperations.WithLabelValues("delete", bucketName, "error").Inc()
 
 		lastErr = err
 
