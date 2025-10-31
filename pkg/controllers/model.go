@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -13,8 +11,6 @@ import (
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	corectlv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/rancher/wrangler/v3/pkg/generic"
@@ -295,110 +291,6 @@ func (h *modelHandler) ensureScriptConfigMap(obj *v1.Model) error {
 	}
 
 	klog.V(1).Infof("Model %s/%s: successfully created script ConfigMap %s", obj.Namespace, obj.Name, scriptName)
-	return nil
-}
-
-func (h *modelHandler) ensureObjectStorageBuckets(obj *v1.Model) error {
-	if !h.ensureBuckets {
-		return nil
-	}
-
-	storage := obj.Spec.ObjectStorage
-	if storage == nil {
-		return nil
-	}
-
-	endpoint := strings.TrimSpace(storage.Endpoint)
-	buckets := uniqueNonEmpty(storage.BucketForSource, storage.BucketForConvert)
-	if endpoint == "" || len(buckets) == 0 {
-		return nil
-	}
-
-	if storage.SecretRef == nil {
-		klog.V(2).Infof("Model %s/%s: objectStorage.secretRef not set, skipping bucket ensure", obj.Namespace, obj.Name)
-		return nil
-	}
-
-	secretNamespace := storage.SecretRef.Namespace
-	if strings.TrimSpace(secretNamespace) == "" {
-		secretNamespace = obj.Namespace
-	}
-
-	secret, err := h.secrets.Cache().Get(secretNamespace, storage.SecretRef.Name)
-	if err != nil {
-		return fmt.Errorf("fetch object storage secret %s/%s: %w", secretNamespace, storage.SecretRef.Name, err)
-	}
-
-	accessKey := valueFromSecret(secret, "AWS_ACCESS_KEY_ID", "aws_access_key_id")
-	secretKey := valueFromSecret(secret, "AWS_SECRET_ACCESS_KEY", "aws_secret_access_key")
-	sessionToken := valueFromSecret(secret, "AWS_SESSION_TOKEN", "aws_session_token")
-	region := valueFromSecret(secret, "AWS_REGION", "AWS_DEFAULT_REGION", "aws_region", "aws_default_region")
-
-	if accessKey == "" || secretKey == "" {
-		return fmt.Errorf("secret %s/%s missing AWS credentials", secretNamespace, storage.SecretRef.Name)
-	}
-
-	parsedEndpoint, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("parse object storage endpoint %q: %w", endpoint, err)
-	}
-	host := parsedEndpoint.Host
-	if host == "" {
-		host = parsedEndpoint.Path
-	}
-	if host == "" {
-		return fmt.Errorf("object storage endpoint %q missing host", endpoint)
-	}
-
-	secure := true
-	switch strings.ToLower(parsedEndpoint.Scheme) {
-	case "http":
-		secure = false
-	case "https", "":
-		secure = true
-	default:
-		secure = parsedEndpoint.Scheme != "http"
-	}
-
-	client, err := minio.New(host, &minio.Options{
-		Creds:        credentials.NewStaticV4(accessKey, secretKey, sessionToken),
-		Secure:       secure,
-		Region:       region,
-		BucketLookup: minio.BucketLookupPath,
-	})
-	if err != nil {
-		return fmt.Errorf("initialise object storage client: %w", err)
-	}
-
-	for _, bucket := range buckets {
-		ctx, cancel := context.WithTimeout(h.ctx, bucketEnsureTimeout)
-		exists, err := client.BucketExists(ctx, bucket)
-		cancel()
-		if err != nil {
-			return fmt.Errorf("check bucket %s existence: %w", bucket, err)
-		}
-		if exists {
-			continue
-		}
-
-		opts := minio.MakeBucketOptions{}
-		if region != "" {
-			opts.Region = region
-		}
-		ctx, cancel = context.WithTimeout(h.ctx, bucketEnsureTimeout)
-		err = client.MakeBucket(ctx, bucket, opts)
-		cancel()
-		if err != nil {
-			resp := minio.ToErrorResponse(err)
-			if resp.Code == "BucketAlreadyOwnedByYou" || resp.Code == "BucketAlreadyExists" {
-				klog.V(2).Infof("Model %s/%s: bucket %s already present", obj.Namespace, obj.Name, bucket)
-				continue
-			}
-			return fmt.Errorf("create bucket %s: %w", bucket, err)
-		}
-		klog.Infof("Model %s/%s: created object storage bucket %s", obj.Namespace, obj.Name, bucket)
-	}
-
 	return nil
 }
 
@@ -2039,74 +1931,6 @@ func parseSizeMeasurement(payload string) (*sizeMeasurement, error) {
 	return &result, nil
 }
 
-func modelObjectKey(model *v1.Model) string {
-	pathValue := strings.TrimSpace(model.Spec.LocalPath)
-	if pathValue == "" {
-		return ""
-	}
-	if _, key, ok := parseS3Path(pathValue); ok {
-		return strings.TrimLeft(key, "/")
-	}
-	return strings.TrimLeft(pathValue, "/")
-}
-
-func conversionPaths(model *v1.Model, spec *v1.ModelConversionSpec, defaultInputKey string) (workDir string, bucket string, key string, uri string) {
-	workDir = "/workspace/hf"
-	storage := model.Spec.ObjectStorage
-	if storage != nil {
-		bucket = strings.TrimSpace(storage.BucketForConvert)
-		if bucket == "" {
-			bucket = storage.BucketForSource
-		}
-	}
-	baseKey := strings.TrimLeft(path.Join(defaultInputKey, "converted", spec.WeightsFloatType), "/")
-	if spec.WeightsFloatType == "" {
-		baseKey = strings.TrimLeft(path.Join(defaultInputKey, "converted", defaultWeightsType), "/")
-	}
-
-	if strings.TrimSpace(spec.OutputPath) != "" {
-		if b, k, ok := parseS3Path(spec.OutputPath); ok {
-			if b != "" {
-				bucket = b
-			}
-			if k != "" {
-				baseKey = strings.TrimLeft(k, "/")
-			} else {
-				baseKey = ""
-			}
-		} else {
-			clean := spec.OutputPath
-			if !strings.HasPrefix(clean, "/") {
-				clean = filepath.Join("/workspace", clean)
-			}
-			workDir = filepath.Clean(clean)
-		}
-	}
-
-	key = strings.TrimLeft(baseKey, "/")
-	if key != "" {
-		key = strings.TrimLeft(path.Join(key, model.Name), "/")
-	} else {
-		key = strings.TrimLeft(path.Join(defaultInputKey, "converted", model.Name), "/")
-	}
-
-	trimmedKey := strings.TrimLeft(key, "/")
-	if bucket != "" && trimmedKey != "" {
-		uri = fmt.Sprintf("s3://%s/%s", bucket, trimmedKey)
-	} else if bucket != "" {
-		uri = fmt.Sprintf("s3://%s", bucket)
-	}
-	return workDir, bucket, trimmedKey, uri
-}
-
-func splitKey(key string) (string, string) {
-	parts := strings.SplitN(key, "/", 2)
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return parts[0], parts[1]
-}
-
 func modelNameFromJob(jobName string) string {
 	if strings.HasSuffix(jobName, jobSuffixDownload) {
 		name := strings.TrimSuffix(jobName, jobSuffixDownload)
@@ -2121,22 +1945,6 @@ func modelNameFromJob(jobName string) string {
 		}
 	}
 	return ""
-}
-
-func parseS3Path(value string) (bucket string, key string, ok bool) {
-	if !strings.HasPrefix(value, "s3://") {
-		return "", "", false
-	}
-	trimmed := strings.TrimPrefix(value, "s3://")
-	parts := strings.SplitN(trimmed, "/", 2)
-	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
-		return "", "", false
-	}
-	bucket = parts[0]
-	if len(parts) > 1 {
-		key = strings.TrimLeft(parts[1], "/")
-	}
-	return bucket, key, true
 }
 
 func hasCondition(conditions []metav1.Condition, condType string) bool {
