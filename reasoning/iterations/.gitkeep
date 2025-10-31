@@ -1,0 +1,3 @@
+# Directory for iteration results
+# Files here follow the pattern: YYYY-MM-DD_session_N.md
+# Private/local iterations can use _local or _private suffix to be ignored by git
