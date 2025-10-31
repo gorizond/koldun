@@ -1,0 +1,13 @@
+# Временные файлы и личные заметки
+iterations/*_local.md
+iterations/*_private.md
+*.tmp
+*.bak
+.DS_Store
+
+# Результаты анализа с личными путями
+*_analysis_*.md
+
+# Локальные конфиги
+.env
+config.local.yaml
