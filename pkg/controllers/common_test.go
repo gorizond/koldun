@@ -400,4 +400,18 @@ func TestDllamaNameForSession(t *testing.T) {
 			t.Errorf("dllamaNameForSession() length = %d, want <= 63", len(got))
 		}
 	})
+
+	t.Run("negative ordinal", func(t *testing.T) {
+		got := dllamaNameForSession("test", -1)
+		if got != "test-dllama--1" {
+			t.Errorf("dllamaNameForSession() = %s, want test-dllama--1", got)
+		}
+	})
+
+	t.Run("empty session name", func(t *testing.T) {
+		got := dllamaNameForSession("", 0)
+		if got != "-dllama-0" {
+			t.Errorf("dllamaNameForSession() = %s, want -dllama-0", got)
+		}
+	})
 }

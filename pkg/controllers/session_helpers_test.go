@@ -335,3 +335,119 @@ func TestEnsureOwnerReference(t *testing.T) {
 func boolPtr(b bool) *bool {
 	return pointer.Bool(b)
 }
+
+func TestSanitizeIdentifier(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "whitespace only",
+			input:    "   ",
+			expected: "",
+		},
+		{
+			name:     "alphanumeric only",
+			input:    "abc123XYZ",
+			expected: "abc123XYZ",
+		},
+		{
+			name:     "with hyphens and underscores",
+			input:    "my-test_id-123",
+			expected: "my-test_id-123",
+		},
+		{
+			name:     "special characters replaced",
+			input:    "hello@world.com",
+			expected: "hello-world-com",
+		},
+		{
+			name:     "mixed special characters",
+			input:    "test!@#$%value",
+			expected: "test-----value",
+		},
+		{
+			name:     "unicode characters replaced",
+			input:    "café-日本語",
+			expected: "caf-----",
+		},
+		{
+			name:     "leading and trailing spaces",
+			input:    "  test-123  ",
+			expected: "test-123",
+		},
+		{
+			name:     "spaces replaced with hyphens",
+			input:    "hello world test",
+			expected: "hello-world-test",
+		},
+		{
+			name:     "all special characters",
+			input:    "!@#$%^&*()",
+			expected: "----------",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizeIdentifier(tt.input)
+			if result != tt.expected {
+				t.Errorf("sanitizeIdentifier(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestReplicaPowerOrDefault(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    int32
+		expected int32
+	}{
+		{
+			name:     "zero returns default",
+			input:    0,
+			expected: 1,
+		},
+		{
+			name:     "negative returns default",
+			input:    -1,
+			expected: 1,
+		},
+		{
+			name:     "large negative returns default",
+			input:    -100,
+			expected: 1,
+		},
+		{
+			name:     "positive value unchanged",
+			input:    5,
+			expected: 5,
+		},
+		{
+			name:     "one unchanged",
+			input:    1,
+			expected: 1,
+		},
+		{
+			name:     "large positive unchanged",
+			input:    1000,
+			expected: 1000,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := replicaPowerOrDefault(tt.input)
+			if result != tt.expected {
+				t.Errorf("replicaPowerOrDefault(%d) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

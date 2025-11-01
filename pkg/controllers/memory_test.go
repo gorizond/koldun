@@ -157,11 +157,22 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			wantOk:              false,
 		},
 		{
-			name:                "zero workers returns not ok",
+			name:                "negative workers returns not ok",
 			conversionSizeBytes: 1024 * 1024 * 1024,
 			workerReplicas:      -1,
 			override:            nil,
 			wantOk:              false,
+		},
+		{
+			name:                "zero workers with valid size",
+			conversionSizeBytes: 1024 * 1024 * 1024,
+			workerReplicas:      0,
+			override:            nil,
+			wantRootMiMin:       1500,
+			wantRootMiMax:       1600,
+			wantWorkerMiMin:     1100,
+			wantWorkerMiMax:     1200,
+			wantOk:              true,
 		},
 		{
 			name:                "tiny model rounds up to minimum",
