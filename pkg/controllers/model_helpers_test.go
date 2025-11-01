@@ -158,6 +158,34 @@ func TestEffectiveConversionSpec(t *testing.T) {
 				ConvertWeights:   "Q8_0",
 			},
 		},
+		{
+			name: "whitespace ConvertWeights uses WeightsFloatType",
+			spec: &v1.ModelConversionSpec{
+				WeightsFloatType: "Q4_0",
+				ConvertWeights:   "  ",
+			},
+			expected: &v1.ModelConversionSpec{
+				Image:            defaultConversionImage,
+				WeightsFloatType: "Q4_0",
+				Memory:           "2Gi",
+				ConverterVersion: "v0.16.2",
+				ConvertWeights:   "Q4_0",
+			},
+		},
+		{
+			name: "whitespace ConvertWeights and empty WeightsFloatType uses default",
+			spec: &v1.ModelConversionSpec{
+				WeightsFloatType: "",
+				ConvertWeights:   "  ",
+			},
+			expected: &v1.ModelConversionSpec{
+				Image:            defaultConversionImage,
+				WeightsFloatType: defaultWeightsType,
+				Memory:           "2Gi",
+				ConverterVersion: "v0.16.2",
+				ConvertWeights:   defaultWeightsType,
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -238,6 +238,32 @@ func TestIsJobFinished(t *testing.T) {
 			},
 			want: false,
 		},
+		{
+			name: "job marked for deletion",
+			job: &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					DeletionTimestamp: &metav1.Time{},
+				},
+				Status: batchv1.JobStatus{
+					Active: 1,
+				},
+			},
+			want: true,
+		},
+		{
+			name: "job condition false status",
+			job: &batchv1.Job{
+				Status: batchv1.JobStatus{
+					Conditions: []batchv1.JobCondition{
+						{
+							Type:   batchv1.JobComplete,
+							Status: corev1.ConditionFalse,
+						},
+					},
+				},
+			},
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
