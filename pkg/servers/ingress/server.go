@@ -2,6 +2,7 @@ package ingress
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -585,7 +586,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash, err := conversationHashFromHeaders(r)
+	hash, err := conversationHashFromHeaders(r, s.cfg.HashSecret)
 	if err != nil {
 		s.log.WithError(err).Warn("conversation hash from headers")
 		writeError(w, http.StatusBadRequest, "failed to derive conversation id")
@@ -1806,7 +1807,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func conversationHashFromHeaders(r *http.Request) (string, error) {
+func conversationHashFromHeaders(r *http.Request, secret []byte) (string, error) {
 	pairs := make([]string, 0, len(r.Header))
 	for name, values := range r.Header {
 		lower := strings.ToLower(name)
@@ -1829,8 +1830,14 @@ func conversationHashFromHeaders(r *http.Request) (string, error) {
 		return "", fmt.Errorf("no identifying headers provided")
 	}
 	sort.Strings(pairs)
-	sum := sha256.Sum256([]byte(strings.Join(pairs, "&")))
-	return hex.EncodeToString(sum[:]), nil
+	message := []byte(strings.Join(pairs, "&"))
+	if len(secret) == 0 {
+		sum := sha256.Sum256(message)
+		return hex.EncodeToString(sum[:]), nil
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
 func minVal(a, b int) int {
