@@ -1,5 +1,6 @@
 .gocache
 .idea
 /operator
-
 coverage.out
+
+reasoning
