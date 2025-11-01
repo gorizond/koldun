@@ -425,7 +425,7 @@ func TestServer_ConcurrentRequests(t *testing.T) {
 func TestServer_Run_ServerClosedError(t *testing.T) {
 	// Test that ErrServerClosed is handled properly
 	health := controllers.NewHealth()
-	server := &Server{
+	_ = &Server{
 		cfg: Config{
 			Health: health,
 		},
@@ -434,7 +434,7 @@ func TestServer_Run_ServerClosedError(t *testing.T) {
 	}
 
 	// Create a context that's already cancelled
-	ctx, cancel := context.WithCancel(context.Background())
+	_, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	// Mock the error channel to return ErrServerClosed
