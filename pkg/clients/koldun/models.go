@@ -26,6 +26,9 @@ type ModelClient struct {
 
 // NewModelClient creates a Model client using the supplied Kubernetes REST config.
 func NewModelClient(cfg *rest.Config) (*ModelClient, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("rest config cannot be nil")
+	}
 	dyn, err := dynamic.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build dynamic client: %w", err)

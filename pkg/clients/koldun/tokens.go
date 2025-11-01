@@ -19,6 +19,9 @@ type TokenClient struct {
 
 // NewTokenClient creates a token Secret client using the supplied Kubernetes REST config.
 func NewTokenClient(cfg *rest.Config) (*TokenClient, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("rest config cannot be nil")
+	}
 	client, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build kubernetes client: %w", err)
