@@ -294,4 +294,35 @@ if cfg == nil {
 - ingress/server_test.go: +299 строк расширений
 - **Итого: ~1331 строк новых тестов**
 
-**Следующая цель:** 40% покрытия (фокус на оставшихся server handlers)
+**UPDATE Session 15: 43.0% ✅ (handleChatCompletions + handleMessage tests)**
+
+После Session 14 были добавлены критические тесты для основных request handlers:
+
+**Прогресс покрытия:**
+- Session 14: 37.6%
+- **Session 15: 43.0%** ✅ (+5.4pp) **MILESTONE 40%+ ДОСТИГНУТ!**
+
+**Новые тесты (333 строки):**
+- ingress/server_test.go: +201 строка
+  - TestHandleChatCompletionsRequiresToken
+  - TestHandleChatCompletionsRejectsInvalidToken
+  - TestHandleChatCompletionsPublishesAndResponds
+- llm/server_test.go: +132 строки
+  - TestHandleMessagePublishesStateAndResponse
+
+**Покрытие по пакетам (финальное):**
+- **Ingress**: 28.7% → **52.2%** (+23.5pp) 🚀
+- **LLM**: 22.8% → **36.4%** (+13.6pp) 🚀
+- **Dispatcher**: 68.3% (стабильно)
+- **Controllers**: 23.9% (стабильно)
+- **Operator**: 94.9% (стабильно)
+- **Tokens**: 95.0% (стабильно)
+- **Clients**: 89.6% (стабильно)
+
+**Общий прогресс итерации 4:**
+- **Начало:** 21.8%
+- **Финал:** 43.0%
+- **Прирост:** +21.2pp (+97% относительный рост)
+- **Добавлено:** ~1664 строк тестового кода
+
+**Следующая цель:** 45-50% покрытия (envtest для controller reconciliation loops)
