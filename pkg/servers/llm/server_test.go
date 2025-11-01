@@ -386,6 +386,56 @@ func TestStartHeartbeatLoopPublishesIdleImmediately(t *testing.T) {
 	srv.wg.Wait()
 }
 
+func TestStartHeartbeatLoopPublishesPeriodicIdleState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	delay := 25 * time.Millisecond
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName:        "dllama-heartbeat",
+			HeartbeatInterval: delay,
+		},
+		nc:           nc,
+		log:          logrus.NewEntry(logger),
+		stateSubject: "sessions.hash.dllama.worker.state",
+	}
+
+	sub, err := nc.SubscribeSync("sessions.hash.dllama.worker.state")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	srv.startHeartbeatLoop(ctx)
+
+	first, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+
+	second, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+
+	var immediate conversation.WorkerStateEvent
+	require.NoError(t, json.Unmarshal(first.Data, &immediate))
+	require.Equal(t, "idle", immediate.State)
+	require.Equal(t, "dllama-heartbeat", immediate.Dllama)
+
+	var periodic conversation.WorkerStateEvent
+	require.NoError(t, json.Unmarshal(second.Data, &periodic))
+	require.Equal(t, "idle", periodic.State)
+	require.Equal(t, "dllama-heartbeat", periodic.Dllama)
+
+	cancel()
+	srv.wg.Wait()
+}
+
 func startJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
 

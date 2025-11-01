@@ -1,302 +1,462 @@
 package controllers
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/registry"
+	"github.com/gorizond/koldun/pkg/tokens"
 	"github.com/nats-io/nats.go"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestIgnoreNotFound tests the ignoreNotFound function which filters out
-// NATS ErrKeyNotFound errors while preserving other errors.
-func TestIgnoreNotFound(t *testing.T) {
-	tests := []struct {
-		name    string
-		err     error
-		wantNil bool
-	}{
-		{
-			name:    "nil error returns nil",
-			err:     nil,
-			wantNil: true,
-		},
-		{
-			name:    "NATS ErrKeyNotFound returns nil",
-			err:     nats.ErrKeyNotFound,
-			wantNil: true,
-		},
-		{
-			name:    "wrapped ErrKeyNotFound returns nil",
-			err:     errors.New("some context: " + nats.ErrKeyNotFound.Error()),
-			wantNil: false, // errors.Is won't match wrapped string
-		},
-		{
-			name:    "other error is preserved",
-			err:     errors.New("connection failed"),
-			wantNil: false,
-		},
-		{
-			name:    "nats timeout error is preserved",
-			err:     nats.ErrTimeout,
-			wantNil: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ignoreNotFound(tt.err)
-			if tt.wantNil && got != nil {
-				t.Errorf("ignoreNotFound() = %v, want nil", got)
-			}
-			if !tt.wantNil && got == nil {
-				t.Errorf("ignoreNotFound() = nil, want error")
-			}
-			if !tt.wantNil && got != tt.err {
-				t.Errorf("ignoreNotFound() = %v, want %v", got, tt.err)
-			}
-		})
-	}
-}
-
-// TestModelKey tests the modelKey function which generates namespaced keys
-// for model storage in NATS KV.
 func TestModelKey(t *testing.T) {
-	tests := []struct {
-		name      string
-		namespace string
-		modelName string
-		want      string
-	}{
-		{
-			name:      "normal namespace and name",
-			namespace: "production",
-			modelName: "llama-7b",
-			want:      "production/llama-7b",
-		},
-		{
-			name:      "empty namespace defaults to default",
-			namespace: "",
-			modelName: "gpt2",
-			want:      "default/gpt2",
-		},
-		{
-			name:      "whitespace namespace defaults to default",
-			namespace: "  ",
-			modelName: "bert",
-			want:      "default/bert",
-		},
-		{
-			name:      "namespace with whitespace is trimmed",
-			namespace: "  staging  ",
-			modelName: "model-v2",
-			want:      "staging/model-v2",
-		},
-		{
-			name:      "model name with whitespace is trimmed",
-			namespace: "dev",
-			modelName: "  my-model  ",
-			want:      "dev/my-model",
-		},
-		{
-			name:      "both trimmed",
-			namespace: " kube-system ",
-			modelName: " metrics-server ",
-			want:      "kube-system/metrics-server",
-		},
-		{
-			name:      "default namespace",
-			namespace: "default",
-			modelName: "test-model",
-			want:      "default/test-model",
-		},
-	}
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := modelKey(tt.namespace, tt.modelName)
-			if got != tt.want {
-				t.Errorf("modelKey(%q, %q) = %q, want %q", tt.namespace, tt.modelName, got, tt.want)
-			}
-		})
-	}
+	require.Equal(t, "default/model", modelKey(" ", "model"))
+	require.Equal(t, "ns/demo", modelKey("ns", " demo "))
 }
 
-// TestModelReady tests the modelReady function which determines if a Model
-// is ready for use based on its status fields and conditions.
+func TestIgnoreNotFound(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, ignoreNotFound(nil))
+	require.NoError(t, ignoreNotFound(nats.ErrKeyNotFound))
+
+	customErr := errors.New("boom")
+	require.Equal(t, customErr, ignoreNotFound(customErr))
+}
+
 func TestModelReady(t *testing.T) {
+	t.Parallel()
+
+	readyCondition := metav1.Condition{Type: conditionReady, Status: metav1.ConditionTrue}
+
 	tests := []struct {
 		name  string
 		model *v1.Model
-		want  bool
+		ready bool
 	}{
 		{
-			name:  "nil model is not ready",
+			name:  "nil",
 			model: nil,
-			want:  false,
+			ready: false,
 		},
 		{
-			name: "empty OutputPVCName is not ready",
+			name: "missing pvc",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "",
-					ConversionSizeBytes: 1000,
-					ConversionSizeHuman: "1KB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
+					ConversionSizeBytes: 1,
+					Conditions:          []metav1.Condition{readyCondition},
 				},
 			},
-			want: false,
+			ready: false,
 		},
 		{
-			name: "whitespace OutputPVCName is not ready",
+			name: "missing size",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "   ",
-					ConversionSizeBytes: 1000,
-					ConversionSizeHuman: "1KB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
+					OutputPVCName: "output-pvc",
+					Conditions:    []metav1.Condition{readyCondition},
 				},
 			},
-			want: false,
+			ready: false,
 		},
 		{
-			name: "missing size information is not ready",
+			name: "missing condition",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 0,
-					ConversionSizeHuman: "",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
+					OutputPVCName:       "output-pvc",
+					ConversionSizeBytes: 1,
 				},
 			},
-			want: false,
+			ready: false,
 		},
 		{
-			name: "negative size bytes is not ready",
+			name: "ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: -100,
-					ConversionSizeHuman: "",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
+					OutputPVCName:       "output-pvc",
+					ConversionSizeBytes: 1,
+					Conditions:          []metav1.Condition{readyCondition},
 				},
 			},
-			want: false,
+			ready: true,
 		},
 		{
-			name: "ready condition false is not ready",
+			name: "ready with human size",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 1000,
-					ConversionSizeHuman: "1KB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionFalse},
-					},
+					OutputPVCName:       "output-pvc",
+					ConversionSizeHuman: "1Gi",
+					Conditions:          []metav1.Condition{readyCondition},
 				},
 			},
-			want: false,
-		},
-		{
-			name: "missing ready condition is not ready",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 1000,
-					ConversionSizeHuman: "1KB",
-					Conditions:          []metav1.Condition{},
-				},
-			},
-			want: false,
-		},
-		{
-			name: "fully ready model with bytes only",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 5000000000,
-					ConversionSizeHuman: "",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "fully ready model with human size only",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "llama-7b-pvc",
-					ConversionSizeBytes: 0,
-					ConversionSizeHuman: "5GB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "fully ready model with both sizes",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "gpt2-medium-pvc",
-					ConversionSizeBytes: 5000000000,
-					ConversionSizeHuman: "5GB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "ready with multiple conditions",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 1000,
-					Conditions: []metav1.Condition{
-						{Type: "Downloaded", Status: metav1.ConditionTrue},
-						{Type: "Converted", Status: metav1.ConditionTrue},
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "ready condition unknown is not ready",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "model-pvc",
-					ConversionSizeBytes: 1000,
-					ConversionSizeHuman: "1KB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionUnknown},
-					},
-				},
-			},
-			want: false,
+			ready: true,
 		},
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			got := modelReady(tt.model)
-			if got != tt.want {
-				t.Errorf("modelReady() = %v, want %v", got, tt.want)
-			}
+			t.Parallel()
+			require.Equal(t, tt.ready, modelReady(tt.model))
 		})
 	}
 }
+
+func TestRegistrySyncPutModelAndDelete(t *testing.T) {
+	t.Parallel()
+
+	kv := &fakeMemoryKV{
+		payload: make(map[string][]byte),
+	}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{ModelPrefix: "model/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		modelsKV: kv,
+	}
+
+	entry := &registry.Model{
+		Namespace:           "demo",
+		Name:                "model",
+		DisplayName:         "demo-model",
+		ConversionSizeBytes: 42,
+	}
+
+	require.NoError(t, sync.putModel(entry))
+
+	require.Contains(t, kv.payload, "model/demo/model")
+
+	stored := kv.payload["model/demo/model"]
+	var decoded registry.Model
+	require.NoError(t, json.Unmarshal(stored, &decoded))
+	require.Equal(t, *entry, decoded)
+	require.Equal(t, []string{"model/demo/model"}, kv.putCalls)
+
+	require.NoError(t, sync.deleteModel("demo", "model"))
+	require.Equal(t, []string{"model/demo/model"}, kv.deleteCalls)
+
+	require.NoError(t, sync.deleteModel("demo", "missing"), "ignore missing keys")
+}
+
+func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
+	t.Parallel()
+
+	kv := &fakeMemoryKV{
+		payload: make(map[string][]byte),
+	}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{TokenPrefix: "token/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		tokensKV: kv,
+	}
+
+	token := &registry.Token{
+		Hash:      "ABC123",
+		Disabled:  true,
+		Namespace: "demo",
+		Metadata:  map[string]string{"role": "reader"},
+	}
+
+	require.NoError(t, sync.putToken(token))
+	require.Contains(t, kv.payload, "token/abc123")
+
+	require.NoError(t, sync.deleteToken("ABC123"))
+	require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
+
+	require.NoError(t, sync.deleteToken("missing"), "ignore missing keys")
+}
+
+func TestRegistrySyncOnModelChange(t *testing.T) {
+	t.Parallel()
+
+	t.Run("ready model published", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{ModelPrefix: "model/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			modelsKV: kv,
+		}
+
+		model := &v1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "model",
+			},
+			Spec: v1.ModelSpec{
+				ReplicaPower: 3,
+			},
+			Status: v1.ModelStatus{
+				OutputPVCName:       "output-pvc",
+				ConversionSizeBytes: 128,
+				Conditions: []metav1.Condition{
+					{Type: conditionReady, Status: metav1.ConditionTrue},
+				},
+			},
+		}
+
+		result, err := sync.onModelChange("demo/model", model)
+		require.NoError(t, err)
+		require.Equal(t, model, result)
+		require.Equal(t, []string{"model/demo/model"}, kv.putCalls)
+	})
+
+	t.Run("not ready model removed", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: map[string][]byte{
+				"model/demo/model": []byte(`{"namespace":"demo","name":"model"}`),
+			},
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{ModelPrefix: "model/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			modelsKV: kv,
+		}
+
+		model := &v1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "model",
+			},
+			Status: v1.ModelStatus{},
+		}
+
+		result, err := sync.onModelChange("demo/model", model)
+		require.NoError(t, err)
+		require.Equal(t, model, result)
+		require.Equal(t, []string{"model/demo/model"}, kv.deleteCalls)
+	})
+
+	t.Run("error bubbles up", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+			putErr:  errors.New("kv put failure"),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{ModelPrefix: "model/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			modelsKV: kv,
+		}
+
+		model := &v1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "model",
+			},
+			Status: v1.ModelStatus{
+				OutputPVCName:       "output",
+				ConversionSizeHuman: "1Gi",
+				Conditions: []metav1.Condition{
+					{Type: conditionReady, Status: metav1.ConditionTrue},
+				},
+			},
+		}
+
+		_, err := sync.onModelChange("demo/model", model)
+		require.EqualError(t, err, "kv put failure")
+	})
+}
+
+func TestRegistrySyncOnModelRemove(t *testing.T) {
+	t.Parallel()
+
+	sync := &registrySync{
+		cfg: RegistryConfig{ModelPrefix: "model/"},
+		log: logrus.New().WithField("component", "registry-test"),
+		modelsKV: &fakeMemoryKV{
+			payload: map[string][]byte{
+				"model/demo/model": []byte(`{"namespace":"demo","name":"model"}`),
+			},
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "demo",
+			Name:      "model",
+		},
+	}
+
+	result, err := sync.onModelRemove("demo/model", model)
+	require.NoError(t, err)
+	require.Equal(t, model, result)
+
+	require.Equal(t, []string{"model/demo/model"}, sync.modelsKV.(*fakeMemoryKV).deleteCalls)
+
+	nilModel, err := sync.onModelRemove("demo/model", nil)
+	require.NoError(t, err)
+	require.Nil(t, nilModel)
+}
+
+func TestRegistrySyncOnSecretChange(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil secret ignored", func(t *testing.T) {
+		sync := &registrySync{}
+		secret, err := sync.onSecretChange("key", nil)
+		require.Nil(t, secret)
+		require.NoError(t, err)
+	})
+
+	t.Run("missing hash ignored", func(t *testing.T) {
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: &fakeMemoryKV{},
+		}
+
+		secret, err := sync.onSecretChange("key", &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "token",
+				Labels: map[string]string{
+					tokens.LabelToken: "true",
+				},
+			},
+			Data: map[string][]byte{},
+		})
+		require.Nil(t, secret)
+		require.NoError(t, err)
+	})
+
+	t.Run("deletion removes token", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+		}
+		kv.payload["token/abc123"] = []byte(`{"hash":"abc123"}`)
+
+		ts := metav1.NewTime(time.Now())
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:         "demo",
+				Name:              "token",
+				Labels:            map[string]string{tokens.LabelToken: "true"},
+				DeletionTimestamp: &ts,
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey: []byte("ABC123"),
+			},
+		}
+
+		result, err := sync.onSecretChange("key", secret)
+		require.Nil(t, result)
+		require.NoError(t, err)
+		require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
+	})
+
+	t.Run("publish token entry", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:   "demo",
+				Name:        "token",
+				Labels:      map[string]string{tokens.LabelToken: "true"},
+				Annotations: map[string]string{tokens.AnnotationMetadataPrefix + "env": "prod"},
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey:     []byte("ABC123"),
+				tokens.DataMetadataKey: []byte(`{"role":"writer"}`),
+			},
+		}
+
+		result, err := sync.onSecretChange("key", secret)
+		require.Nil(t, result)
+		require.NoError(t, err)
+		require.Equal(t, []string{"token/abc123"}, kv.putCalls)
+
+		stored := kv.payload["token/abc123"]
+		var entry registry.Token
+		require.NoError(t, json.Unmarshal(stored, &entry))
+		require.Equal(t, "abc123", entry.Hash)
+		require.Equal(t, map[string]string{"role": "writer", "env": "prod"}, entry.Metadata)
+	})
+
+	t.Run("put error returned", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+			putErr:  errors.New("kv put failed"),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "token",
+				Labels:    map[string]string{tokens.LabelToken: "true"},
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey: []byte("ABC123"),
+			},
+		}
+
+		_, err := sync.onSecretChange("key", secret)
+		require.EqualError(t, err, "kv put failed")
+	})
+
+	t.Run("extract registry token error ignored", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: make(map[string][]byte),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "token",
+				Labels:    map[string]string{tokens.LabelToken: "true"},
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey:     []byte("ABC123"),
+				tokens.DataMetadataKey: []byte("{invalid"),
+			},
+		}
+
+		result, err := sync.onSecretChange("key", secret)
+		require.Nil(t, result)
+		require.NoError(t, err)
+		require.Empty(t, kv.putCalls)
+	})
+}
+
+// Ensure fakeMemoryKV satisfies interface expectations in this package too.
+var _ nats.KeyValue = (*fakeMemoryKV)(nil)

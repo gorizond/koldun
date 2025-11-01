@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +200,46 @@ func TestResponseSubjectPrefix(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestConversationHashFromHeadersPlain(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Trace-Id", "abc-123")
+	req.Header.Set("X-Request-Id", "req-1")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	actual, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+
+	pairs := []string{
+		"user-agent=ingress-test",
+		"x-request-id=req-1",
+		"x-trace-id=abc-123",
+	}
+	sort.Strings(pairs)
+	expectedSum := sha256.Sum256([]byte(strings.Join(pairs, "&")))
+	assert.Equal(t, hex.EncodeToString(expectedSum[:]), actual)
+}
+
+func TestConversationHashFromHeadersWithSecret(t *testing.T) {
+	secret := []byte("topsecret")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-Trace-Id", "abc-123")
+	req.Header.Set("User-Agent", "ingress-test")
+	req.Header.Set("X-Forwarded-Server", "ignored")
+
+	actual, err := conversationHashFromHeaders(req, secret)
+	require.NoError(t, err)
+
+	pairs := []string{
+		"user-agent=ingress-test",
+		"x-trace-id=abc-123",
+	}
+	sort.Strings(pairs)
+	message := []byte(strings.Join(pairs, "&"))
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(message)
+	assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), actual)
 }
 
 // TestSessionBacklogSubject validates backlog subject generation.
@@ -971,6 +1013,125 @@ func TestHandleReadyFailures(t *testing.T) {
 	require.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestListModelsRequiresBucket(t *testing.T) {
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	models, err := srv.listModels()
+	require.Nil(t, models)
+	require.EqualError(t, err, "models bucket unavailable")
+}
+
+func TestListModelsReturnsEmptyWhenNoKeys(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, _ := connectIngressJetStream(t, ns)
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket: "list_models_empty",
+	})
+	require.NoError(t, err)
+
+	srv := &Server{
+		cfg:      Config{ModelPrefix: registry.DefaultModelPrefix},
+		log:      logrus.New().WithField("component", "ingress-test"),
+		modelsKV: kv,
+	}
+
+	models, err := srv.listModels()
+	require.NoError(t, err)
+	require.Empty(t, models)
+}
+
+func TestListModelsFiltersInvalidEntries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, _ := connectIngressJetStream(t, ns)
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "list_models_data",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	valid := registry.Model{
+		DisplayName:         "Alpha",
+		ConversionSizeHuman: "10GiB",
+		OutputPVCName:       "alpha-pvc",
+		ReplicaPower:        2,
+	}
+	payload, err := json.Marshal(valid)
+	require.NoError(t, err)
+
+	_, err = kv.Put("model/tenant-alpha/alpha", payload)
+	require.NoError(t, err)
+	_, err = kv.Put("ignored/key", payload)
+	require.NoError(t, err)
+	_, err = kv.Put("model/tenant-alpha/bad", []byte("not-json"))
+	require.NoError(t, err)
+
+	srv := &Server{
+		cfg:      Config{ModelPrefix: registry.DefaultModelPrefix},
+		log:      logrus.New().WithField("component", "ingress-test"),
+		modelsKV: kv,
+	}
+
+	models, err := srv.listModels()
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+
+	model := models[0]
+	require.Equal(t, "tenant-alpha", model.Namespace)
+	require.Equal(t, "alpha", model.Name)
+	require.Equal(t, "Alpha", model.DisplayName)
+	require.Equal(t, int32(2), model.ReplicaPower)
+}
+
+func TestListModelsHandlesLookupErrors(t *testing.T) {
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{"model/tenant-alpha/missing"}, nil
+			},
+			getFn: func(string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+
+	models, err := srv.listModels()
+	require.NoError(t, err)
+	require.Empty(t, models)
+}
+
+func TestListModelsPropagatesKeyErrors(t *testing.T) {
+	expected := errors.New("kv offline")
+
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return nil, expected
+			},
+		},
+	}
+
+	models, err := srv.listModels()
+	require.Nil(t, models)
+	require.ErrorIs(t, err, expected)
+}
+
 func TestHandleChatCompletionsRequiresToken(t *testing.T) {
 	t.Parallel()
 
@@ -1083,7 +1244,7 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 	req.Header.Set("User-Agent", "ingress-test")
 	req.Header.Set("X-Trace-Id", "abc-123")
 
-	hash, err := conversationHashFromHeaders(req)
+	hash, err := conversationHashFromHeaders(req, nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -1166,6 +1327,32 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for response payload")
 	}
+}
+
+type keyValueStub struct {
+	nats.KeyValue
+	keysFn func() ([]string, error)
+	getFn  func(string) (nats.KeyValueEntry, error)
+}
+
+func (kv keyValueStub) Keys(opts ...nats.WatchOpt) ([]string, error) {
+	if kv.keysFn != nil {
+		return kv.keysFn()
+	}
+	if kv.KeyValue != nil {
+		return kv.KeyValue.Keys(opts...)
+	}
+	return nil, errors.New("keys not implemented")
+}
+
+func (kv keyValueStub) Get(key string) (nats.KeyValueEntry, error) {
+	if kv.getFn != nil {
+		return kv.getFn(key)
+	}
+	if kv.KeyValue != nil {
+		return kv.KeyValue.Get(key)
+	}
+	return nil, errors.New("get not implemented")
 }
 
 func startIngressJetStream(t *testing.T) *server.Server {

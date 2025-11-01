@@ -1,453 +1,348 @@
 package controllers
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-func TestResourceSessionKey(t *testing.T) {
-	tests := []struct {
-		name      string
-		resource  string
-		namespace string
-		objName   string
-		expected  string
-	}{
-		{
-			name:      "valid key",
-			resource:  "dllama",
-			namespace: "default",
-			objName:   "test-dllama-abc",
-			expected:  "dllama/default/test-dllama-abc",
-		},
-		{
-			name:      "empty resource",
-			resource:  "",
-			namespace: "default",
-			objName:   "test",
-			expected:  "",
-		},
-		{
-			name:      "empty name",
-			resource:  "dllama",
-			namespace: "default",
-			objName:   "",
-			expected:  "",
-		},
-		{
-			name:      "empty namespace is allowed",
-			resource:  "root",
-			namespace: "",
-			objName:   "test-root",
-			expected:  "root//test-root",
-		},
-	}
+func TestEnsureLabels(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := resourceSessionKey(tt.resource, tt.namespace, tt.objName)
-			if result != tt.expected {
-				t.Errorf("resourceSessionKey(%q, %q, %q) = %q, want %q",
-					tt.resource, tt.namespace, tt.objName, result, tt.expected)
-			}
-		})
-	}
+	meta := &metav1.ObjectMeta{}
+
+	require.False(t, ensureLabels(meta, nil))
+	require.False(t, ensureLabels(meta, map[string]string{}))
+
+	changed := ensureLabels(meta, map[string]string{"a": "b"})
+	require.True(t, changed)
+	require.Equal(t, "b", meta.Labels["a"])
+
+	require.False(t, ensureLabels(meta, map[string]string{"a": "b"}))
+
+	changed = ensureLabels(meta, map[string]string{"a": "c", "b": "d"})
+	require.True(t, changed)
+	require.Equal(t, map[string]string{"a": "c", "b": "d"}, meta.Labels)
+}
+
+func TestEnsureAnnotations(t *testing.T) {
+	t.Parallel()
+
+	meta := &metav1.ObjectMeta{}
+
+	require.False(t, ensureAnnotations(meta, nil))
+	require.False(t, ensureAnnotations(meta, map[string]string{}))
+
+	require.True(t, ensureAnnotations(meta, map[string]string{"key": "value"}))
+	require.Equal(t, "value", meta.Annotations["key"])
+
+	require.False(t, ensureAnnotations(meta, map[string]string{"key": "value"}))
+
+	require.True(t, ensureAnnotations(meta, map[string]string{"another": "entry"}))
+	require.Equal(t, map[string]string{"key": "value", "another": "entry"}, meta.Annotations)
+}
+
+func TestEnsureTrailingDotHelper(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "", ensureTrailingDot(""))
+	require.Equal(t, "prefix.", ensureTrailingDot("prefix"))
+	require.Equal(t, "subject.", ensureTrailingDot("subject."))
+}
+
+func TestResourceSessionKey(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, "", resourceSessionKey("", "ns", "name"))
+	require.Equal(t, "", resourceSessionKey(resourceDllama, "ns", ""))
+	require.Equal(t, "dllama/ns/name", resourceSessionKey(resourceDllama, "ns", "name"))
+}
+
+func TestTrackAndPopResourceSession(t *testing.T) {
+	t.Parallel()
+
+	handler := &sessionHandler{resourceSessions: map[string]string{}}
+
+	handler.trackResourceSession(resourceDllama, "ns", "name", "session")
+	require.Equal(t, "session", handler.popResourceSession(resourceDllama, "ns", "name"))
+
+	require.Equal(t, "", handler.popResourceSession(resourceDllama, "ns", "name"), "pop should delete entry")
+
+	handler.trackResourceSession(resourceDllama, "ns", "", "session")
+	require.Empty(t, handler.resourceSessions)
 }
 
 func TestSplitNamespaceName(t *testing.T) {
-	tests := []struct {
-		name         string
-		key          string
-		expectedNS   string
-		expectedName string
-	}{
-		{
-			name:         "valid namespaced key",
-			key:          "default/my-resource",
-			expectedNS:   "default",
-			expectedName: "my-resource",
-		},
-		{
-			name:         "name only - no namespace",
-			key:          "my-resource",
-			expectedNS:   "",
-			expectedName: "my-resource",
-		},
-		{
-			name:         "empty key",
-			key:          "",
-			expectedNS:   "",
-			expectedName: "",
-		},
-		{
-			name:         "multiple slashes - only first split",
-			key:          "kube-system/pod/container",
-			expectedNS:   "kube-system",
-			expectedName: "pod/container",
-		},
-		{
-			name:         "empty namespace part",
-			key:          "/my-resource",
-			expectedNS:   "",
-			expectedName: "my-resource",
-		},
-	}
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ns, name := splitNamespaceName(tt.key)
-			if ns != tt.expectedNS {
-				t.Errorf("namespace: got %q, want %q", ns, tt.expectedNS)
-			}
-			if name != tt.expectedName {
-				t.Errorf("name: got %q, want %q", name, tt.expectedName)
-			}
-		})
-	}
+	ns, name := splitNamespaceName("sessions/demo")
+	require.Equal(t, "sessions", ns)
+	require.Equal(t, "demo", name)
+
+	ns, name = splitNamespaceName("dllama-only")
+	require.Equal(t, "", ns)
+	require.Equal(t, "dllama-only", name)
+
+	ns, name = splitNamespaceName("")
+	require.Equal(t, "", ns)
+	require.Equal(t, "", name)
 }
 
-func TestGuessSessionFromDllamaName(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "valid dllama name",
-			input:    "my-session-dllama-abc123",
-			expected: "my-session",
-		},
-		{
-			name:     "session with hyphens",
-			input:    "prod-user-123-dllama-xyz",
-			expected: "prod-user-123",
-		},
-		{
-			name:     "no -dllama suffix",
-			input:    "my-session-abc",
-			expected: "",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "-dllama at start (invalid)",
-			input:    "-dllama-abc",
-			expected: "",
-		},
-		{
-			name:     "multiple -dllama occurrences - use first",
-			input:    "session-dllama-test-dllama-abc",
-			expected: "session",
-		},
+func TestDeleteDllama(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockDllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	handler := &sessionHandler{
+		dllamas: mockDllamas,
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := guessSessionFromDllamaName(tt.input)
-			if result != tt.expected {
-				t.Errorf("guessSessionFromDllamaName(%q) = %q, want %q",
-					tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestGuessSessionFromRootName(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "valid root name",
-			input:    "my-session-dllama-abc-root",
-			expected: "my-session",
-		},
-		{
-			name:     "root name without -root suffix",
-			input:    "my-session-dllama-abc",
-			expected: "my-session",
-		},
-		{
-			name:     "no dllama in name",
-			input:    "my-session-root",
-			expected: "",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := guessSessionFromRootName(tt.input)
-			if result != tt.expected {
-				t.Errorf("guessSessionFromRootName(%q) = %q, want %q",
-					tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestGuessSessionFromWorkerName(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "valid worker name",
-			input:    "my-session-dllama-abc-workers",
-			expected: "my-session",
-		},
-		{
-			name:     "worker name without -workers suffix",
-			input:    "my-session-dllama-abc",
-			expected: "my-session",
-		},
-		{
-			name:     "no dllama in name",
-			input:    "my-session-workers",
-			expected: "",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := guessSessionFromWorkerName(tt.input)
-			if result != tt.expected {
-				t.Errorf("guessSessionFromWorkerName(%q) = %q, want %q",
-					tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestEnsureOwnerReference(t *testing.T) {
-	session := &v1.Session{
+	sess := &v1.Session{}
+	dllama := &v1.Dllama{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-session",
-			UID:  "session-uid-123",
-		},
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "koldun.gorizond.io/v1",
-			Kind:       "Session",
+			Name:      "demo",
+			Namespace: "sessions",
 		},
 	}
 
-	tests := []struct {
-		name            string
-		existing        []metav1.OwnerReference
-		expectedChanged bool
-		expectedCount   int
-	}{
-		{
-			name:            "no existing owner references",
-			existing:        nil,
-			expectedChanged: true,
-			expectedCount:   1,
-		},
-		{
-			name: "owner reference already exists with matching BlockOwnerDeletion",
-			existing: []metav1.OwnerReference{
-				{
-					APIVersion:         "koldun.gorizond.io/v1",
-					Kind:               "Session",
-					Name:               "test-session",
-					UID:                "session-uid-123",
-					Controller:         boolPtr(true),
-					BlockOwnerDeletion: boolPtr(true),
+	mockDllamas.EXPECT().
+		Delete("sessions", "demo", gomock.Any()).
+		Return(nil)
+	require.NoError(t, handler.deleteDllama(sess, dllama))
+
+	mockDllamas.EXPECT().
+		Delete("sessions", "demo", gomock.Any()).
+		Return(apierrors.NewNotFound(schema.GroupResource{Group: v1.GroupName, Resource: "dllamas"}, "demo"))
+	require.NoError(t, handler.deleteDllama(sess, dllama))
+
+	mockDllamas.EXPECT().
+		Delete("sessions", "demo", gomock.Any()).
+		Return(errors.New("delete failure"))
+	require.EqualError(t, handler.deleteDllama(sess, dllama), "delete failure")
+
+	require.NoError(t, handler.deleteDllama(sess, nil))
+}
+
+func TestSessionHandlerOnRelatedDllama(t *testing.T) {
+	t.Parallel()
+
+	t.Run("delete uses tracked session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{resourceSessionKey(resourceDllama, "ns", "demo-dllama"): "demo"},
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedDllama("ns/demo-dllama", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("delete falls back to name guess", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{},
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedDllama("ns/demo-dllama", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("active dllama tracks session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{},
+		}
+
+		dllama := &v1.Dllama{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns",
+				Name:      "demo-dllama",
+				Labels: map[string]string{
+					labelSessionName: "demo",
 				},
 			},
-			expectedChanged: false,
-			expectedCount:   1,
-		},
-		{
-			name: "different owner reference exists",
-			existing: []metav1.OwnerReference{
-				{
-					APIVersion: "apps/v1",
-					Kind:       "Deployment",
-					Name:       "other-resource",
-					UID:        "other-uid",
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedDllama("ns/demo-dllama", dllama)
+		require.NoError(t, err)
+		require.Equal(t, dllama, result)
+
+		key := resourceSessionKey(resourceDllama, "ns", "demo-dllama")
+		require.Equal(t, "demo", handler.resourceSessions[key])
+	})
+}
+
+func TestSessionHandlerOnRelatedRoot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("delete uses tracked session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{resourceSessionKey(resourceRoot, "ns", "demo-root"): "demo"},
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedRoot("ns/demo-root", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("active root tracks session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{},
+		}
+
+		root := &v1.Root{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns",
+				Name:      "demo-root",
+				Labels: map[string]string{
+					labelSessionName: "demo",
 				},
 			},
-			expectedChanged: true,
-			expectedCount:   2,
-		},
-	}
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			meta := &metav1.ObjectMeta{
-				OwnerReferences: tt.existing,
-			}
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedRoot("ns/demo-root", root)
+		require.NoError(t, err)
+		require.Equal(t, root, result)
 
-			changed := ensureOwnerReference(meta, session)
-
-			if changed != tt.expectedChanged {
-				t.Errorf("ensureOwnerReference() changed = %v, want %v",
-					changed, tt.expectedChanged)
-			}
-
-			if len(meta.OwnerReferences) != tt.expectedCount {
-				t.Errorf("owner references count = %d, want %d",
-					len(meta.OwnerReferences), tt.expectedCount)
-			}
-
-			// Verify the session owner reference exists
-			found := false
-			for _, ref := range meta.OwnerReferences {
-				if ref.UID == session.UID {
-					found = true
-					if ref.Name != session.Name {
-						t.Errorf("owner reference name = %q, want %q",
-							ref.Name, session.Name)
-					}
-					if ref.Kind != "Session" {
-						t.Errorf("owner reference kind = %q, want Session", ref.Kind)
-					}
-					if ref.Controller == nil || !*ref.Controller {
-						t.Error("owner reference should have controller=true")
-					}
-				}
-			}
-			if !found {
-				t.Error("session owner reference not found in OwnerReferences")
-			}
-		})
-	}
+		key := resourceSessionKey(resourceRoot, "ns", "demo-root")
+		require.Equal(t, "demo", handler.resourceSessions[key])
+	})
 }
 
-func boolPtr(b bool) *bool {
-	return pointer.Bool(b)
+func TestSessionHandlerOnRelatedWorker(t *testing.T) {
+	t.Parallel()
+
+	t.Run("delete uses tracked session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{resourceSessionKey(resourceWorker, "ns", "demo-workers"): "demo"},
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedWorker("ns/demo-workers", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("active worker tracks session", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		handler := &sessionHandler{
+			sessions:         sessions,
+			resourceSessions: map[string]string{},
+		}
+
+		worker := &v1.Worker{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "ns",
+				Name:      "demo-workers",
+				Labels: map[string]string{
+					labelSessionName: "demo",
+				},
+			},
+		}
+
+		sessions.EXPECT().Enqueue("ns", "demo")
+		result, err := handler.onRelatedWorker("ns/demo-workers", worker)
+		require.NoError(t, err)
+		require.Equal(t, worker, result)
+
+		key := resourceSessionKey(resourceWorker, "ns", "demo-workers")
+		require.Equal(t, "demo", handler.resourceSessions[key])
+	})
 }
 
-func TestSanitizeIdentifier(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "whitespace only",
-			input:    "   ",
-			expected: "",
-		},
-		{
-			name:     "alphanumeric only",
-			input:    "abc123XYZ",
-			expected: "abc123XYZ",
-		},
-		{
-			name:     "with hyphens and underscores",
-			input:    "my-test_id-123",
-			expected: "my-test_id-123",
-		},
-		{
-			name:     "special characters replaced",
-			input:    "hello@world.com",
-			expected: "hello-world-com",
-		},
-		{
-			name:     "mixed special characters",
-			input:    "test!@#$%value",
-			expected: "test-----value",
-		},
-		{
-			name:     "unicode characters replaced",
-			input:    "café-日本語",
-			expected: "caf-----",
-		},
-		{
-			name:     "leading and trailing spaces",
-			input:    "  test-123  ",
-			expected: "test-123",
-		},
-		{
-			name:     "spaces replaced with hyphens",
-			input:    "hello world test",
-			expected: "hello-world-test",
-		},
-		{
-			name:     "all special characters",
-			input:    "!@#$%^&*()",
-			expected: "----------",
-		},
-	}
+func TestSessionHandlerLookupRootEndpoint(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := sanitizeIdentifier(tt.input)
-			if result != tt.expected {
-				t.Errorf("sanitizeIdentifier(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	roots := genericfake.NewMockControllerInterface[*v1.Root, *v1.RootList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Root](ctrl)
+	roots.EXPECT().Cache().Return(cache).AnyTimes()
+
+	handler := &sessionHandler{roots: roots}
+
+	cache.EXPECT().Get("ns", "demo-root").Return(&v1.Root{
+		Status: v1.RootStatus{Endpoint: " root.endpoint.svc "},
+	}, nil)
+	require.Equal(t, "root.endpoint.svc", handler.lookupRootEndpoint("ns", "demo"))
+
+	cache.EXPECT().Get("ns", "missing-root").Return(nil, errors.New("not found"))
+	require.Equal(t, "", handler.lookupRootEndpoint("ns", "missing"))
 }
 
-func TestReplicaPowerOrDefault(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    int32
-		expected int32
-	}{
-		{
-			name:     "zero returns default",
-			input:    0,
-			expected: 1,
-		},
-		{
-			name:     "negative returns default",
-			input:    -1,
-			expected: 1,
-		},
-		{
-			name:     "large negative returns default",
-			input:    -100,
-			expected: 1,
-		},
-		{
-			name:     "positive value unchanged",
-			input:    5,
-			expected: 5,
-		},
-		{
-			name:     "one unchanged",
-			input:    1,
-			expected: 1,
-		},
-		{
-			name:     "large positive unchanged",
-			input:    1000,
-			expected: 1000,
-		},
+func TestSessionHandlerCheckHealth(t *testing.T) {
+	t.Parallel()
+
+	handler := &sessionHandler{
+		ctx: context.Background(),
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := replicaPowerOrDefault(tt.input)
-			if result != tt.expected {
-				t.Errorf("replicaPowerOrDefault(%d) = %d, want %d", tt.input, result, tt.expected)
-			}
-		})
-	}
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer healthy.Close()
+
+	handler.httpClient = healthy.Client()
+	require.True(t, handler.checkHealth(strings.TrimPrefix(healthy.URL, "http://")))
+
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer unhealthy.Close()
+
+	handler.httpClient = unhealthy.Client()
+	require.False(t, handler.checkHealth(strings.TrimPrefix(unhealthy.URL, "http://")))
+
+	// missing endpoint should fail fast
+	require.False(t, handler.checkHealth(""))
 }

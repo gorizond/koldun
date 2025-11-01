@@ -1,14 +1,20 @@
 package controllers
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	fakeapply "github.com/rancher/wrangler/v3/pkg/apply/fake"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
@@ -167,6 +173,130 @@ func TestDesiredBackendDeployment(t *testing.T) {
 	require.True(t, containsArg(container.Args, "--backend-session-dispatcher-image=ghcr.io/gorizond/dispatcher:stable"))
 	require.Equal(t, ing.Spec.Backend.ExtraArgs, container.Args[len(container.Args)-len(ing.Spec.Backend.ExtraArgs):])
 	require.Equal(t, ing.Spec.Backend.Resources, container.Resources)
+}
+
+func TestEnsureResourcesAppliesExpectedObjects(t *testing.T) {
+	ing := newIngress()
+	applySpy := &fakeapply.FakeApply{}
+	handler := &ingressHandler{apply: applySpy}
+
+	require.NoError(t, handler.ensureResources(ing))
+	require.Len(t, applySpy.Objects, 1)
+	objects := applySpy.Objects[0].All()
+	require.Len(t, objects, 3)
+
+	var (
+		deployment *appsv1.Deployment
+		service    *corev1.Service
+		route      *networkingv1.Ingress
+	)
+
+	for _, obj := range objects {
+		switch typed := obj.(type) {
+		case *appsv1.Deployment:
+			deployment = typed
+		case *corev1.Service:
+			service = typed
+		case *networkingv1.Ingress:
+			route = typed
+		default:
+			t.Fatalf("unexpected object type %T", obj)
+		}
+	}
+
+	expectedName := fmt.Sprintf("%s-backend", ing.Name)
+
+	require.NotNil(t, deployment)
+	require.Equal(t, expectedName, deployment.Name)
+	require.Equal(t, ing.Namespace, deployment.Namespace)
+	require.NotNil(t, deployment.Spec.Template.Spec.Containers)
+	require.Equal(t, ing.Spec.Backend.Image, deployment.Spec.Template.Spec.Containers[0].Image)
+
+	require.NotNil(t, service)
+	require.Equal(t, expectedName, service.Name)
+	require.Equal(t, int32(8082), service.Spec.Ports[0].Port)
+
+	require.NotNil(t, route)
+	require.Equal(t, expectedName, route.Name)
+	require.Equal(t, ing.Spec.Route.Host, route.Spec.Rules[0].Host)
+}
+
+func TestEnsureResourcesValidatesSpec(t *testing.T) {
+	ing := newIngress()
+	ing.Spec.Backend.Image = ""
+	handler := &ingressHandler{apply: &fakeapply.FakeApply{}}
+
+	err := handler.ensureResources(ing)
+	require.EqualError(t, err, "backend.image is required")
+}
+
+func TestEnsureStatusSetsBackendReadyCondition(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	deploymentsCache := genericfake.NewMockCacheInterface[*appsv1.Deployment](ctrl)
+	deployments := genericfake.NewMockControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+
+	handler := &ingressHandler{
+		deployments: deployments,
+		ingresses:   ingressController,
+	}
+
+	deployments.EXPECT().Cache().Return(deploymentsCache)
+	backendName := fmt.Sprintf("%s-backend", "chat-backend")
+	deploymentsCache.EXPECT().Get("testing", backendName).Return(&appsv1.Deployment{Status: appsv1.DeploymentStatus{ReadyReplicas: 1}}, nil)
+	ingressController.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Ingress{})).DoAndReturn(func(obj *v1.Ingress) (*v1.Ingress, error) {
+		cond := meta.FindStatusCondition(obj.Status.Conditions, conditionReady)
+		require.NotNil(t, cond)
+		require.Equal(t, metav1.ConditionTrue, cond.Status)
+		require.Equal(t, "BackendReady", cond.Reason)
+		require.Equal(t, obj.Generation, obj.Status.ObservedGeneration)
+		require.Equal(t, backendName, obj.Status.BackendServiceName)
+		require.Equal(t, backendName, obj.Status.IngressName)
+		return obj, nil
+	})
+
+	ing := newIngress()
+	ing.Generation = 3
+
+	updated, err := handler.ensureStatus(ing)
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+}
+
+func TestEnsureStatusNoChangeReturnsOriginal(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	deploymentsCache := genericfake.NewMockCacheInterface[*appsv1.Deployment](ctrl)
+	deployments := genericfake.NewMockControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+
+	handler := &ingressHandler{
+		deployments: deployments,
+		ingresses:   ingressController,
+	}
+
+	deployments.EXPECT().Cache().Return(deploymentsCache)
+	backendName := fmt.Sprintf("%s-backend", "chat-backend")
+	deploymentsCache.EXPECT().Get("testing", backendName).Return(&appsv1.Deployment{Status: appsv1.DeploymentStatus{ReadyReplicas: 0}}, nil)
+	ingressController.EXPECT().UpdateStatus(gomock.Any()).Times(0)
+
+	ing := newIngress()
+	ing.Status.Conditions = []metav1.Condition{{
+		Type:    conditionReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  "BackendNotReady",
+		Message: "backend deployment is not yet ready",
+	}}
+	ing.Status.ObservedGeneration = ing.Generation
+	ing.Status.BackendServiceName = backendName
+	ing.Status.IngressName = backendName
+
+	returned, err := handler.ensureStatus(ing)
+	require.NoError(t, err)
+	require.Equal(t, ing, returned)
 }
 
 func TestDesiredBackendService(t *testing.T) {

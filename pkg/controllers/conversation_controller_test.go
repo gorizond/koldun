@@ -2,16 +2,23 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/nats-io/nats.go"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/apply/injectors"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/rancher/wrangler/v3/pkg/objectset"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -196,6 +203,146 @@ func TestEnsureSessionDefaults(t *testing.T) {
 	require.Equal(t, fmt.Sprintf("conversation-session-%s", record.Hash), fakeApply.setID)
 }
 
+func TestConversationSyncAppliesSessionsAndDeletesStale(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessionsController := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	sessionCache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessionsController.EXPECT().Cache().Return(sessionCache).AnyTimes()
+
+	recordA := &conversation.Record{
+		Hash:        "hash-a",
+		Session:     "active-session",
+		Namespace:   "default",
+		Model:       "models/demo",
+		RootImage:   "ghcr.io/demo/root:latest",
+		WorkerImage: "ghcr.io/demo/worker:latest",
+	}
+	recordB := &conversation.Record{
+		Hash:        "hash-b",
+		Session:     "second-session",
+		Namespace:   "default",
+		Model:       "models/other",
+		RootImage:   "ghcr.io/demo/root:latest",
+		WorkerImage: "ghcr.io/demo/worker:latest",
+	}
+
+	payloads := make(map[string][]byte)
+	for _, record := range []*conversation.Record{recordA, recordB} {
+		data, err := record.Marshal()
+		require.NoError(t, err)
+		payloads[fmt.Sprintf("nats_ttl_%s", record.Hash)] = data
+	}
+
+	kv := &fakeMemoryKV{
+		bucket:  "sessions",
+		keys:    []string{"nats_ttl_hash-a", "nats_ttl_hash-b"},
+		payload: payloads,
+	}
+
+	activeSession := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      recordA.SessionName(),
+			Namespace: recordA.Namespace,
+			Labels: map[string]string{
+				labelConversationHash: recordA.Hash,
+			},
+		},
+		Spec: v1.SessionSpec{
+			Hash: recordA.Hash,
+		},
+	}
+	staleSession := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stale-session",
+			Namespace: "default",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "stale-hash",
+		},
+	}
+
+	sessionCache.EXPECT().
+		List("", gomock.Any()).
+		Return([]*v1.Session{activeSession, staleSession}, nil)
+
+	sessionsController.EXPECT().
+		Delete("default", "stale-session", gomock.Any()).
+		Return(nil)
+
+	fakeApply := newFakeApply()
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			TTLPrefix: "nats_ttl_",
+		},
+		log:      logrus.New().WithField("component", "conversation-sync-test"),
+		sessions: sessionsController,
+		apply:    fakeApply,
+		kv:       kv,
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Len(t, fakeApply.appliedObjects, 2, "expected two sessions to be applied")
+
+	applied := map[string]struct{}{}
+	for _, obj := range fakeApply.appliedObjects {
+		session, ok := obj.(*v1.Session)
+		require.True(t, ok, "expected Session object")
+		applied[fmt.Sprintf("%s/%s", session.Namespace, session.Name)] = struct{}{}
+		require.NotEmpty(t, session.Spec.Hash, "session hash should be populated")
+		require.NotEmpty(t, session.Spec.ModelRef.Name, "model reference should be populated")
+	}
+
+	require.Contains(t, applied, fmt.Sprintf("%s/%s", recordA.Namespace, recordA.SessionName()))
+	require.Contains(t, applied, fmt.Sprintf("%s/%s", recordB.Namespace, recordB.SessionName()))
+}
+
+func TestConversationSyncDeletesWhenNoKeysFound(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessionsController := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	sessionCache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessionsController.EXPECT().Cache().Return(sessionCache).AnyTimes()
+
+	stale := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "legacy-session",
+			Namespace: "conversations",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "legacy-hash",
+		},
+	}
+
+	sessionCache.EXPECT().
+		List("", gomock.Any()).
+		Return([]*v1.Session{stale}, nil)
+
+	sessionsController.EXPECT().
+		Delete("conversations", "legacy-session", gomock.Any()).
+		Return(nil)
+
+	fakeApply := newFakeApply()
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			TTLPrefix: "nats_ttl_",
+		},
+		log:      logrus.New().WithField("component", "conversation-sync-test"),
+		sessions: sessionsController,
+		apply:    fakeApply,
+		kv: &fakeMemoryKV{
+			keysErr: nats.ErrNoKeysFound,
+		},
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Empty(t, fakeApply.appliedObjects, "no sessions should be applied when KV empty")
+}
+
 type fakeApply struct {
 	defaultNamespace string
 	setID            string
@@ -267,3 +414,184 @@ func (f *fakeApply) DryRun(...runtime.Object) (apply.Plan, error) {
 }
 
 var _ apply.Apply = (*fakeApply)(nil)
+
+type fakeMemoryKV struct {
+	bucket  string
+	keys    []string
+	payload map[string][]byte
+	keysErr error
+
+	putCalls    []string
+	deleteCalls []string
+	putErr      error
+	deleteErr   error
+	revision    uint64
+}
+
+func (f *fakeMemoryKV) Get(key string) (nats.KeyValueEntry, error) {
+	if f == nil {
+		return nil, nats.ErrBucketNotFound
+	}
+	value, ok := f.payload[key]
+	if !ok {
+		return nil, nats.ErrKeyNotFound
+	}
+	return &fakeKVEntry{
+		bucket:   f.bucket,
+		key:      key,
+		value:    append([]byte(nil), value...),
+		revision: 1,
+	}, nil
+}
+
+func (f *fakeMemoryKV) GetRevision(string, uint64) (nats.KeyValueEntry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Put(key string, value []byte) (uint64, error) {
+	if f == nil {
+		return 0, errors.New("kv not initialised")
+	}
+	if f.putErr != nil {
+		return 0, f.putErr
+	}
+	if f.payload == nil {
+		f.payload = make(map[string][]byte)
+	}
+	if f.keys == nil {
+		f.keys = []string{}
+	}
+	if _, ok := f.payload[key]; !ok {
+		found := false
+		for _, existing := range f.keys {
+			if existing == key {
+				found = true
+				break
+			}
+		}
+		if !found {
+			f.keys = append(f.keys, key)
+		}
+	}
+	f.payload[key] = append([]byte(nil), value...)
+	f.putCalls = append(f.putCalls, key)
+	f.revision++
+	return f.revision, nil
+}
+
+func (f *fakeMemoryKV) PutString(string, string) (uint64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Create(string, []byte) (uint64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Update(string, []byte, uint64) (uint64, error) {
+	return 0, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Delete(key string, _ ...nats.DeleteOpt) error {
+	if f == nil {
+		return errors.New("kv not initialised")
+	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	if f.payload == nil {
+		return nats.ErrKeyNotFound
+	}
+	if _, ok := f.payload[key]; !ok {
+		return nats.ErrKeyNotFound
+	}
+	delete(f.payload, key)
+	f.deleteCalls = append(f.deleteCalls, key)
+	for i, existing := range f.keys {
+		if existing == key {
+			f.keys = append(f.keys[:i], f.keys[i+1:]...)
+			break
+		}
+	}
+	return nil
+}
+
+func (f *fakeMemoryKV) Purge(string, ...nats.DeleteOpt) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Watch(string, ...nats.WatchOpt) (nats.KeyWatcher, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) WatchAll(...nats.WatchOpt) (nats.KeyWatcher, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) WatchFiltered([]string, ...nats.WatchOpt) (nats.KeyWatcher, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Keys(...nats.WatchOpt) ([]string, error) {
+	if f == nil {
+		return nil, nats.ErrBucketNotFound
+	}
+	if f.keysErr != nil {
+		return nil, f.keysErr
+	}
+	if len(f.keys) == 0 && len(f.payload) > 0 {
+		keys := make([]string, 0, len(f.payload))
+		for key := range f.payload {
+			keys = append(keys, key)
+		}
+		return keys, nil
+	}
+	return append([]string(nil), f.keys...), nil
+}
+
+func (f *fakeMemoryKV) ListKeys(...nats.WatchOpt) (nats.KeyLister, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) History(string, ...nats.WatchOpt) ([]nats.KeyValueEntry, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Bucket() string {
+	if f == nil || f.bucket == "" {
+		return "test"
+	}
+	return f.bucket
+}
+
+func (f *fakeMemoryKV) PurgeDeletes(...nats.PurgeOpt) error {
+	return errors.New("not implemented")
+}
+
+func (f *fakeMemoryKV) Status() (nats.KeyValueStatus, error) {
+	return nil, errors.New("not implemented")
+}
+
+type fakeKVEntry struct {
+	bucket   string
+	key      string
+	value    []byte
+	revision uint64
+}
+
+func (e *fakeKVEntry) Bucket() string { return e.bucket }
+func (e *fakeKVEntry) Key() string    { return e.key }
+func (e *fakeKVEntry) Value() []byte  { return e.value }
+func (e *fakeKVEntry) Revision() uint64 {
+	if e.revision == 0 {
+		return 1
+	}
+	return e.revision
+}
+func (e *fakeKVEntry) Created() time.Time { return time.Time{} }
+func (e *fakeKVEntry) Delta() uint64      { return 0 }
+func (e *fakeKVEntry) Operation() nats.KeyValueOp {
+	return nats.KeyValuePut
+}
+
+var _ nats.KeyValue = (*fakeMemoryKV)(nil)
+var _ nats.KeyValueEntry = (*fakeKVEntry)(nil)

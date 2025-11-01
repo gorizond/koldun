@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"os"
 	"strings"
@@ -162,6 +163,8 @@ func main() {
 		logrus.WithError(err).Fatal("parse flags")
 	}
 
+	hashSecret := decodeHashSecret(backendHashSecret)
+
 	klog.SetOutput(os.Stderr)
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
@@ -225,7 +228,7 @@ func main() {
 			SessionScaleUpBacklog:       int32(backendSessionScaleUpBacklog),
 			SessionScaleDownIdleSeconds: int32(backendSessionScaleDownIdleSeconds),
 			SessionDispatcherImage:      backendSessionDispatcherImage,
-			HashSecret:                  []byte(backendHashSecret),
+			HashSecret:                  hashSecret,
 			AllowAnonymous:              backendAllowAnonymous,
 			ReplicaPower:                int32(backendReplicaPower),
 		})
@@ -328,4 +331,57 @@ func runDispatcher(ctx context.Context, cfg dispatcher.Config) {
 	if err := server.Run(ctx); err != nil {
 		logrus.Fatalf("dispatcher exited with error: %v", err)
 	}
+}
+
+func decodeHashSecret(value string) []byte {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+
+	base64Value, forced := trimBase64Prefix(trimmed)
+	if base64Value == "" && strings.ContainsAny(trimmed, "+/=_-") {
+		base64Value = trimmed
+	}
+
+	if base64Value != "" {
+		if decoded, ok := tryDecodeBase64(base64Value); ok {
+			return decoded
+		}
+		if forced {
+			return []byte(base64Value)
+		}
+	}
+
+	return []byte(trimmed)
+}
+
+func trimBase64Prefix(value string) (string, bool) {
+	switch {
+	case strings.HasPrefix(value, "base64:"):
+		return value[len("base64:"):], true
+	case strings.HasPrefix(value, "b64:"):
+		return value[len("b64:"):], true
+	default:
+		return "", false
+	}
+}
+
+func tryDecodeBase64(value string) ([]byte, bool) {
+	encodings := []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	}
+	for _, enc := range encodings {
+		decoded, err := enc.DecodeString(value)
+		if err != nil {
+			continue
+		}
+		if enc.EncodeToString(decoded) == value {
+			return decoded, true
+		}
+	}
+	return nil, false
 }

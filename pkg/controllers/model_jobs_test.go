@@ -231,6 +231,117 @@ func TestEnsureConversionJobSkipsWithoutBuckets(t *testing.T) {
 	}
 }
 
+func TestEnsureConversionJobDeletesOutdatedJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "1"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+	jobs.EXPECT().Delete("models", "mistral-convert", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).DoAndReturn(func(namespace, name string, opts *metav1.DeleteOptions) error {
+		if opts == nil || opts.PropagationPolicy == nil || *opts.PropagationPolicy != metav1.DeletePropagationBackground {
+			t.Fatalf("unexpected delete options: %#v", opts)
+		}
+		return nil
+	})
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "dst"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+	if len(applySpy.Objects) != 0 {
+		t.Fatalf("expected no objects applied, got %d", len(applySpy.Objects))
+	}
+}
+
+func TestEnsureConversionJobSkipsWhenTrackedInStatus(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "dst"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 5,
+			ConversionJobName:  "mistral-convert",
+			ConversionState:    "Running",
+		},
+	}
+	model.Generation = 5
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+	if len(applySpy.Objects) != 0 {
+		t.Fatalf("expected no objects applied, got %d", len(applySpy.Objects))
+	}
+}
+
+func TestEnsureConversionJobWaitsForDownload(t *testing.T) {
+	handler := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "dst"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Pending",
+			ObservedGeneration: 1,
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+}
+
 func TestEnsureDownloadJobCreatesJob(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -386,6 +497,188 @@ func TestEnsureDownloadJobSkipsWhenRecentlyDeleted(t *testing.T) {
 	}
 	if len(applySpy.Objects) != 0 {
 		t.Fatalf("expected no apply objects, got %d", len(applySpy.Objects))
+	}
+}
+
+func TestEnsureSizingJobCreatesJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-size").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-size"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			ConversionState:       "Succeeded",
+			ObservedGeneration:    2,
+			OutputPVCName:         "mistral-output",
+			ConversionSizeState:   "",
+			ConversionSizeJobName: "",
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureSizingJob(model); err != nil {
+		t.Fatalf("ensureSizingJob returned error: %v", err)
+	}
+	if len(applySpy.Objects) != 1 {
+		t.Fatalf("expected 1 apply set, got %d", len(applySpy.Objects))
+	}
+	objects := applySpy.Objects[0].All()
+	if len(objects) != 1 {
+		t.Fatalf("expected 1 object applied, got %d", len(objects))
+	}
+	job, ok := objects[0].(*batchv1.Job)
+	if !ok {
+		t.Fatalf("expected *batchv1.Job, got %T", objects[0])
+	}
+	if job.Name != "mistral-size" {
+		t.Fatalf("unexpected job name %s", job.Name)
+	}
+	if job.Annotations[annotationModelGeneration] != "2" {
+		t.Fatalf("expected annotationModelGeneration=2, got %s", job.Annotations[annotationModelGeneration])
+	}
+}
+
+func TestEnsureSizingJobDeletesOutdatedJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-size",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "1"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-size").Return(existing, nil)
+	jobs.EXPECT().Delete("models", "mistral-size", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).DoAndReturn(func(namespace, name string, opts *metav1.DeleteOptions) error {
+		if opts == nil || opts.PropagationPolicy == nil || *opts.PropagationPolicy != metav1.DeletePropagationBackground {
+			t.Fatalf("unexpected delete options: %#v", opts)
+		}
+		return nil
+	})
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			ConversionState:    "Succeeded",
+			ObservedGeneration: 2,
+			OutputPVCName:      "mistral-output",
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureSizingJob(model); err != nil {
+		t.Fatalf("ensureSizingJob returned error: %v", err)
+	}
+	if len(applySpy.Objects) != 0 {
+		t.Fatalf("expected no objects applied, got %d", len(applySpy.Objects))
+	}
+}
+
+func TestEnsureSizingJobDeletesOnForceTokenChange(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-size",
+			Namespace: "models",
+			Annotations: map[string]string{
+				annotationModelGeneration: "2",
+				annotationForceSizeRerun:  "token-old",
+			},
+		},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-size").Return(existing, nil)
+	jobs.EXPECT().Delete("models", "mistral-size", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).Return(nil)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "mistral",
+			Namespace:       "models",
+			Annotations:     map[string]string{annotationForceSizeRerun: "token-new"},
+			ResourceVersion: "42",
+		},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			ConversionState:    "Succeeded",
+			ObservedGeneration: 2,
+			OutputPVCName:      "mistral-output",
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureSizingJob(model); err != nil {
+		t.Fatalf("ensureSizingJob returned error: %v", err)
+	}
+	if len(applySpy.Objects) != 0 {
+		t.Fatalf("expected no objects applied, got %d", len(applySpy.Objects))
+	}
+}
+
+func TestEnsureSizingJobSkipsWhenAlreadySucceeded(t *testing.T) {
+	handler := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			ConversionState:          "Succeeded",
+			ObservedGeneration:       3,
+			OutputPVCName:            "mistral-output",
+			ConversionSizeState:      "Succeeded",
+			ConversionSizeGeneration: 3,
+			ConversionSizeJobName:    "mistral-size",
+		},
+	}
+	model.Generation = 3
+
+	if err := handler.ensureSizingJob(model); err != nil {
+		t.Fatalf("ensureSizingJob returned error: %v", err)
 	}
 }
 

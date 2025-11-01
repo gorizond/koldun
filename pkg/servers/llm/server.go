@@ -44,9 +44,10 @@ const (
 
 	maxNonStreamResponseSize = 4 << 20 // 4 MiB cap for single-response payloads
 
-	consumerCleanupInterval = 5 * time.Minute
-	inactiveConsumerGrace   = 10 * time.Minute
-	consumerListTimeout     = 5 * time.Second
+	consumerCleanupInterval  = 5 * time.Minute
+	inactiveConsumerGrace    = 10 * time.Minute
+	consumerListTimeout      = 5 * time.Second
+	defaultHeartbeatInterval = 30 * time.Second
 )
 
 var (
@@ -89,6 +90,7 @@ type Config struct {
 	SidecarTimeout          time.Duration
 	SidecarMonitorInterval  time.Duration
 	SidecarFailureThreshold int
+	HeartbeatInterval       time.Duration
 
 	Logger *logrus.Entry
 }
@@ -182,6 +184,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.SidecarFailureThreshold <= 0 {
 		cfg.SidecarFailureThreshold = defaultSidecarFailureThreshold
+	}
+	if cfg.HeartbeatInterval <= 0 {
+		cfg.HeartbeatInterval = defaultHeartbeatInterval
 	}
 
 	log := cfg.Logger
@@ -687,7 +692,12 @@ func (s *Server) startHeartbeatLoop(ctx context.Context) {
 	go func() {
 		defer s.wg.Done()
 
-		ticker := time.NewTicker(30 * time.Second)
+		interval := s.cfg.HeartbeatInterval
+		if interval <= 0 {
+			interval = defaultHeartbeatInterval
+		}
+
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {
