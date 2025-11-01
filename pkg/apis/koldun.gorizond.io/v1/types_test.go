@@ -1322,3 +1322,286 @@ func TestDllamaList_DeepCopy(t *testing.T) {
 		})
 	}
 }
+
+// TestModelPVSpec_DeepCopy tests the DeepCopy method for ModelPVSpec
+func TestModelPVSpec_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *ModelPVSpec
+	}{
+		{
+			name: "nil spec",
+			spec: nil,
+		},
+		{
+			name: "empty spec",
+			spec: &ModelPVSpec{},
+		},
+		{
+			name: "full spec",
+			spec: &ModelPVSpec{
+				StorageClassName: "fast-storage",
+				Capacity:         "10Gi",
+				AccessModes:      []string{"ReadWriteOnce", "ReadOnlyMany"},
+				ReclaimPolicy:    "Retain",
+				CSIDriver:        "ru.yandex.s3.csi",
+				VolumeAttributes: map[string]string{"type": "ssd", "region": "us-west"},
+				PVCAccessModes:   []string{"ReadWriteOnce"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.DeepCopy()
+
+			if tt.spec == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == tt.spec {
+				t.Error("DeepCopy() returned same pointer, not a copy")
+			}
+
+			if !reflect.DeepEqual(got, tt.spec) {
+				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.spec)
+			}
+
+			// Verify deep copy of slices
+			if len(tt.spec.AccessModes) > 0 {
+				got.AccessModes[0] = "modified"
+				if tt.spec.AccessModes[0] == "modified" {
+					t.Error("DeepCopy() did not deep copy AccessModes slice")
+				}
+			}
+
+			// Verify deep copy of maps
+			if len(tt.spec.VolumeAttributes) > 0 {
+				got.VolumeAttributes["new"] = "value"
+				if _, exists := tt.spec.VolumeAttributes["new"]; exists {
+					t.Error("DeepCopy() did not deep copy VolumeAttributes map")
+				}
+			}
+		})
+	}
+}
+
+// TestRootList_DeepCopy tests the DeepCopy methods for RootList
+func TestRootList_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		list *RootList
+	}{
+		{
+			name: "nil list",
+			list: nil,
+		},
+		{
+			name: "empty list",
+			list: &RootList{},
+		},
+		{
+			name: "list with items",
+			list: &RootList{
+				Items: []Root{
+					{
+						Spec: RootSpec{
+							ModelRef: "model-1",
+							Image:    "image-1",
+						},
+					},
+					{
+						Spec: RootSpec{
+							ModelRef: "model-2",
+							Image:    "image-2",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test DeepCopy
+			got := tt.list.DeepCopy()
+
+			if tt.list == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == tt.list {
+				t.Error("DeepCopy() returned same pointer")
+			}
+
+			if !reflect.DeepEqual(got, tt.list) {
+				t.Errorf("DeepCopy() mismatch:\ngot = %+v\nwant = %+v", got, tt.list)
+			}
+
+			// Test DeepCopyInto
+			var into RootList
+			tt.list.DeepCopyInto(&into)
+			if !reflect.DeepEqual(&into, tt.list) {
+				t.Errorf("DeepCopyInto() mismatch:\ngot = %+v\nwant = %+v", &into, tt.list)
+			}
+
+			// Test DeepCopyObject
+			gotObj := tt.list.DeepCopyObject()
+			if gotList, ok := gotObj.(*RootList); !ok {
+				t.Errorf("DeepCopyObject() type = %T, want *RootList", gotObj)
+			} else if !reflect.DeepEqual(gotList, tt.list) {
+				t.Errorf("DeepCopyObject() content mismatch:\ngot = %+v\nwant = %+v", gotObj, tt.list)
+			}
+		})
+	}
+}
+
+// TestRootSpec_DeepCopy tests the DeepCopy method for RootSpec
+func TestRootSpec_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *RootSpec
+	}{
+		{
+			name: "nil spec",
+			spec: nil,
+		},
+		{
+			name: "simple spec",
+			spec: &RootSpec{
+				ModelRef: "test-model",
+				Image:    "test-image",
+			},
+		},
+		{
+			name: "spec with memory config",
+			spec: &RootSpec{
+				ModelRef: "test-model",
+				Image:    "test-image",
+				Memory: &RootMemorySpec{
+					OverheadMaxRatio: func() *float64 { v := 2.0; return &v }(),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.DeepCopy()
+
+			if tt.spec == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == tt.spec {
+				t.Error("DeepCopy() returned same pointer")
+			}
+
+			if !reflect.DeepEqual(got, tt.spec) {
+				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.spec)
+			}
+		})
+	}
+}
+
+// TestRootMemorySpec_DeepCopy tests the DeepCopy method for RootMemorySpec
+func TestRootMemorySpec_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *RootMemorySpec
+	}{
+		{
+			name: "nil spec",
+			spec: nil,
+		},
+		{
+			name: "empty spec",
+			spec: &RootMemorySpec{},
+		},
+		{
+			name: "spec with value",
+			spec: &RootMemorySpec{
+				OverheadMaxRatio: func() *float64 { v := 1.5; return &v }(),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.spec.DeepCopy()
+			
+			if tt.spec == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == tt.spec {
+				t.Error("DeepCopy() returned same pointer")
+			}
+
+			if !reflect.DeepEqual(got, tt.spec) {
+				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.spec)
+			}
+		})
+	}
+}
+
+// TestRootStatus_DeepCopy tests the DeepCopy method for RootStatus
+func TestRootStatus_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name   string
+		status *RootStatus
+	}{
+		{
+			name:   "nil status",
+			status: nil,
+		},
+		{
+			name:   "empty status",
+			status: &RootStatus{},
+		},
+		{
+			name: "status with conditions",
+			status: &RootStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:   "Ready",
+						Status: metav1.ConditionTrue,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.status.DeepCopy()
+			
+			if tt.status == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() = %v, want nil", got)
+				}
+				return
+			}
+
+			if got == tt.status {
+				t.Error("DeepCopy() returned same pointer")
+			}
+
+			if !reflect.DeepEqual(got, tt.status) {
+				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.status)
+			}
+		})
+	}
+}
