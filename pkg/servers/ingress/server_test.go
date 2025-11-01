@@ -5,12 +5,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gorizond/koldun/pkg/api/openai"
+	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/gorizond/koldun/pkg/registry"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
@@ -965,6 +969,203 @@ func TestHandleReadyFailures(t *testing.T) {
 	w = httptest.NewRecorder()
 	srv.handleReady(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestHandleChatCompletionsRequiresToken(t *testing.T) {
+	t.Parallel()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  false,
+			ResponseTimeout: 200 * time.Millisecond,
+		},
+		log: logger.WithField("component", "ingress-test"),
+	}
+
+	body := strings.NewReader(`{"model":"tenant/model"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	var payload openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Contains(t, strings.ToLower(payload.Error.Message), "missing api token")
+}
+
+func TestHandleChatCompletionsRejectsInvalidToken(t *testing.T) {
+	t.Parallel()
+
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  false,
+			ResponseTimeout: 200 * time.Millisecond,
+		},
+		log: logger.WithField("component", "ingress-test"),
+	}
+
+	body := strings.NewReader(`{"model":"tenant/model"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer invalid-token")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+	require.Equal(t, http.StatusUnauthorized, w.Code)
+	var payload openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Contains(t, strings.ToLower(payload.Error.Message), "invalid api token")
+}
+
+func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 3 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+	})
+
+	token := "super-secret-token"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "ingress-test")
+	req.Header.Set("X-Trace-Id", "abc-123")
+
+	hash, err := conversationHashFromHeaders(req)
+	require.NoError(t, err)
+	backlogSubject := sessionBacklogSubject(hash)
+
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	backlogConn, err := nats.Connect(srv.cfg.NATSURL, nats.Timeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		backlogConn.Close()
+	})
+
+	sub, err := backlogConn.SubscribeSync(backlogSubject)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sub.Unsubscribe()
+	})
+	require.NoError(t, backlogConn.Flush())
+
+	errCh := make(chan error, 1)
+	responseCh := make(chan []byte, 1)
+
+	go func() {
+		msg, msgErr := sub.NextMsg(5 * time.Second)
+		if msgErr != nil {
+			errCh <- msgErr
+			return
+		}
+
+		var backlog conversation.BacklogMessage
+		if uErr := json.Unmarshal(msg.Data, &backlog); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		var payload struct {
+			ResponseSubject string `json:"responseSubject"`
+		}
+		if uErr := json.Unmarshal(backlog.Payload, &payload); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		pubConn, pubErr := nats.Connect(srv.cfg.NATSURL, nats.Timeout(2*time.Second))
+		if pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		defer pubConn.Close()
+
+		response := []byte(`{"object":"chat.completion"}`)
+		if pubErr := pubConn.Publish(payload.ResponseSubject, response); pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		if flushErr := pubConn.Flush(); flushErr != nil {
+			errCh <- flushErr
+			return
+		}
+		responseCh <- response
+		errCh <- nil
+	}()
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for backlog handler")
+	}
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "application/json", w.Header().Get("Content-Type"))
+
+	select {
+	case expected := <-responseCh:
+		require.JSONEq(t, string(expected), w.Body.String())
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for response payload")
+	}
 }
 
 func startIngressJetStream(t *testing.T) *server.Server {
