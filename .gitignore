@@ -1,6 +1,15 @@
 .gocache
 .idea
 /operator
+
+# Test coverage files
 coverage.out
+*.coverprofile
+*_coverage.out
+coverage.html
+
+# Test binaries
+*.test
+koldun.test
 
 reasoning
