@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -704,4 +706,300 @@ func TestIngressIntegration(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "list", result["object"])
 	})
+}
+
+func TestServerSessionLoadLifecycle(t *testing.T) {
+	srv := &Server{}
+
+	require.Zero(t, srv.sessionLoadValue("alpha"))
+
+	require.Equal(t, int32(1), srv.incrementSessionLoad("alpha"))
+	require.Equal(t, int32(2), srv.incrementSessionLoad("alpha"))
+	require.Equal(t, int32(2), srv.sessionLoadValue("alpha"))
+
+	require.Equal(t, int32(1), srv.decrementSessionLoad("alpha"))
+	require.Equal(t, int32(0), srv.decrementSessionLoad("alpha"))
+	require.Zero(t, srv.sessionLoadValue("alpha"))
+
+	srv.sessionLoad.mu.Lock()
+	_, exists := srv.sessionLoad.lastActivity["alpha"]
+	require.False(t, exists, "last activity should be removed when load reaches zero and cleanup disabled")
+	require.Nil(t, srv.sessionLoad.idleTimers["alpha"])
+	srv.sessionLoad.mu.Unlock()
+}
+
+func TestServerScheduleSessionCleanup(t *testing.T) {
+	srv := &Server{
+		cfg: Config{SessionScaleDownIdleSeconds: 1},
+	}
+
+	now := time.Now()
+	srv.sessionLoad.mu.Lock()
+	srv.scheduleSessionCleanupLocked("beta", now)
+	timer := srv.sessionLoad.idleTimers["beta"]
+	srv.sessionLoad.mu.Unlock()
+
+	require.NotNil(t, timer, "cleanup timer should be scheduled for idle session")
+	require.True(t, timer.Stop(), "timer should be stopped in test to avoid asynchronous cleanup")
+}
+
+func TestServerFinalizeSessionCleanup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	t.Run("removes idle record", func(t *testing.T) {
+		ns := startIngressJetStream(t)
+		js, nc := connectIngressJetStream(t, ns)
+
+		kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+			Bucket:  "ttl_cleanup_idle",
+			History: 1,
+			TTL:     time.Minute,
+		})
+		require.NoError(t, err)
+
+		srv := &Server{
+			cfg: Config{
+				TTLPrefix:                   "nats_ttl_",
+				SessionScaleDownIdleSeconds: 1,
+			},
+			convKV: kv,
+			log:    logrus.New().WithField("component", "ingress-test"),
+		}
+		srv.sessionLoad.lastActivity = map[string]time.Time{
+			"idle": time.Now().Add(-2 * time.Second),
+		}
+		timer := time.NewTimer(time.Hour)
+		require.True(t, timer.Stop())
+		srv.sessionLoad.idleTimers = map[string]*time.Timer{
+			"idle": timer,
+		}
+
+		_, err = kv.Put(srv.cfg.TTLPrefix+"idle", []byte("payload"))
+		require.NoError(t, err)
+
+		deadline := time.Now().Add(-time.Second)
+		srv.finalizeSessionCleanup("idle", deadline)
+
+		require.Eventually(t, func() bool {
+			_, err := kv.Get(srv.cfg.TTLPrefix + "idle")
+			if err == nil {
+				return false
+			}
+			return errors.Is(err, nats.ErrKeyNotFound) || errors.Is(err, nats.ErrKeyDeleted)
+		}, 5*time.Second, 100*time.Millisecond, "expected conversation record to be removed")
+
+		srv.sessionLoad.mu.Lock()
+		_, exists := srv.sessionLoad.lastActivity["idle"]
+		require.False(t, exists, "last activity should be cleared after cleanup")
+		srv.sessionLoad.mu.Unlock()
+
+		_ = nc.Flush()
+	})
+
+	t.Run("skips active session", func(t *testing.T) {
+		ns := startIngressJetStream(t)
+		js, _ := connectIngressJetStream(t, ns)
+
+		kv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+			Bucket:  "ttl_cleanup_active",
+			History: 1,
+			TTL:     time.Minute,
+		})
+		require.NoError(t, err)
+
+		srv := &Server{
+			cfg: Config{
+				TTLPrefix:                   "nats_ttl_",
+				SessionScaleDownIdleSeconds: 1,
+			},
+			convKV: kv,
+			log:    logrus.New().WithField("component", "ingress-test"),
+		}
+		srv.sessionLoad.values = map[string]int32{
+			"busy": 2,
+		}
+		srv.sessionLoad.lastActivity = map[string]time.Time{
+			"busy": time.Now(),
+		}
+		timer := time.NewTimer(time.Hour)
+		require.True(t, timer.Stop())
+		srv.sessionLoad.idleTimers = map[string]*time.Timer{
+			"busy": timer,
+		}
+
+		_, err = kv.Put(srv.cfg.TTLPrefix+"busy", []byte("payload"))
+		require.NoError(t, err)
+
+		deadline := time.Now().Add(-time.Minute)
+		srv.finalizeSessionCleanup("busy", deadline)
+
+		entry, err := kv.Get(srv.cfg.TTLPrefix + "busy")
+		require.NoError(t, err, "active session should retain conversation record")
+		require.NotNil(t, entry)
+	})
+}
+
+func TestCacheWorkerStateIdleDetection(t *testing.T) {
+	srv := &Server{}
+
+	now := time.Now()
+	srv.cacheWorkerState("tenant.prefix", "worker-1", "idle", 0, now)
+	require.True(t, srv.hasCachedIdleWorker("tenant.prefix"), "idle worker should be detected")
+
+	srv.cacheWorkerState("tenant.prefix", "worker-1", "running", 1, now.Add(time.Second))
+	require.False(t, srv.hasCachedIdleWorker("tenant.prefix"), "non-idle worker should not count")
+
+	stale := time.Now().Add(-time.Minute)
+	srv.cacheWorkerState("tenant.prefix", "stale-worker", "idle", 0, stale)
+	require.False(t, srv.hasCachedIdleWorker("tenant.prefix"), "stale entries should be purged")
+}
+
+func TestApplyCORSHeaders(t *testing.T) {
+	srv := &Server{}
+
+	t.Run("reflect origin", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Origin", "https://example.com")
+		w := httptest.NewRecorder()
+
+		srv.applyCORSHeaders(w, req)
+
+		header := w.Result().Header
+		require.Equal(t, "https://example.com", header.Get("Access-Control-Allow-Origin"))
+		require.Equal(t, corsAllowMethods, header.Get("Access-Control-Allow-Methods"))
+		require.Equal(t, corsAllowHeaders, header.Get("Access-Control-Allow-Headers"))
+		require.Equal(t, corsExposeHeaders, header.Get("Access-Control-Expose-Headers"))
+		require.Equal(t, "3600", header.Get("Access-Control-Max-Age"))
+		require.Contains(t, header.Values("Vary"), "Origin", "vary header should include Origin when reflected")
+	})
+
+	t.Run("wildcard origin", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		w := httptest.NewRecorder()
+
+		srv.applyCORSHeaders(w, req)
+
+		header := w.Result().Header
+		require.Equal(t, "*", header.Get("Access-Control-Allow-Origin"))
+		require.Empty(t, header.Get("Vary"), "vary header should remain empty for wildcard origin")
+	})
+}
+
+func TestAddVaryHeader(t *testing.T) {
+	header := http.Header{}
+
+	addVaryHeader(header, "Origin")
+	require.Equal(t, "Origin", header.Get("Vary"))
+
+	addVaryHeader(header, "origin")
+	require.Equal(t, "Origin", header.Get("Vary"), "duplicate vary values should not be appended")
+
+	addVaryHeader(header, "Authorization")
+	require.Equal(t, "Origin, Authorization", header.Get("Vary"))
+}
+
+func TestExtractAPIToken(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("X-API-KEY", "priority-token")
+	req.Header.Set("Authorization", "Bearer ignored")
+
+	require.Equal(t, "priority-token", extractAPIToken(req), "explicit API key headers should win")
+
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer actual-token")
+	require.Equal(t, "actual-token", extractAPIToken(req))
+
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Basic Zm9vOmJhcg==")
+	require.Empty(t, extractAPIToken(req), "basic auth should not be treated as API token")
+
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	require.Empty(t, extractAPIToken(req))
+}
+
+func TestStateSubjectParsing(t *testing.T) {
+	require.Equal(t, "tenant.session.dllama.", statePrefixFromSubject("tenant.session.dllama.worker.state"))
+	require.Equal(t, "", statePrefixFromSubject("invalid"))
+
+	require.Equal(t, "worker", stateWorkerFromSubject("tenant.session.worker.state"))
+	require.Equal(t, "", stateWorkerFromSubject("tenant"))
+}
+
+func TestHandleReadyFailures(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, nc := connectIngressJetStream(t, ns)
+
+	conv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_conv",
+		History: 1,
+		TTL:     time.Minute,
+	})
+	require.NoError(t, err)
+
+	srv := &Server{
+		raw: nc,
+		cfg: Config{AllowAnonymous: false},
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+	srv.convKV = conv
+	srv.modelsKV = conv
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, "tokensKV missing should block readiness when anonymous disabled")
+
+	tokens, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_tokens",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	srv.tokensKV = tokens
+	w = httptest.NewRecorder()
+	srv.handleReady(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func startIngressJetStream(t *testing.T) *server.Server {
+	t.Helper()
+
+	opts := &server.Options{
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		Port:      -1,
+	}
+	ns, err := server.NewServer(opts)
+	require.NoError(t, err)
+
+	go ns.Start()
+	t.Cleanup(ns.Shutdown)
+
+	if !ns.ReadyForConnections(5 * time.Second) {
+		t.Fatal("NATS server not ready")
+	}
+	return ns
+}
+
+func connectIngressJetStream(t *testing.T, ns *server.Server) (nats.JetStreamContext, *nats.Conn) {
+	t.Helper()
+
+	nc, err := nats.Connect(ns.ClientURL(), nats.Timeout(2*time.Second))
+	require.NoError(t, err)
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_ = nc.Drain()
+		nc.Close()
+	})
+
+	return js, nc
 }
