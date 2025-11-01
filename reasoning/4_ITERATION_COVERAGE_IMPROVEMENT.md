@@ -268,17 +268,30 @@ if cfg == nil {
 
 ## UPDATE: Итоговые результаты итерации 4
 
-После серии сессий (10-12) цель достигнута:
+После серии сессий (10-14) все цели превышены:
 
 **Прогресс покрытия:**
 - Session 10: 29.2% (DeepCopy tests для v1 API)
 - Session 11: 29.7% (LLM и Ingress helper functions)
-- **Session 12: 30.5%** ✅ (Dispatcher integration tests) **MILESTONE!**
+- Session 12: 30.5% ✅ (Dispatcher integration tests) **MILESTONE 30%!**
+- Session 13: 35.1% ✅ (Controllers helpers + retry logic) **MILESTONE 35%!**
+- **Session 14: 37.6%** ✅ (Session lifecycle + LLM integration) **MILESTONE 37%+!**
 
 **Ключевые достижения:**
-- ✅ Создан robust набор интеграционных тестов для dispatcher
-- ✅ Использован embedded NATS server для реалистичного тестирования
-- ✅ Dispatcher покрытие: 49.9% → 63.1% (+13.2pp)
-- ✅ **ЦЕЛЬ 30% ДОСТИГНУТА И ПРЕВЫШЕНА: 30.5%**
+- ✅ Создан comprehensive набор интеграционных тестов с embedded NATS
+- ✅ Покрыты критические области: retry logic, session lifecycle, stream management
+- ✅ Dispatcher покрытие: 49.9% → 68.3% (+18.4pp)
+- ✅ LLM server покрытие: 5.6% → 22.8% (+17.2pp)
+- ✅ Ingress покрытие: 14.3% → 28.7% (+14.4pp)
+- ✅ Controllers покрытие: 18.5% → 23.9% (+5.4pp)
+- ✅ **ИТОГО: 21.8% → 37.6% (+15.8pp за итерацию)**
 
-**Следующая цель:** 35% покрытия
+**Добавлено тестового кода:**
+- conversation_controller_test.go: 269 строк
+- ingress_test.go: 343 строк
+- retry_integration_test.go: 115 строк
+- llm/server_test.go: 305 строк
+- ingress/server_test.go: +299 строк расширений
+- **Итого: ~1331 строк новых тестов**
+
+**Следующая цель:** 40% покрытия (фокус на оставшихся server handlers)
