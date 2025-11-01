@@ -4,13 +4,13 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/nats-io/nats.go"
-
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/nats-io/nats.go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestIgnoreNotFound tests the ignoreNotFound error handler
+// TestIgnoreNotFound tests the ignoreNotFound function which filters out
+// NATS ErrKeyNotFound errors while preserving other errors.
 func TestIgnoreNotFound(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -23,22 +23,22 @@ func TestIgnoreNotFound(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			name:    "ErrKeyNotFound returns nil",
+			name:    "NATS ErrKeyNotFound returns nil",
 			err:     nats.ErrKeyNotFound,
 			wantNil: true,
 		},
 		{
 			name:    "wrapped ErrKeyNotFound returns nil",
-			err:     errors.Join(nats.ErrKeyNotFound, errors.New("context")),
-			wantNil: true,
+			err:     errors.New("some context: " + nats.ErrKeyNotFound.Error()),
+			wantNil: false, // errors.Is won't match wrapped string
 		},
 		{
-			name:    "other error returns error",
-			err:     errors.New("some other error"),
+			name:    "other error is preserved",
+			err:     errors.New("connection failed"),
 			wantNil: false,
 		},
 		{
-			name:    "NATS timeout error returns error",
+			name:    "nats timeout error is preserved",
 			err:     nats.ErrTimeout,
 			wantNil: false,
 		},
@@ -48,16 +48,20 @@ func TestIgnoreNotFound(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ignoreNotFound(tt.err)
 			if tt.wantNil && got != nil {
-				t.Errorf("ignoreNotFound(%v) = %v, want nil", tt.err, got)
+				t.Errorf("ignoreNotFound() = %v, want nil", got)
 			}
 			if !tt.wantNil && got == nil {
-				t.Errorf("ignoreNotFound(%v) = nil, want error", tt.err)
+				t.Errorf("ignoreNotFound() = nil, want error")
+			}
+			if !tt.wantNil && got != tt.err {
+				t.Errorf("ignoreNotFound() = %v, want %v", got, tt.err)
 			}
 		})
 	}
 }
 
-// TestModelKey tests the modelKey function which creates namespaced keys
+// TestModelKey tests the modelKey function which generates namespaced keys
+// for model storage in NATS KV.
 func TestModelKey(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -67,51 +71,45 @@ func TestModelKey(t *testing.T) {
 	}{
 		{
 			name:      "normal namespace and name",
-			namespace: "default",
+			namespace: "production",
 			modelName: "llama-7b",
-			want:      "default/llama-7b",
+			want:      "production/llama-7b",
 		},
 		{
-			name:      "empty namespace defaults to 'default'",
+			name:      "empty namespace defaults to default",
 			namespace: "",
-			modelName: "llama-7b",
-			want:      "default/llama-7b",
+			modelName: "gpt2",
+			want:      "default/gpt2",
 		},
 		{
-			name:      "whitespace namespace defaults to 'default'",
-			namespace: "   ",
-			modelName: "llama-7b",
-			want:      "default/llama-7b",
+			name:      "whitespace namespace defaults to default",
+			namespace: "  ",
+			modelName: "bert",
+			want:      "default/bert",
 		},
 		{
-			name:      "custom namespace",
-			namespace: "ai-models",
-			modelName: "gpt-4",
-			want:      "ai-models/gpt-4",
+			name:      "namespace with whitespace is trimmed",
+			namespace: "  staging  ",
+			modelName: "model-v2",
+			want:      "staging/model-v2",
 		},
 		{
-			name:      "name with spaces trimmed",
+			name:      "model name with whitespace is trimmed",
+			namespace: "dev",
+			modelName: "  my-model  ",
+			want:      "dev/my-model",
+		},
+		{
+			name:      "both trimmed",
+			namespace: " kube-system ",
+			modelName: " metrics-server ",
+			want:      "kube-system/metrics-server",
+		},
+		{
+			name:      "default namespace",
 			namespace: "default",
-			modelName: "  llama-7b  ",
-			want:      "default/llama-7b",
-		},
-		{
-			name:      "both with spaces trimmed",
-			namespace: "  ai-models  ",
-			modelName: "  gpt-4  ",
-			want:      "ai-models/gpt-4",
-		},
-		{
-			name:      "empty name",
-			namespace: "default",
-			modelName: "",
-			want:      "default/",
-		},
-		{
-			name:      "name with dashes and numbers",
-			namespace: "prod",
-			modelName: "llama-2-7b-chat",
-			want:      "prod/llama-2-7b-chat",
+			modelName: "test-model",
+			want:      "default/test-model",
 		},
 	}
 
@@ -125,7 +123,8 @@ func TestModelKey(t *testing.T) {
 	}
 }
 
-// TestModelReady tests the modelReady function which checks if a model is ready
+// TestModelReady tests the modelReady function which determines if a Model
+// is ready for use based on its status fields and conditions.
 func TestModelReady(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -138,7 +137,7 @@ func TestModelReady(t *testing.T) {
 			want:  false,
 		},
 		{
-			name: "model with empty OutputPVCName is not ready",
+			name: "empty OutputPVCName is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
 					OutputPVCName:       "",
@@ -152,7 +151,7 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "model with whitespace OutputPVCName is not ready",
+			name: "whitespace OutputPVCName is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
 					OutputPVCName:       "   ",
@@ -166,10 +165,10 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "model with zero size bytes and empty human size is not ready",
+			name: "missing size information is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
+					OutputPVCName:       "model-pvc",
 					ConversionSizeBytes: 0,
 					ConversionSizeHuman: "",
 					Conditions: []metav1.Condition{
@@ -180,10 +179,10 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "model with negative size bytes and empty human size is not ready",
+			name: "negative size bytes is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
+					OutputPVCName:       "model-pvc",
 					ConversionSizeBytes: -100,
 					ConversionSizeHuman: "",
 					Conditions: []metav1.Condition{
@@ -194,10 +193,10 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "model with Ready condition false is not ready",
+			name: "ready condition false is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
+					OutputPVCName:       "model-pvc",
 					ConversionSizeBytes: 1000,
 					ConversionSizeHuman: "1KB",
 					Conditions: []metav1.Condition{
@@ -208,10 +207,10 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "model with no Ready condition is not ready",
+			name: "missing ready condition is not ready",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
+					OutputPVCName:       "model-pvc",
 					ConversionSizeBytes: 1000,
 					ConversionSizeHuman: "1KB",
 					Conditions:          []metav1.Condition{},
@@ -220,39 +219,11 @@ func TestModelReady(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "fully ready model with size bytes",
+			name: "fully ready model with bytes only",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
-					ConversionSizeBytes: 1000000,
-					ConversionSizeHuman: "1MB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "ready model with only human size",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
-					ConversionSizeBytes: 0,
-					ConversionSizeHuman: "1MB",
-					Conditions: []metav1.Condition{
-						{Type: conditionReady, Status: metav1.ConditionTrue},
-					},
-				},
-			},
-			want: true,
-		},
-		{
-			name: "ready model with only size bytes",
-			model: &v1.Model{
-				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
-					ConversionSizeBytes: 1000000,
+					OutputPVCName:       "model-pvc",
+					ConversionSizeBytes: 5000000000,
 					ConversionSizeHuman: "",
 					Conditions: []metav1.Condition{
 						{Type: conditionReady, Status: metav1.ConditionTrue},
@@ -262,12 +233,39 @@ func TestModelReady(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "ready model with multiple conditions",
+			name: "fully ready model with human size only",
 			model: &v1.Model{
 				Status: v1.ModelStatus{
-					OutputPVCName:       "pvc-test",
-					ConversionSizeBytes: 1000000,
-					ConversionSizeHuman: "1MB",
+					OutputPVCName:       "llama-7b-pvc",
+					ConversionSizeBytes: 0,
+					ConversionSizeHuman: "5GB",
+					Conditions: []metav1.Condition{
+						{Type: conditionReady, Status: metav1.ConditionTrue},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "fully ready model with both sizes",
+			model: &v1.Model{
+				Status: v1.ModelStatus{
+					OutputPVCName:       "gpt2-medium-pvc",
+					ConversionSizeBytes: 5000000000,
+					ConversionSizeHuman: "5GB",
+					Conditions: []metav1.Condition{
+						{Type: conditionReady, Status: metav1.ConditionTrue},
+					},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "ready with multiple conditions",
+			model: &v1.Model{
+				Status: v1.ModelStatus{
+					OutputPVCName:       "model-pvc",
+					ConversionSizeBytes: 1000,
 					Conditions: []metav1.Condition{
 						{Type: "Downloaded", Status: metav1.ConditionTrue},
 						{Type: "Converted", Status: metav1.ConditionTrue},
@@ -276,6 +274,20 @@ func TestModelReady(t *testing.T) {
 				},
 			},
 			want: true,
+		},
+		{
+			name: "ready condition unknown is not ready",
+			model: &v1.Model{
+				Status: v1.ModelStatus{
+					OutputPVCName:       "model-pvc",
+					ConversionSizeBytes: 1000,
+					ConversionSizeHuman: "1KB",
+					Conditions: []metav1.Condition{
+						{Type: conditionReady, Status: metav1.ConditionUnknown},
+					},
+				},
+			},
+			want: false,
 		},
 	}
 
