@@ -1,6 +1,8 @@
 package ingress
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -345,6 +347,269 @@ func TestUniqueSubjects(t *testing.T) {
 					assert.Less(t, result[i-1], result[i], "subjects should be sorted")
 				}
 			}
+		})
+	}
+}
+
+// TestIsHexDigest validates hex digest validation.
+func TestIsHexDigest(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected bool
+	}{
+		{
+			name:     "valid 64-char hex",
+			input:    strings.Repeat("a", 64),
+			expected: true,
+		},
+		{
+			name:     "valid sha256 hash",
+			input:    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+			expected: true,
+		},
+		{
+			name:     "uppercase hex",
+			input:    "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+			expected: true,
+		},
+		{
+			name:     "too short",
+			input:    "abc123",
+			expected: false,
+		},
+		{
+			name:     "too long",
+			input:    strings.Repeat("a", 65),
+			expected: false,
+		},
+		{
+			name:     "invalid characters",
+			input:    strings.Repeat("g", 64),
+			expected: false,
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: false,
+		},
+		{
+			name:     "63 chars",
+			input:    strings.Repeat("a", 63),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isHexDigest(tt.input)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestSha256Hex validates SHA256 hex encoding.
+func TestSha256Hex(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+		{
+			name:     "simple string",
+			input:    "hello",
+			expected: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+		},
+		{
+			name:     "with spaces",
+			input:    "hello world",
+			expected: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sha256Hex(tt.input)
+			assert.Equal(t, tt.expected, result)
+			assert.Len(t, result, 64, "SHA256 hash should be 64 characters")
+			assert.True(t, isHexDigest(result), "result should be valid hex")
+
+			// Verify against standard library
+			sum := sha256.Sum256([]byte(tt.input))
+			expectedStd := hex.EncodeToString(sum[:])
+			assert.Equal(t, expectedStd, result)
+		})
+	}
+}
+
+// TestFirstNonEmpty validates first non-empty string selection.
+func TestFirstNonEmpty(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []string
+		expected string
+	}{
+		{
+			name:     "first is non-empty",
+			input:    []string{"first", "second", "third"},
+			expected: "first",
+		},
+		{
+			name:     "skip empty strings",
+			input:    []string{"", "second", "third"},
+			expected: "second",
+		},
+		{
+			name:     "skip whitespace",
+			input:    []string{"  ", "\t", "value"},
+			expected: "value",
+		},
+		{
+			name:     "all empty",
+			input:    []string{"", "  ", "\t"},
+			expected: "",
+		},
+		{
+			name:     "empty slice",
+			input:    []string{},
+			expected: "",
+		},
+		{
+			name:     "single value",
+			input:    []string{"only"},
+			expected: "only",
+		},
+		{
+			name:     "returns first trimmed",
+			input:    []string{"", "  value  ", "other"},
+			expected: "  value  ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := firstNonEmpty(tt.input...)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// TestWriteJSON validates JSON response writing.
+func TestWriteJSON(t *testing.T) {
+	tests := []struct {
+		name           string
+		status         int
+		payload        any
+		expectedStatus int
+		expectBody     bool
+	}{
+		{
+			name:           "with payload",
+			status:         http.StatusOK,
+			payload:        map[string]string{"message": "hello"},
+			expectedStatus: http.StatusOK,
+			expectBody:     true,
+		},
+		{
+			name:           "nil payload",
+			status:         http.StatusNoContent,
+			payload:        nil,
+			expectedStatus: http.StatusNoContent,
+			expectBody:     false,
+		},
+		{
+			name:           "error status with payload",
+			status:         http.StatusBadRequest,
+			payload:        map[string]string{"error": "invalid request"},
+			expectedStatus: http.StatusBadRequest,
+			expectBody:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeJSON(w, tt.status, tt.payload)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+			assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
+
+			if tt.expectBody {
+				assert.NotEmpty(t, w.Body.String())
+				// Verify it's valid JSON
+				var result map[string]interface{}
+				err := json.Unmarshal(w.Body.Bytes(), &result)
+				assert.NoError(t, err, "response should be valid JSON")
+			} else {
+				assert.Empty(t, w.Body.String(), "nil payload should produce empty body")
+			}
+		})
+	}
+}
+
+// TestMinVal validates minimum value calculation.
+func TestMinVal(t *testing.T) {
+	tests := []struct {
+		name     string
+		a        int
+		b        int
+		expected int
+	}{
+		{
+			name:     "a less than b",
+			a:        1,
+			b:        5,
+			expected: 1,
+		},
+		{
+			name:     "b less than a",
+			a:        10,
+			b:        3,
+			expected: 3,
+		},
+		{
+			name:     "equal values",
+			a:        7,
+			b:        7,
+			expected: 7,
+		},
+		{
+			name:     "negative values",
+			a:        -5,
+			b:        -10,
+			expected: -10,
+		},
+		{
+			name:     "mixed positive negative",
+			a:        5,
+			b:        -3,
+			expected: -3,
+		},
+		{
+			name:     "zero values",
+			a:        0,
+			b:        0,
+			expected: 0,
+		},
+		{
+			name:     "zero and positive",
+			a:        0,
+			b:        10,
+			expected: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := minVal(tt.a, tt.b)
+			assert.Equal(t, tt.expected, result)
+			assert.LessOrEqual(t, result, tt.a, "result should be <= a")
+			assert.LessOrEqual(t, result, tt.b, "result should be <= b")
 		})
 	}
 }
