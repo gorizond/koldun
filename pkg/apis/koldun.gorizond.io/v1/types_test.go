@@ -61,6 +61,193 @@ func TestDllamaNATSConfig_Validate(t *testing.T) {
 	}
 }
 
+// TestModelStatus_DeepCopy tests the DeepCopy method for ModelStatus
+func TestModelStatus_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name   string
+		status *ModelStatus
+	}{
+		{
+			name:   "nil status",
+			status: nil,
+		},
+		{
+			name:   "empty status",
+			status: &ModelStatus{},
+		},
+		{
+			name: "status with download state",
+			status: &ModelStatus{
+				DownloadState: "Running",
+			},
+		},
+		{
+			name: "status with all fields",
+			status: &ModelStatus{
+				ObservedGeneration: 2,
+				DownloadState:      "Succeeded",
+				ArtifactSizeBytes:  1024000,
+				DownloadJobName:    "model-download-123",
+				ConversionJobName:  "model-convert-456",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *ModelStatus
+			if tt.status != nil {
+				got = tt.status.DeepCopy()
+			}
+
+			if tt.status == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			if got == tt.status {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			if !reflect.DeepEqual(got, tt.status) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.status)
+			}
+		})
+	}
+}
+
+// TestSessionStatus_DeepCopy tests the DeepCopy method for SessionStatus
+func TestSessionStatus_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name   string
+		status *SessionStatus
+	}{
+		{
+			name:   "nil status",
+			status: nil,
+		},
+		{
+			name:   "empty status",
+			status: &SessionStatus{},
+		},
+		{
+			name: "status with workers",
+			status: &SessionStatus{
+				ReadyWorkers:     3,
+				AvailableWorkers: 2,
+			},
+		},
+		{
+			name: "status with all fields",
+			status: &SessionStatus{
+				ObservedGeneration: 5,
+				ReadyWorkers:       3,
+				BusyWorkers:        1,
+				AvailableWorkers:   2,
+				Backlog:            10,
+				InFlight:           2,
+				ActiveRequests:     1,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *SessionStatus
+			if tt.status != nil {
+				got = tt.status.DeepCopy()
+			}
+
+			if tt.status == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			if got == tt.status {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			if !reflect.DeepEqual(got, tt.status) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.status)
+			}
+		})
+	}
+}
+
+// TestModelConversionSpec_DeepCopy tests the DeepCopy method for ModelConversionSpec
+func TestModelConversionSpec_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		spec *ModelConversionSpec
+	}{
+		{
+			name: "nil spec",
+			spec: nil,
+		},
+		{
+			name: "empty spec",
+			spec: &ModelConversionSpec{},
+		},
+		{
+			name: "spec with weightsFloatType",
+			spec: &ModelConversionSpec{
+				WeightsFloatType: "q40",
+			},
+		},
+		{
+			name: "spec with all fields",
+			spec: &ModelConversionSpec{
+				WeightsFloatType: "q40",
+				ConvertWeights:   "yes",
+				Memory:           "8Gi",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *ModelConversionSpec
+			if tt.spec != nil {
+				got = tt.spec.DeepCopy()
+			}
+
+			if tt.spec == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			if got == tt.spec {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			if !reflect.DeepEqual(got, tt.spec) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.spec)
+			}
+		})
+	}
+}
+
 func TestDllamaStatus_DeepCopy(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -709,6 +896,428 @@ func TestCacheSpec_DeepCopy(t *testing.T) {
 			}
 			if got.Bucket != tt.spec.Bucket {
 				t.Errorf("Bucket = %v, want %v", got.Bucket, tt.spec.Bucket)
+			}
+		})
+	}
+}
+
+// TestModelList_DeepCopy tests the DeepCopy methods for ModelList
+func TestModelList_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		list *ModelList
+	}{
+		{
+			name: "nil list",
+			list: nil,
+		},
+		{
+			name: "empty list",
+			list: &ModelList{},
+		},
+		{
+			name: "list with metadata",
+			list: &ModelList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "ModelList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "12345",
+				},
+			},
+		},
+		{
+			name: "list with single item",
+			list: &ModelList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "ModelList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				Items: []Model{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "model1",
+							Namespace: "default",
+						},
+						Spec: ModelSpec{
+							SourceURL: "http://example.com/model",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "list with multiple items",
+			list: &ModelList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "ModelList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "67890",
+					Continue:        "next-page",
+				},
+				Items: []Model{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "model1",
+							Namespace: "ns1",
+						},
+						Spec: ModelSpec{
+							SourceURL: "http://example.com/model1",
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "model2",
+							Namespace: "ns2",
+						},
+						Spec: ModelSpec{
+							SourceURL: "http://example.com/model2",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test DeepCopy
+			var got *ModelList
+			if tt.list != nil {
+				got = tt.list.DeepCopy()
+			}
+
+			if tt.list == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			// Verify it's a different instance
+			if got == tt.list {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			// Verify content is equal
+			if !reflect.DeepEqual(got, tt.list) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.list)
+			}
+
+			// Test DeepCopyInto
+			into := &ModelList{}
+			tt.list.DeepCopyInto(into)
+
+			if !reflect.DeepEqual(into, tt.list) {
+				t.Errorf("DeepCopyInto() content mismatch:\ngot = %+v\nwant = %+v", into, tt.list)
+			}
+
+			// Test DeepCopyObject
+			obj := tt.list.DeepCopyObject()
+			if obj == nil {
+				t.Errorf("DeepCopyObject() = nil, want non-nil")
+				return
+			}
+
+			gotObj, ok := obj.(*ModelList)
+			if !ok {
+				t.Errorf("DeepCopyObject() returned %T, want *ModelList", obj)
+				return
+			}
+
+			if !reflect.DeepEqual(gotObj, tt.list) {
+				t.Errorf("DeepCopyObject() content mismatch:\ngot = %+v\nwant = %+v", gotObj, tt.list)
+			}
+		})
+	}
+}
+
+// TestSessionList_DeepCopy tests the DeepCopy methods for SessionList
+func TestSessionList_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		list *SessionList
+	}{
+		{
+			name: "nil list",
+			list: nil,
+		},
+		{
+			name: "empty list",
+			list: &SessionList{},
+		},
+		{
+			name: "list with metadata",
+			list: &SessionList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "SessionList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "12345",
+				},
+			},
+		},
+		{
+			name: "list with single item",
+			list: &SessionList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "SessionList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				Items: []Session{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "session1",
+							Namespace: "default",
+						},
+						Spec: SessionSpec{
+							Hash: "session1-hash",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "list with multiple items",
+			list: &SessionList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "SessionList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "67890",
+					Continue:        "next-page",
+				},
+				Items: []Session{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "session1",
+							Namespace: "ns1",
+						},
+						Spec: SessionSpec{
+							Hash: "session1-hash",
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "session2",
+							Namespace: "ns2",
+						},
+						Spec: SessionSpec{
+							Hash: "session2-hash",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test DeepCopy
+			var got *SessionList
+			if tt.list != nil {
+				got = tt.list.DeepCopy()
+			}
+
+			if tt.list == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			// Verify it's a different instance
+			if got == tt.list {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			// Verify content is equal
+			if !reflect.DeepEqual(got, tt.list) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.list)
+			}
+
+			// Test DeepCopyInto
+			into := &SessionList{}
+			tt.list.DeepCopyInto(into)
+
+			if !reflect.DeepEqual(into, tt.list) {
+				t.Errorf("DeepCopyInto() content mismatch:\ngot = %+v\nwant = %+v", into, tt.list)
+			}
+
+			// Test DeepCopyObject
+			obj := tt.list.DeepCopyObject()
+			if obj == nil {
+				t.Errorf("DeepCopyObject() = nil, want non-nil")
+				return
+			}
+
+			gotObj, ok := obj.(*SessionList)
+			if !ok {
+				t.Errorf("DeepCopyObject() returned %T, want *SessionList", obj)
+				return
+			}
+
+			if !reflect.DeepEqual(gotObj, tt.list) {
+				t.Errorf("DeepCopyObject() content mismatch:\ngot = %+v\nwant = %+v", gotObj, tt.list)
+			}
+		})
+	}
+}
+
+// TestDllamaList_DeepCopy tests the DeepCopy methods for DllamaList
+func TestDllamaList_DeepCopy(t *testing.T) {
+	tests := []struct {
+		name string
+		list *DllamaList
+	}{
+		{
+			name: "nil list",
+			list: nil,
+		},
+		{
+			name: "empty list",
+			list: &DllamaList{},
+		},
+		{
+			name: "list with metadata",
+			list: &DllamaList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "DllamaList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "12345",
+				},
+			},
+		},
+		{
+			name: "list with single item",
+			list: &DllamaList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "DllamaList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				Items: []Dllama{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "dllama1",
+							Namespace: "default",
+						},
+						Spec: DllamaSpec{
+							ModelRef: ModelReference{
+								Name: "model1",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "list with multiple items",
+			list: &DllamaList{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "DllamaList",
+					APIVersion: "koldun.gorizond.io/v1",
+				},
+				ListMeta: metav1.ListMeta{
+					ResourceVersion: "67890",
+				},
+				Items: []Dllama{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "dllama1",
+							Namespace: "ns1",
+						},
+						Spec: DllamaSpec{
+							ModelRef: ModelReference{
+								Name: "model1",
+							},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "dllama2",
+							Namespace: "ns2",
+						},
+						Spec: DllamaSpec{
+							ModelRef: ModelReference{
+								Name: "model2",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Test DeepCopy
+			var got *DllamaList
+			if tt.list != nil {
+				got = tt.list.DeepCopy()
+			}
+
+			if tt.list == nil {
+				if got != nil {
+					t.Errorf("DeepCopy() of nil should return nil, got %v", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Errorf("DeepCopy() = nil, want non-nil")
+				return
+			}
+
+			// Verify it's a different instance
+			if got == tt.list {
+				t.Errorf("DeepCopy() returned same instance, want different instance")
+			}
+
+			// Verify content is equal
+			if !reflect.DeepEqual(got, tt.list) {
+				t.Errorf("DeepCopy() content mismatch:\ngot = %+v\nwant = %+v", got, tt.list)
+			}
+
+			// Test DeepCopyInto
+			into := &DllamaList{}
+			tt.list.DeepCopyInto(into)
+
+			if !reflect.DeepEqual(into, tt.list) {
+				t.Errorf("DeepCopyInto() content mismatch:\ngot = %+v\nwant = %+v", into, tt.list)
+			}
+
+			// Test DeepCopyObject
+			obj := tt.list.DeepCopyObject()
+			if obj == nil {
+				t.Errorf("DeepCopyObject() = nil, want non-nil")
+				return
+			}
+
+			gotObj, ok := obj.(*DllamaList)
+			if !ok {
+				t.Errorf("DeepCopyObject() returned %T, want *DllamaList", obj)
+				return
+			}
+
+			if !reflect.DeepEqual(gotObj, tt.list) {
+				t.Errorf("DeepCopyObject() content mismatch:\ngot = %+v\nwant = %+v", gotObj, tt.list)
 			}
 		})
 	}
