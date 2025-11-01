@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorizond/koldun/pkg/api/openai"
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -262,6 +264,128 @@ func TestProbeSidecarUpdatesMetrics(t *testing.T) {
 	require.Equal(t, float64(0), value)
 }
 
+func TestHandleMessagePublishesStateAndResponse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/chat/completions", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp-1"}`))
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName:     "dllama-handle",
+			SidecarURL:     sidecar.URL,
+			SidecarTimeout: time.Second,
+		},
+		nc:           nc,
+		client:       sidecar.Client(),
+		log:          logrus.NewEntry(logger),
+		outSubject:   "responses.subject",
+		stateSubject: "state.subject",
+	}
+
+	stateSub, err := nc.SubscribeSync("state.subject")
+	require.NoError(t, err)
+	respSub, err := nc.SubscribeSync("responses.subject")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		Hash:            "hash-1",
+		ChatID:          "chat-1",
+		Model:           "tenant/model",
+		Namespace:       "tenant",
+		ResponseSubject: "responses.subject",
+		Request: openai.ChatCompletionRequest{
+			Model: "tenant/model",
+		},
+	}
+	env := conversation.AssignmentEnvelope{
+		AssignmentID: "assignment-1",
+		Payload:      mustJSON(t, payload),
+	}
+
+	msg := &nats.Msg{Data: mustJSON(t, env)}
+
+	successBefore := testutil.ToFloat64(metrics.LLMRequestsTotal.WithLabelValues("success"))
+
+	srv.handleMessage(msg)
+	require.NoError(t, nc.Flush())
+
+	successAfter := testutil.ToFloat64(metrics.LLMRequestsTotal.WithLabelValues("success"))
+	require.Equal(t, successBefore+1, successAfter, "success counter should increment")
+
+	busyMsg, err := stateSub.NextMsg(time.Second)
+	require.NoError(t, err)
+	var busy conversation.WorkerStateEvent
+	require.NoError(t, json.Unmarshal(busyMsg.Data, &busy))
+	require.Equal(t, "busy", busy.State)
+	require.Equal(t, "assignment-1", busy.AssignmentID)
+	require.Equal(t, "dllama-handle", busy.Dllama)
+
+	respMsg, err := respSub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"resp-1"}`, string(respMsg.Data))
+
+	idleMsg, err := stateSub.NextMsg(time.Second)
+	require.NoError(t, err)
+	var idle conversation.WorkerStateEvent
+	require.NoError(t, json.Unmarshal(idleMsg.Data, &idle))
+	require.Equal(t, "idle", idle.State)
+	require.Equal(t, "dllama-handle", idle.Dllama)
+	require.Zero(t, idle.Active)
+}
+
+func TestStartHeartbeatLoopPublishesIdleImmediately(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-heartbeat",
+		},
+		nc:           nc,
+		log:          logrus.NewEntry(logger),
+		stateSubject: "sessions.hash.dllama.worker.state",
+	}
+
+	sub, err := nc.SubscribeSync("sessions.hash.dllama.worker.state")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	srv.startHeartbeatLoop(ctx)
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+
+	var event conversation.WorkerStateEvent
+	require.NoError(t, json.Unmarshal(msg.Data, &event))
+	require.Equal(t, "idle", event.State)
+	require.Equal(t, "dllama-heartbeat", event.Dllama)
+
+	cancel()
+	srv.wg.Wait()
+}
+
 func startJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
 
@@ -302,4 +426,12 @@ func connectJetStream(t *testing.T, ns *server.Server) (nats.JetStreamContext, *
 	})
 
 	return js, nc
+}
+
+func mustJSON(t *testing.T, payload any) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(payload)
+	require.NoError(t, err)
+	return data
 }
