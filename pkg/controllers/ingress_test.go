@@ -1,0 +1,343 @@
+package controllers
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/pointer"
+)
+
+func newIngressSpec() *v1.IngressSpec {
+	conversationTTL := metav1.Duration{Duration: 30 * time.Second}
+	responseTimeout := metav1.Duration{Duration: 45 * time.Second}
+
+	return &v1.IngressSpec{
+		Backend: v1.IngressBackendSpec{
+			Image:          "ghcr.io/gorizond/backend:latest",
+			RootImage:      "ghcr.io/gorizond/root:latest",
+			WorkerImage:    "ghcr.io/gorizond/worker:latest",
+			ReplicaPower:   2,
+			HashSecret:     "topsecret",
+			AllowAnonymous: true,
+			NATS: v1.IngressNATSConfig{
+				URL:                "nats://example:4222",
+				ConversationBucket: "conversation-bucket",
+				ModelsBucket:       "models-bucket",
+				TokensBucket:       "tokens-bucket",
+				ModelPrefix:        "models",
+				TokenPrefix:        "tokens",
+			},
+			ConversationTTL: &conversationTTL,
+			ResponseTimeout: &responseTimeout,
+			SessionScaling: &v1.IngressSessionScalingSpec{
+				MinDllamas:           1,
+				MaxDllamas:           3,
+				ScaleUpBacklog:       5,
+				ScaleDownIdleSeconds: 120,
+			},
+		},
+		Route: v1.IngressRouteSpec{
+			Host: "chat.example.com",
+		},
+	}
+}
+
+func newIngress() *v1.Ingress {
+	spec := newIngressSpec()
+	return &v1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-backend",
+			Namespace: "testing",
+		},
+		Spec: *spec,
+	}
+}
+
+func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {
+	spec := newIngressSpec()
+	args := backendArgs(spec, 9090)
+
+	expected := []string{
+		"--mode=backend",
+		"--backend-listen=:9090",
+		"--backend-namespace=$(POD_NAMESPACE)",
+		"--backend-root-image=ghcr.io/gorizond/root:latest",
+		"--backend-worker-image=ghcr.io/gorizond/worker:latest",
+		"--backend-replica-power=2",
+		"--backend-session-dispatcher-image=ghcr.io/gorizond/backend:latest",
+		"--backend-nats-url=nats://example:4222",
+		"--backend-conversation-bucket=conversation-bucket",
+		"--backend-models-bucket=models-bucket",
+		"--backend-tokens-bucket=tokens-bucket",
+		"--backend-model-prefix=models",
+		"--backend-token-prefix=tokens",
+		"--backend-ttl-prefix=nats_ttl_",
+		"--backend-conversation-ttl=30s",
+		"--backend-response-timeout=45s",
+		"--backend-session-min-dllamas=1",
+		"--backend-session-max-dllamas=3",
+		"--backend-session-scale-up-backlog=5",
+		"--backend-session-scale-down-idle-seconds=120",
+		"--backend-hash-secret=topsecret",
+		"--backend-allow-anonymous",
+	}
+
+	require.Equal(t, expected, args)
+}
+
+func containsArg(args []string, prefix string) bool {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBackendArgs_OverridesAndOmissions(t *testing.T) {
+	spec := newIngressSpec()
+	spec.Backend.ReplicaPower = 0
+	spec.Backend.DispatcherImage = "ghcr.io/gorizond/dispatcher:v1.2.3"
+	spec.Backend.NATS.TTLPrefix = "ttl_custom_"
+	spec.Backend.ConversationTTL = nil
+	spec.Backend.ResponseTimeout = nil
+	spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{}
+	spec.Backend.HashSecret = ""
+	spec.Backend.AllowAnonymous = false
+
+	args := backendArgs(spec, 8082)
+
+	require.Contains(t, args, "--backend-session-dispatcher-image=ghcr.io/gorizond/dispatcher:v1.2.3")
+	require.Contains(t, args, "--backend-ttl-prefix=ttl_custom_")
+	require.False(t, containsArg(args, "--backend-replica-power"))
+	require.False(t, containsArg(args, "--backend-conversation-ttl"))
+	require.False(t, containsArg(args, "--backend-response-timeout"))
+	require.False(t, containsArg(args, "--backend-session-min-dllamas"))
+	require.False(t, containsArg(args, "--backend-session-max-dllamas"))
+	require.False(t, containsArg(args, "--backend-session-scale-up-backlog"))
+	require.False(t, containsArg(args, "--backend-session-scale-down-idle-seconds"))
+	require.False(t, containsArg(args, "--backend-hash-secret"))
+	require.False(t, containsArg(args, "--backend-allow-anonymous"))
+}
+
+func TestServicePort(t *testing.T) {
+	spec := newIngressSpec()
+	require.Equal(t, int32(8082), servicePort(spec))
+
+	spec.Service = &v1.IngressServiceSpec{Port: 9090}
+	require.Equal(t, int32(9090), servicePort(spec))
+}
+
+func TestDesiredBackendDeployment(t *testing.T) {
+	ing := newIngress()
+	ing.Spec.Backend.Image = "ghcr.io/gorizond/backend:stable"
+	ing.Spec.Backend.DispatcherImage = "ghcr.io/gorizond/dispatcher:stable"
+	ing.Spec.Backend.ImagePullPolicy = string(corev1.PullAlways)
+	ing.Spec.Backend.ExtraArgs = []string{"--log-level=debug", "--metrics-bind=:9000"}
+	ing.Spec.Backend.Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+
+	deployment := desiredBackendDeployment(ing, "chat-backend")
+	require.Equal(t, "chat-backend", deployment.Name)
+	require.Equal(t, "testing", deployment.Namespace)
+	require.NotNil(t, deployment.Spec.Replicas)
+	require.Equal(t, int32(1), *deployment.Spec.Replicas)
+	require.Equal(t, map[string]string{
+		labelComponent:   componentBackend,
+		labelBackendName: ing.Name,
+	}, deployment.Spec.Template.Labels)
+
+	require.Len(t, deployment.Spec.Template.Spec.Containers, 1)
+	container := deployment.Spec.Template.Spec.Containers[0]
+	require.Equal(t, "backend", container.Name)
+	require.Equal(t, "ghcr.io/gorizond/backend:stable", container.Image)
+	require.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
+	require.True(t, strings.HasPrefix(container.Args[0], "--mode=backend"))
+	require.True(t, containsArg(container.Args, "--backend-session-dispatcher-image=ghcr.io/gorizond/dispatcher:stable"))
+	require.Equal(t, ing.Spec.Backend.ExtraArgs, container.Args[len(container.Args)-len(ing.Spec.Backend.ExtraArgs):])
+	require.Equal(t, ing.Spec.Backend.Resources, container.Resources)
+}
+
+func TestDesiredBackendService(t *testing.T) {
+	ing := newIngress()
+	ing.Spec.Service = &v1.IngressServiceSpec{
+		Type: string(corev1.ServiceTypeNodePort),
+		Port: 9090,
+	}
+
+	service := desiredBackendService(ing, "chat-backend")
+	require.Equal(t, "chat-backend", service.Name)
+	require.Equal(t, corev1.ServiceTypeNodePort, service.Spec.Type)
+	require.Equal(t, int32(9090), service.Spec.Ports[0].Port)
+	require.Equal(t, map[string]string{
+		labelComponent:   componentBackend,
+		labelBackendName: ing.Name,
+	}, service.Spec.Selector)
+}
+
+func TestDesiredKubernetesIngress(t *testing.T) {
+	ing := newIngress()
+	ing.Spec.Service = &v1.IngressServiceSpec{Port: 8443}
+	ing.Spec.Route = v1.IngressRouteSpec{
+		Host:             "chat.example.com",
+		Path:             "/v1/chat",
+		PathType:         "Prefix",
+		IngressClassName: "nginx",
+		Annotations: map[string]string{
+			"nginx.ingress.kubernetes.io/rewrite-target": "/",
+		},
+		TLS: []v1.IngressTLSSpec{
+			{
+				SecretName: "chat-tls",
+				Hosts:      []string{"chat.example.com"},
+			},
+		},
+	}
+
+	route := desiredKubernetesIngress(ing, "chat-backend", "chat-route")
+	require.Equal(t, "chat-route", route.Name)
+	require.Equal(t, "testing", route.Namespace)
+	require.Equal(t, "chat.example.com", route.Spec.Rules[0].Host)
+	require.Equal(t, "/v1/chat", route.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Path)
+	require.Equal(t, networkingv1.PathTypePrefix, *route.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].PathType)
+	require.Equal(t, int32(8443), route.Spec.Rules[0].IngressRuleValue.HTTP.Paths[0].Backend.Service.Port.Number)
+	require.NotNil(t, route.Spec.IngressClassName)
+	require.Equal(t, "nginx", *route.Spec.IngressClassName)
+	require.Equal(t, map[string]string{
+		labelComponent:   componentBackend,
+		labelBackendName: ing.Name,
+	}, route.Labels)
+	require.Equal(t, ing.Spec.Route.Annotations, route.Annotations)
+	require.Len(t, route.Spec.TLS, 1)
+	require.Equal(t, "chat-tls", route.Spec.TLS[0].SecretName)
+	require.Equal(t, []string{"chat.example.com"}, route.Spec.TLS[0].Hosts)
+
+	// Ensure TLS hosts were deep-copied.
+	ing.Spec.Route.TLS[0].Hosts[0] = "mutated.example.com"
+	require.Equal(t, []string{"chat.example.com"}, route.Spec.TLS[0].Hosts)
+}
+
+func TestPathTypePtr(t *testing.T) {
+	require.Equal(t, networkingv1.PathTypeImplementationSpecific, *pathTypePtr(""))
+	require.Equal(t, networkingv1.PathTypeExact, *pathTypePtr("exact"))
+	require.Equal(t, networkingv1.PathTypePrefix, *pathTypePtr("PREFIX"))
+	require.Equal(t, networkingv1.PathTypeImplementationSpecific, *pathTypePtr("unknown"))
+}
+
+func TestIsResourceRequirementsEmpty(t *testing.T) {
+	require.True(t, isResourceRequirementsEmpty(corev1.ResourceRequirements{}))
+
+	req := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+	}
+	require.False(t, isResourceRequirementsEmpty(req))
+
+	limits := corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("1"),
+		},
+	}
+	require.False(t, isResourceRequirementsEmpty(limits))
+}
+
+func TestValidateIngressSpec(t *testing.T) {
+	require.NoError(t, validateIngressSpec(newIngressSpec()))
+
+	tests := []struct {
+		name    string
+		mutate  func(*v1.IngressSpec)
+		wantErr string
+	}{
+		{
+			name:    "missing backend image",
+			mutate:  func(spec *v1.IngressSpec) { spec.Backend.Image = " " },
+			wantErr: "backend.image is required",
+		},
+		{
+			name:    "missing root image",
+			mutate:  func(spec *v1.IngressSpec) { spec.Backend.RootImage = "" },
+			wantErr: "backend.rootImage is required",
+		},
+		{
+			name:    "missing worker image",
+			mutate:  func(spec *v1.IngressSpec) { spec.Backend.WorkerImage = "" },
+			wantErr: "backend.workerImage is required",
+		},
+		{
+			name:    "missing nats url",
+			mutate:  func(spec *v1.IngressSpec) { spec.Backend.NATS.URL = "  " },
+			wantErr: "backend.nats.url is required",
+		},
+		{
+			name:    "missing route host",
+			mutate:  func(spec *v1.IngressSpec) { spec.Route.Host = "" },
+			wantErr: "route.host is required",
+		},
+		{
+			name:    "negative replica power",
+			mutate:  func(spec *v1.IngressSpec) { spec.Backend.ReplicaPower = -1 },
+			wantErr: "backend.replicaPower must be >= 0",
+		},
+		{
+			name: "invalid root memory ratio",
+			mutate: func(spec *v1.IngressSpec) {
+				spec.Backend.RootMemory = &v1.IngressRootMemorySpec{
+					OverheadMaxRatio: pointer.Float64(-0.1),
+				}
+			},
+			wantErr: "backend.rootMemory.overheadMaxRatio must be > 0",
+		},
+		{
+			name: "negative min dllamas",
+			mutate: func(spec *v1.IngressSpec) {
+				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
+					MinDllamas: -1,
+				}
+			},
+			wantErr: "backend.sessionScaling.minDllamas must be >= 0",
+		},
+		{
+			name: "negative max dllamas",
+			mutate: func(spec *v1.IngressSpec) {
+				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
+					MaxDllamas: -1,
+				}
+			},
+			wantErr: "backend.sessionScaling.maxDllamas must be >= 0",
+		},
+		{
+			name: "max dllamas less than min",
+			mutate: func(spec *v1.IngressSpec) {
+				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
+					MinDllamas: 2,
+					MaxDllamas: 1,
+				}
+			},
+			wantErr: "backend.sessionScaling.maxDllamas must be >= minDllamas",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := newIngressSpec()
+			tt.mutate(spec)
+			err := validateIngressSpec(spec)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
