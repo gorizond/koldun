@@ -3,8 +3,12 @@ package v1
 import (
 	"reflect"
 	"testing"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestDllamaNATSConfig_Validate(t *testing.T) {
@@ -901,6 +905,618 @@ func TestCacheSpec_DeepCopy(t *testing.T) {
 	}
 }
 
+func TestAddKnownTypes(t *testing.T) {
+	scheme := runtime.NewScheme()
+
+	if err := addKnownTypes(scheme); err != nil {
+		t.Fatalf("addKnownTypes() error = %v", err)
+	}
+
+	testCases := []struct {
+		kind     string
+		expected runtime.Object
+	}{
+		{"Dllama", &Dllama{}},
+		{"DllamaList", &DllamaList{}},
+		{"Model", &Model{}},
+		{"ModelList", &ModelList{}},
+		{"Root", &Root{}},
+		{"RootList", &RootList{}},
+		{"Worker", &Worker{}},
+		{"WorkerList", &WorkerList{}},
+		{"Ingress", &Ingress{}},
+		{"IngressList", &IngressList{}},
+		{"Session", &Session{}},
+		{"SessionList", &SessionList{}},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.kind, func(t *testing.T) {
+			obj, err := scheme.New(SchemeGroupVersion.WithKind(tt.kind))
+			if err != nil {
+				t.Fatalf("scheme.New(%q) error = %v", tt.kind, err)
+			}
+			if reflect.TypeOf(obj) != reflect.TypeOf(tt.expected) {
+				t.Fatalf("scheme.New(%q) returned %T, want %T", tt.kind, obj, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDllamaDeepCopyVariants(t *testing.T) {
+	original := &Dllama{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Dllama",
+			APIVersion: SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "demo",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app": "dllama",
+			},
+		},
+		Spec: DllamaSpec{
+			ModelRef: ModelReference{
+				Name:      "model",
+				Namespace: "ml",
+			},
+			ReplicaPower: 2,
+			RootImage:    "dllama-root:latest",
+			WorkerImage:  "dllama-worker:latest",
+			NATS: &DllamaNATSConfig{
+				URL: "nats://localhost:4222",
+				CredentialsSecret: &SecretReference{
+					Name:      "nats-creds",
+					Namespace: "system",
+				},
+			},
+		},
+		Status: DllamaStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Ready",
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if reflect.TypeOf(copyObj) != reflect.TypeOf(original) {
+		t.Fatalf("DeepCopyObject() returned %T, want %T", copyObj, original)
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	mutated := original.DeepCopy()
+	mutated.ObjectMeta.Labels["new"] = "label"
+	mutated.Spec.NATS.CredentialsSecret.Name = "changed"
+	mutated.Status.Conditions[0].Status = metav1.ConditionFalse
+
+	if reflect.DeepEqual(mutated, original) {
+		t.Fatal("DeepCopy() did not produce an independent copy")
+	}
+}
+
+func TestDllamaListDeepCopyVariants(t *testing.T) {
+	list := &DllamaList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "DllamaList",
+			APIVersion: SchemeGroupVersion.String(),
+		},
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: "123",
+			Continue:        "token",
+		},
+		Items: []Dllama{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "item-1",
+				},
+				Spec: DllamaSpec{
+					ModelRef: ModelReference{Name: "model"},
+				},
+			},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if reflect.TypeOf(copyObj) != reflect.TypeOf(list) {
+		t.Fatalf("DeepCopyObject() returned %T, want %T", copyObj, list)
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].ObjectMeta.Name = "modified"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestModelDeepCopyVariants(t *testing.T) {
+	original := &Model{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Model",
+			APIVersion: SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "sample-model",
+			Annotations: map[string]string{
+				"team": "ml",
+			},
+		},
+		Spec: ModelSpec{
+			LaunchOptions: []string{"--max-tokens=128"},
+			ObjectStorage: &ModelObjectStorageSpec{
+				Endpoint: "https://object.storage",
+				SecretRef: &SecretReference{
+					Name: "storage-secret",
+				},
+				BucketForSource:  "source-bucket",
+				BucketForConvert: "convert-bucket",
+			},
+			Download: &ModelDownloadSpec{
+				Image:   "downloader:latest",
+				Command: []string{"download"},
+				Args:    []string{"--full"},
+				HuggingFaceTokenSecretRef: &SecretReference{
+					Name: "hf-secret",
+				},
+				Memory:      "1Gi",
+				ChunkMaxMiB: 64,
+				Concurrency: 2,
+			},
+			Conversion: &ModelConversionSpec{
+				Image:            "converter:latest",
+				Command:          []string{"convert"},
+				Args:             []string{"--opt"},
+				WeightsFloatType: "q40",
+				ConvertWeights:   "hf",
+				OutputPath:       "s3://converted",
+				Memory:           "2Gi",
+				RcloneImage:      "rclone/rclone:1.67",
+				ToolsImage:       "alpine:3.18",
+				ConverterVersion: "v1.0.0",
+				Dependencies: map[string]string{
+					"torch": "2.1.0",
+				},
+			},
+			PV: &ModelPVSpec{
+				AccessModes: []string{"ReadWriteMany"},
+				VolumeAttributes: map[string]string{
+					"fstype": "xfs",
+				},
+				PVCAccessModes: []string{"ReadWriteMany"},
+			},
+		},
+		Status: ModelStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Ready",
+					Status: metav1.ConditionTrue,
+				},
+			},
+			ObservedGeneration: 3,
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	original.Spec.ObjectStorage.SecretRef.Name = "changed"
+	if reflect.DeepEqual(copyObj, original) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestModelListDeepCopyVariants(t *testing.T) {
+	list := &ModelList{
+		ListMeta: metav1.ListMeta{
+			ResourceVersion: "rv",
+		},
+		Items: []Model{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "model-a",
+				},
+				Spec: ModelSpec{
+					LaunchOptions: []string{"--fast"},
+				},
+			},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].Spec.LaunchOptions[0] = "--slow"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestRootDeepCopyVariants(t *testing.T) {
+	original := &Root{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "root-a",
+			Labels: map[string]string{
+				"component": "root",
+			},
+		},
+		Spec: RootSpec{
+			Args: []string{"--debug"},
+			CacheSpec: &CacheSpec{
+				Endpoint: "s3://cache",
+				Bucket:   "cache-bucket",
+			},
+			WorkerSelector: map[string]string{
+				"role": "worker",
+			},
+			NATS: &RootNATSConfig{
+				URL: "nats://root:4222",
+				CredentialsSecret: &SecretReference{
+					Name: "root-creds",
+				},
+			},
+			Memory: &RootMemorySpec{
+				OverheadMaxRatio: func() *float64 { v := 1.5; return &v }(),
+			},
+		},
+		Status: RootStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Healthy",
+					Status: metav1.ConditionUnknown,
+				},
+			},
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	original.Spec.NATS.CredentialsSecret.Name = "mutated"
+	if reflect.DeepEqual(copyObj, original) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestRootListDeepCopyVariants(t *testing.T) {
+	list := &RootList{
+		Items: []Root{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "root-list-item",
+				},
+			},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].ObjectMeta.Name = "changed"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestRootNATSConfigDeepCopy(t *testing.T) {
+	original := &RootNATSConfig{
+		URL: "nats://root:4222",
+		CredentialsSecret: &SecretReference{
+			Name:      "root-creds",
+			Namespace: "system",
+		},
+	}
+
+	copyConfig := original.DeepCopy()
+	if copyConfig == original {
+		t.Fatal("DeepCopy() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyConfig, original) {
+		t.Fatalf("DeepCopy() mismatch:\noriginal = %#v\ncopy = %#v", original, copyConfig)
+	}
+
+	original.CredentialsSecret.Name = "mutated"
+	if reflect.DeepEqual(copyConfig, original) {
+		t.Fatal("DeepCopy() copy mutated after modifying original")
+	}
+}
+
+func TestWorkerDeepCopyVariants(t *testing.T) {
+	original := &Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "worker-1",
+		},
+		Spec: WorkerSpec{
+			Args: []string{"--serve"},
+			CacheSpec: &CacheSpec{
+				Endpoint: "s3://cache",
+				Bucket:   "worker-cache",
+			},
+			NATS: &WorkerNATSConfig{
+				URL: "nats://worker:4222",
+				CredentialsSecret: &SecretReference{
+					Name: "worker-creds",
+				},
+			},
+		},
+		Status: WorkerStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Ready",
+					Status: metav1.ConditionFalse,
+				},
+			},
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	original.Spec.CacheSpec.Bucket = "mutated"
+	if reflect.DeepEqual(copyObj, original) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestWorkerListDeepCopyVariants(t *testing.T) {
+	list := &WorkerList{
+		Items: []Worker{
+			{ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].ObjectMeta.Name = "changed"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestSessionDeepCopyVariants(t *testing.T) {
+	now := metav1.NewTime(time.Now().UTC())
+	duration := metav1.Duration{Duration: 5 * time.Minute}
+
+	original := &Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "session-1",
+			Labels: map[string]string{
+				"user": "alice",
+			},
+		},
+		Spec: SessionSpec{
+			Queue: &SessionQueueSpec{
+				AckTimeout: &duration,
+			},
+			Scaling: &SessionScalingSpec{
+				MinDllamas:           1,
+				MaxDllamas:           5,
+				ScaleUpBacklog:       2,
+				ScaleDownIdleSeconds: 30,
+				DesiredDllamas:       3,
+			},
+			NATS: &SessionNATSConfig{
+				URL: "nats://session:4222",
+				CredentialsSecret: &SecretReference{
+					Name: "session-creds",
+				},
+			},
+			TTL: &duration,
+		},
+		Status: SessionStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   "Ready",
+					Status: metav1.ConditionTrue,
+				},
+			},
+			Workers: []SessionWorker{
+				{
+					Name:          "worker-1",
+					LastHeartbeat: &now,
+				},
+			},
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	original.Spec.Queue.AckTimeout.Duration = 10 * time.Minute
+	if reflect.DeepEqual(copyObj, original) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestSessionListDeepCopyVariants(t *testing.T) {
+	list := &SessionList{
+		Items: []Session{
+			{ObjectMeta: metav1.ObjectMeta{Name: "session-a"}},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].ObjectMeta.Name = "changed"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestIngressDeepCopyVariants(t *testing.T) {
+	convTTL := metav1.Duration{Duration: time.Minute}
+	respTimeout := metav1.Duration{Duration: 2 * time.Minute}
+	now := metav1.Now()
+
+	original := &Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ingress-1",
+		},
+		Spec: IngressSpec{
+			Backend: IngressBackendSpec{
+				Image:           "ingress:latest",
+				ImagePullPolicy: "Always",
+				RootImage:       "root:latest",
+				WorkerImage:     "worker:latest",
+				DispatcherImage: "dispatcher:latest",
+				ReplicaPower:    4,
+				HashSecret:      "secret",
+				AllowAnonymous:  true,
+				NATS: IngressNATSConfig{
+					URL:                "nats://ingress:4222",
+					ConversationBucket: "conv",
+					ModelsBucket:       "models",
+					TokensBucket:       "tokens",
+					ModelPrefix:        "model-",
+					TokenPrefix:        "token-",
+					TTLPrefix:          "ttl-",
+				},
+				ConversationTTL: &convTTL,
+				ResponseTimeout: &respTimeout,
+				SessionScaling: &IngressSessionScalingSpec{
+					MinDllamas:           1,
+					MaxDllamas:           3,
+					ScaleUpBacklog:       5,
+					ScaleDownIdleSeconds: 30,
+				},
+				ExtraArgs: []string{"--log-level=debug"},
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("1"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("500m"),
+						corev1.ResourceMemory: resource.MustParse("512Mi"),
+					},
+				},
+				RootMemory: &IngressRootMemorySpec{
+					OverheadMaxRatio: func() *float64 { v := 2.0; return &v }(),
+				},
+			},
+			Route: IngressRouteSpec{
+				Host:             "example.com",
+				Path:             "/chat",
+				PathType:         "Prefix",
+				IngressClassName: "nginx",
+				Annotations: map[string]string{
+					"nginx.ingress.kubernetes.io/rewrite-target": "/",
+				},
+				TLS: []IngressTLSSpec{
+					{
+						SecretName: "tls-secret",
+						Hosts:      []string{"example.com", "api.example.com"},
+					},
+				},
+			},
+			Service: &IngressServiceSpec{
+				Type: "ClusterIP",
+				Port: 8443,
+			},
+		},
+		Status: IngressStatus{
+			ObservedGeneration: 2,
+			Conditions: []metav1.Condition{
+				{
+					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					LastTransitionTime: now,
+				},
+			},
+			BackendServiceName: "backend-service",
+			IngressName:        "ingress-resource",
+		},
+	}
+
+	copyObj := original.DeepCopyObject()
+	if copyObj == original {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, original) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", original, copyObj)
+	}
+
+	original.Spec.Route.Annotations["new"] = "annotation"
+	if reflect.DeepEqual(copyObj, original) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
+func TestIngressListDeepCopyVariants(t *testing.T) {
+	list := &IngressList{
+		Items: []Ingress{
+			{ObjectMeta: metav1.ObjectMeta{Name: "ingress-a"}},
+		},
+	}
+
+	copyObj := list.DeepCopyObject()
+	if copyObj == list {
+		t.Fatal("DeepCopyObject() returned the same pointer")
+	}
+	if !reflect.DeepEqual(copyObj, list) {
+		t.Fatalf("DeepCopyObject() mismatch:\noriginal = %#v\ncopy = %#v", list, copyObj)
+	}
+
+	list.Items[0].ObjectMeta.Name = "changed"
+	if reflect.DeepEqual(copyObj, list) {
+		t.Fatal("DeepCopyObject() copy mutated after modifying original")
+	}
+}
+
 // TestModelList_DeepCopy tests the DeepCopy methods for ModelList
 func TestModelList_DeepCopy(t *testing.T) {
 	tests := []struct {
@@ -1538,7 +2154,7 @@ func TestRootMemorySpec_DeepCopy(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.spec.DeepCopy()
-			
+
 			if tt.spec == nil {
 				if got != nil {
 					t.Errorf("DeepCopy() = %v, want nil", got)
@@ -1587,7 +2203,7 @@ func TestRootStatus_DeepCopy(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := tt.status.DeepCopy()
-			
+
 			if tt.status == nil {
 				if got != nil {
 					t.Errorf("DeepCopy() = %v, want nil", got)
