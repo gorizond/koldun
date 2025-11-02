@@ -8,6 +8,7 @@ import (
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/rancher/wrangler/v3/pkg/apply"
 	fakeapply "github.com/rancher/wrangler/v3/pkg/apply/fake"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"go.uber.org/mock/gomock"
@@ -15,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
@@ -58,6 +60,326 @@ func TestJobNameForModel(t *testing.T) {
 				t.Errorf("jobNameForModel() length %d > 63", len(got))
 			}
 		})
+	}
+}
+
+// rror path tests for ensureConversionJob
+
+// errorApply wraps fakeapply and allows injecting errors on specific call numbers
+type errorApply struct {
+	*fakeapply.FakeApply
+	errorOnCall int
+	callNumber  int
+	err         error
+}
+
+func (e *errorApply) ApplyObjects(objs ...runtime.Object) error {
+	e.callNumber++
+	if e.callNumber == e.errorOnCall {
+		return e.err
+	}
+	return e.FakeApply.ApplyObjects(objs...)
+}
+
+func (e *errorApply) WithOwner(obj runtime.Object) apply.Apply {
+	e.FakeApply.WithOwner(obj)
+	return e
+}
+
+func (e *errorApply) WithSetID(id string) apply.Apply {
+	e.FakeApply.WithSetID(id)
+	return e
+}
+
+func (e *errorApply) WithSetOwnerReference(controller, block bool) apply.Apply {
+	e.FakeApply.WithSetOwnerReference(controller, block)
+	return e
+}
+
+func (e *errorApply) WithDefaultNamespace(ns string) apply.Apply {
+	e.FakeApply.WithDefaultNamespace(ns)
+	return e
+}
+
+func TestEnsureConversionJobDeleteError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	handler := &modelHandler{
+		jobs: jobs,
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "1"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+	deleteErr := errors.New("simulated delete error")
+	jobs.EXPECT().Delete("models", "mistral-convert", gomock.Any()).Return(deleteErr)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "dst"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when deleting outdated job fails")
+	}
+	if !strings.Contains(err.Error(), "failed to delete outdated conversion job") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestEnsureConversionJobInputPVApplyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	applyErr := errors.New("simulated PV apply error")
+	errApply := &errorApply{
+		FakeApply:   &fakeapply.FakeApply{},
+		errorOnCall: 1,
+		err:         applyErr,
+	}
+
+	handler := &modelHandler{
+		apply: errApply,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "out",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when PV apply fails")
+	}
+	if !strings.Contains(err.Error(), "failed to apply PV") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestEnsureConversionJobInputPVCApplyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	applyErr := errors.New("simulated PVC apply error")
+	errApply := &errorApply{
+		FakeApply:   &fakeapply.FakeApply{},
+		errorOnCall: 2,
+		err:         applyErr,
+	}
+
+	handler := &modelHandler{
+		apply: errApply,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "out",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when PVC apply fails")
+	}
+	if !strings.Contains(err.Error(), "failed to apply PVC") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestEnsureConversionJobOutputPVApplyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	applyErr := errors.New("simulated output PV apply error")
+	errApply := &errorApply{
+		FakeApply:   &fakeapply.FakeApply{},
+		errorOnCall: 3,
+		err:         applyErr,
+	}
+
+	handler := &modelHandler{
+		apply: errApply,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "out",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when output PV apply fails")
+	}
+	if !strings.Contains(err.Error(), "failed to apply output PV") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestEnsureConversionJobOutputPVCApplyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	applyErr := errors.New("simulated output PVC apply error")
+	errApply := &errorApply{
+		FakeApply:   &fakeapply.FakeApply{},
+		errorOnCall: 4,
+		err:         applyErr,
+	}
+
+	handler := &modelHandler{
+		apply: errApply,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "out",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when output PVC apply fails")
+	}
+	if !strings.Contains(err.Error(), "failed to apply output PVC") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestEnsureConversionJobJobApplyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	applyErr := errors.New("simulated Job apply error")
+	errApply := &errorApply{
+		FakeApply:   &fakeapply.FakeApply{},
+		errorOnCall: 5,
+		err:         applyErr,
+	}
+
+	handler := &modelHandler{
+		apply: errApply,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "out",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+		},
+	}
+	model.Generation = 2
+
+	err := handler.ensureConversionJob(model)
+	if err == nil {
+		t.Fatal("expected error when Job apply fails")
+	}
+	if err != applyErr {
+		t.Fatalf("expected Job apply error to be returned directly, got: %v", err)
 	}
 }
 
