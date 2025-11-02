@@ -1,9 +1,13 @@
 package controllers
 
 import (
+	"errors"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -142,6 +146,165 @@ func TestHasCondition(t *testing.T) {
 			got := hasCondition(tt.conditions, tt.condType)
 			if got != tt.want {
 				t.Errorf("hasCondition() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCollectSizeMeasurement(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	podsCache := genericfake.NewMockCacheInterface[*corev1.Pod](ctrl)
+	pods := genericfake.NewMockControllerInterface[*corev1.Pod, *corev1.PodList](ctrl)
+
+	handler := &modelHandler{
+		pods: pods,
+	}
+
+	tests := []struct {
+		name      string
+		namespace string
+		jobName   string
+		setupMock func()
+		want      *sizeMeasurement
+		wantErr   bool
+	}{
+		{
+			name:      "pod with terminated message",
+			namespace: "default",
+			jobName:   "test-job",
+			setupMock: func() {
+				pods.EXPECT().Cache().Return(podsCache)
+				podsCache.EXPECT().List("default", gomock.Any()).Return([]*corev1.Pod{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-job-pod",
+							Namespace: "default",
+							Labels:    map[string]string{"job-name": "test-job"},
+						},
+						Status: corev1.PodStatus{
+							ContainerStatuses: []corev1.ContainerStatus{
+								{
+									State: corev1.ContainerState{
+										Terminated: &corev1.ContainerStateTerminated{
+											Message: `{"bytes":1024,"human":"1 KiB"}`,
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil)
+			},
+			want: &sizeMeasurement{
+				Bytes: 1024,
+				Human: "1 KiB",
+			},
+			wantErr: false,
+		},
+		{
+			name:      "no terminated message",
+			namespace: "default",
+			jobName:   "test-job",
+			setupMock: func() {
+				pods.EXPECT().Cache().Return(podsCache)
+				podsCache.EXPECT().List("default", gomock.Any()).Return([]*corev1.Pod{
+					{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-job-pod",
+							Namespace: "default",
+							Labels:    map[string]string{"job-name": "test-job"},
+						},
+						Status: corev1.PodStatus{
+							ContainerStatuses: []corev1.ContainerStatus{
+								{
+									State: corev1.ContainerState{
+										Running: &corev1.ContainerStateRunning{},
+									},
+								},
+							},
+						},
+					},
+				}, nil)
+			},
+			want:    nil,
+			wantErr: false,
+		},
+		{
+			name:      "list pods error",
+			namespace: "default",
+			jobName:   "test-job",
+			setupMock: func() {
+				pods.EXPECT().Cache().Return(podsCache)
+				podsCache.EXPECT().List("default", gomock.Any()).Return(nil, errors.New("list failed"))
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name:      "no pods",
+			namespace: "default",
+			jobName:   "test-job",
+			setupMock: func() {
+				pods.EXPECT().Cache().Return(podsCache)
+				podsCache.EXPECT().List("default", gomock.Any()).Return([]*corev1.Pod{}, nil)
+			},
+			want:    nil,
+			wantErr: false,
+		},
+		{
+			name:      "empty terminated message",
+			namespace: "default",
+			jobName:   "test-job",
+			setupMock: func() {
+				pods.EXPECT().Cache().Return(podsCache)
+				podsCache.EXPECT().List("default", gomock.Any()).Return([]*corev1.Pod{
+					{
+						Status: corev1.PodStatus{
+							ContainerStatuses: []corev1.ContainerStatus{
+								{
+									State: corev1.ContainerState{
+										Terminated: &corev1.ContainerStateTerminated{
+											Message: "  ",
+										},
+									},
+								},
+							},
+						},
+					},
+				}, nil)
+			},
+			want:    nil,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setupMock()
+			got, err := handler.collectSizeMeasurement(tt.namespace, tt.jobName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("collectSizeMeasurement() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+			if tt.want == nil && got != nil {
+				t.Errorf("collectSizeMeasurement() = %v, want nil", got)
+				return
+			}
+			if tt.want != nil && got == nil {
+				t.Errorf("collectSizeMeasurement() = nil, want %v", tt.want)
+				return
+			}
+			if tt.want != nil && got != nil {
+				if got.Bytes != tt.want.Bytes || got.Human != tt.want.Human {
+					t.Errorf("collectSizeMeasurement() = %v, want %v", got, tt.want)
+				}
 			}
 		})
 	}
