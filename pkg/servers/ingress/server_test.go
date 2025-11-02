@@ -1,12 +1,14 @@
 package ingress
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -121,6 +123,156 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestNewEstablishesResources(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+
+	cfg := Config{
+		RootImage:         "test/root:latest",
+		WorkerImage:       "test/worker:latest",
+		NATSURL:           ns.ClientURL(),
+		InPrefix:          "tenant.in.",
+		ConversationTTL:   45 * time.Second,
+		SessionMinDllamas: 1,
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	t.Cleanup(func() {
+		if srv.stateSub != nil {
+			_ = srv.stateSub.Drain()
+		}
+		if srv.raw != nil {
+			_ = srv.raw.Drain()
+			srv.raw.Close()
+		}
+	})
+
+	require.Equal(t, llmRequestStreamName, srv.streamName)
+	require.NotNil(t, srv.convKV)
+	require.NotNil(t, srv.modelsKV)
+	require.NotNil(t, srv.tokensKV)
+	require.NotNil(t, srv.stateSub)
+
+	require.Equal(t, defaultListenAddress, srv.cfg.ListenAddress)
+	require.Equal(t, defaultNamespace, srv.cfg.Namespace)
+	require.Equal(t, "tenant.in.", srv.cfg.InPrefix)
+	require.Equal(t, defaultOutPrefix, srv.cfg.OutPrefix)
+
+	status, err := srv.convKV.Status()
+	require.NoError(t, err)
+	require.InDelta(t, cfg.ConversationTTL.Seconds(), status.TTL().Seconds(), 1.0)
+
+	info, err := srv.nc.StreamInfo(llmRequestStreamName)
+	require.NoError(t, err)
+	require.Contains(t, info.Config.Subjects, defaultInPrefix+">")
+	require.Contains(t, info.Config.Subjects, cfg.InPrefix+">")
+}
+
+func TestNewAllowAnonymousSkipsTokens(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+
+	cfg := Config{
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  true,
+		ConversationTTL: 30 * time.Second,
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	t.Cleanup(func() {
+		if srv.stateSub != nil {
+			_ = srv.stateSub.Drain()
+		}
+		if srv.raw != nil {
+			_ = srv.raw.Drain()
+			srv.raw.Close()
+		}
+	})
+
+	require.NotNil(t, srv.convKV)
+	require.NotNil(t, srv.modelsKV)
+	require.Nil(t, srv.tokensKV)
+
+	_, err = srv.nc.KeyValue(srv.cfg.TokensBucket)
+	require.ErrorIs(t, err, nats.ErrBucketNotFound)
+}
+
+func TestRunServesHealthAndReady(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
+	cfg := Config{
+		ListenAddress:  addr,
+		Namespace:      "tenant",
+		RootImage:      "test/root:latest",
+		WorkerImage:    "test/worker:latest",
+		NATSURL:        ns.ClientURL(),
+		AllowAnonymous: true,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		res, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			return false
+		}
+		defer res.Body.Close()
+		return res.StatusCode == http.StatusOK
+	}, 5*time.Second, 50*time.Millisecond)
+
+	resp, err := http.Get("http://" + addr + "/readyz")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	resp, err = http.Get("http://" + addr + "/v1/models")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err)
+	require.Contains(t, string(body), `"object":"list"`)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	if srv.raw != nil {
+		srv.raw.Close()
+	}
+}
+
 // TestSanitizeSessionHash validates session hash sanitization.
 func TestSanitizeSessionHash(t *testing.T) {
 	tests := []struct {
@@ -200,6 +352,72 @@ func TestResponseSubjectPrefix(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestEnsureBucketCreatesAndRecreates(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, _ := connectIngressJetStream(t, ns)
+
+	_, err := ensureBucket(js, &nats.KeyValueConfig{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bucket name cannot be empty")
+
+	cfg := &nats.KeyValueConfig{
+		Bucket: "testbucket",
+		TTL:    time.Minute,
+	}
+	kv, err := ensureBucket(js, cfg)
+	require.NoError(t, err)
+
+	status, err := kv.Status()
+	require.NoError(t, err)
+	require.InDelta(t, cfg.TTL.Seconds(), status.TTL().Seconds(), 1.0)
+
+	cfg.TTL = 2 * time.Minute
+	kv, err = ensureBucket(js, cfg)
+	require.NoError(t, err)
+
+	status, err = kv.Status()
+	require.NoError(t, err)
+	require.InDelta(t, cfg.TTL.Seconds(), status.TTL().Seconds(), 1.0)
+}
+
+func TestEnsureRequestStreamCreatesAndUpdates(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, _ := connectIngressJetStream(t, ns)
+
+	name, err := ensureRequestStream(js, "tenant.in.")
+	require.NoError(t, err)
+	require.Equal(t, llmRequestStreamName, name)
+
+	info, err := js.StreamInfo(name)
+	require.NoError(t, err)
+	require.Contains(t, info.Config.Subjects, "tenant.in.>")
+	require.Contains(t, info.Config.Subjects, defaultInPrefix+">")
+
+	name, err = ensureRequestStream(js, "tenant.extra.")
+	require.NoError(t, err)
+	require.Equal(t, llmRequestStreamName, name)
+
+	info, err = js.StreamInfo(name)
+	require.NoError(t, err)
+	require.Contains(t, info.Config.Subjects, "tenant.extra.>")
+
+	_, err = ensureRequestStream(js, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "in-prefix is required")
+
+	_, err = ensureRequestStream(js, "invalid")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must end with '.'")
 }
 
 func TestConversationHashFromHeadersPlain(t *testing.T) {

@@ -26,7 +26,17 @@ type ConversationConfig struct {
 	KVBucket     string
 	TTLPrefix    string
 	PollInterval time.Duration
+
+	dialer natsDialer
 }
+
+type natsConnection interface {
+	JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error)
+	Close()
+	Drain() error
+}
+
+type natsDialer func(url string, opts ...nats.Option) (natsConnection, error)
 
 type conversationReconciler struct {
 	cfg ConversationConfig
@@ -35,7 +45,7 @@ type conversationReconciler struct {
 	sessions generic.ControllerInterface[*v1.Session, *v1.SessionList]
 	apply    apply.Apply
 
-	conn *nats.Conn
+	conn natsConnection
 	kv   nats.KeyValue
 }
 
@@ -59,7 +69,14 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 
 	log := logrus.StandardLogger().WithField("component", "conversation-reconciler")
 
-	conn, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-operator"))
+	dial := cfg.dialer
+	if dial == nil {
+		dial = func(url string, opts ...nats.Option) (natsConnection, error) {
+			return nats.Connect(url, opts...)
+		}
+	}
+
+	conn, err := dial(cfg.NATSURL, nats.Name("koldun-operator"))
 	if err != nil {
 		return fmt.Errorf("connect NATS: %w", err)
 	}

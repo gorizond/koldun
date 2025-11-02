@@ -1,14 +1,67 @@
 package koldunv1
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/rancher/lasso/pkg/cache"
+	"github.com/rancher/lasso/pkg/client"
 	"github.com/rancher/lasso/pkg/controller"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
+	cachetools "k8s.io/client-go/tools/cache"
 )
+
+type fakeSharedController struct{}
+
+func (f *fakeSharedController) Enqueue(namespace, name string) {}
+
+func (f *fakeSharedController) EnqueueAfter(namespace, name string, delay time.Duration) {}
+
+func (f *fakeSharedController) EnqueueKey(key string) {}
+
+func (f *fakeSharedController) Informer() cachetools.SharedIndexInformer { return nil }
+
+func (f *fakeSharedController) Start(ctx context.Context, workers int) error { return nil }
+
+func (f *fakeSharedController) RegisterHandler(ctx context.Context, name string, handler controller.SharedControllerHandler) {
+}
+
+func (f *fakeSharedController) Client() *client.Client { return nil }
+
+type fakeSharedControllerFactory struct {
+	lastGVR        schema.GroupVersionResource
+	lastKind       string
+	lastNamespaced bool
+}
+
+func (f *fakeSharedControllerFactory) ForObject(runtime.Object) (controller.SharedController, error) {
+	return &fakeSharedController{}, nil
+}
+
+func (f *fakeSharedControllerFactory) ForKind(schema.GroupVersionKind) (controller.SharedController, error) {
+	return &fakeSharedController{}, nil
+}
+
+func (f *fakeSharedControllerFactory) ForResource(gvr schema.GroupVersionResource, namespaced bool) controller.SharedController {
+	f.lastGVR = gvr
+	f.lastNamespaced = namespaced
+	return &fakeSharedController{}
+}
+
+func (f *fakeSharedControllerFactory) ForResourceKind(gvr schema.GroupVersionResource, kind string, namespaced bool) controller.SharedController {
+	f.lastGVR = gvr
+	f.lastKind = kind
+	f.lastNamespaced = namespaced
+	return &fakeSharedController{}
+}
+
+func (f *fakeSharedControllerFactory) SharedCacheFactory() cache.SharedCacheFactory { return nil }
+
+func (f *fakeSharedControllerFactory) Start(context.Context, int) error { return nil }
 
 // mockSharedControllerFactory implements the minimal interface needed for testing
 type mockSharedControllerFactory struct {
@@ -32,6 +85,75 @@ func TestNew(t *testing.T) {
 
 	if v.controllerFactory == nil {
 		t.Fatal("controllerFactory was not set")
+	}
+}
+
+func TestVersionControllerMappings(t *testing.T) {
+	factory := &fakeSharedControllerFactory{}
+	v := &version{controllerFactory: factory}
+
+	tests := []struct {
+		name     string
+		call     func() interface{}
+		resource string
+		kind     string
+	}{
+		{
+			name:     "dllama",
+			call:     func() interface{} { return v.Dllama() },
+			resource: "dllamas",
+			kind:     "Dllama",
+		},
+		{
+			name:     "model",
+			call:     func() interface{} { return v.Model() },
+			resource: "models",
+			kind:     "Model",
+		},
+		{
+			name:     "root",
+			call:     func() interface{} { return v.Root() },
+			resource: "roots",
+			kind:     "Root",
+		},
+		{
+			name:     "worker",
+			call:     func() interface{} { return v.Worker() },
+			resource: "workers",
+			kind:     "Worker",
+		},
+		{
+			name:     "ingress",
+			call:     func() interface{} { return v.Ingress() },
+			resource: "ingresses",
+			kind:     "Ingress",
+		},
+		{
+			name:     "session",
+			call:     func() interface{} { return v.Session() },
+			resource: "sessions",
+			kind:     "Session",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			factory.lastGVR = schema.GroupVersionResource{}
+			ctrl := tt.call()
+			if ctrl == nil {
+				t.Fatalf("%s controller returned nil", tt.name)
+			}
+			expectedGVR := v1.SchemeGroupVersion.WithResource(tt.resource)
+			if factory.lastGVR != expectedGVR {
+				t.Fatalf("unexpected GVR: got %v want %v", factory.lastGVR, expectedGVR)
+			}
+			if factory.lastKind != tt.kind {
+				t.Fatalf("unexpected Kind: got %s want %s", factory.lastKind, tt.kind)
+			}
+			if !factory.lastNamespaced {
+				t.Fatalf("expected namespaced controller for %s", tt.name)
+			}
+		})
 	}
 }
 

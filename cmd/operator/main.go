@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -16,7 +17,71 @@ import (
 	operatorhealth "github.com/gorizond/koldun/pkg/servers/operator"
 	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
+)
+
+type operatorManager interface {
+	SetEnsureObjectStorageBuckets(bool)
+	Register(context.Context) error
+	Start(context.Context) error
+	Health() *controllers.Health
+}
+
+type operatorHealthServer interface {
+	Run(context.Context) error
+}
+
+type llmServer interface {
+	Run(context.Context) error
+}
+
+type ingressServer interface {
+	Run(context.Context) error
+}
+
+type dispatcherServer interface {
+	Run(context.Context) error
+}
+
+var (
+	buildConfigFn = kube.BuildConfig
+
+	newOperatorManagerFn = func(cfg *rest.Config) (operatorManager, error) {
+		return controllers.NewManager(cfg)
+	}
+
+	newHealthServerFn = func(cfg operatorhealth.Config) (operatorHealthServer, error) {
+		return operatorhealth.New(cfg)
+	}
+
+	startRegistrySyncFn = func(ctx context.Context, mgr operatorManager, cfg controllers.RegistryConfig) error {
+		typed, ok := mgr.(*controllers.Manager)
+		if !ok {
+			return fmt.Errorf("unsupported manager type %T", mgr)
+		}
+		return controllers.StartRegistrySync(ctx, typed, cfg)
+	}
+
+	startConversationReconcilerFn = func(ctx context.Context, mgr operatorManager, cfg controllers.ConversationConfig) error {
+		typed, ok := mgr.(*controllers.Manager)
+		if !ok {
+			return fmt.Errorf("unsupported manager type %T", mgr)
+		}
+		return controllers.StartConversationReconciler(ctx, typed, cfg)
+	}
+
+	newLLMServerFn = func(cfg llm.Config) (llmServer, error) {
+		return llm.New(cfg)
+	}
+
+	newIngressServerFn = func(cfg ingress.Config) (ingressServer, error) {
+		return ingress.New(cfg)
+	}
+
+	newDispatcherServerFn = func(cfg dispatcher.Config) (dispatcherServer, error) {
+		return dispatcher.New(cfg)
+	}
 )
 
 func main() {
@@ -249,18 +314,18 @@ func main() {
 }
 
 func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.ConversationConfig, registryCfg controllers.RegistryConfig, healthListen string, disableBucketEnsure bool) {
-	cfg, err := kube.BuildConfig(kubeconfig)
+	cfg, err := buildConfigFn(kubeconfig)
 	if err != nil {
 		logrus.Fatalf("failed to build Kubernetes config: %v", err)
 	}
 
-	manager, err := controllers.NewManager(cfg)
+	manager, err := newOperatorManagerFn(cfg)
 	if err != nil {
 		logrus.Fatalf("failed to create controller manager: %v", err)
 	}
 	manager.SetEnsureObjectStorageBuckets(!disableBucketEnsure)
 
-	healthServer, err := operatorhealth.New(operatorhealth.Config{
+	healthServer, err := newHealthServerFn(operatorhealth.Config{
 		ListenAddress: healthListen,
 		Health:        manager.Health(),
 	})
@@ -272,11 +337,11 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 		logrus.Fatalf("failed to register controllers: %v", err)
 	}
 
-	if err := controllers.StartRegistrySync(ctx, manager, registryCfg); err != nil {
+	if err := startRegistrySyncFn(ctx, manager, registryCfg); err != nil {
 		logrus.Fatalf("failed to start registry sync: %v", err)
 	}
 
-	if err := controllers.StartConversationReconciler(ctx, manager, convCfg); err != nil {
+	if err := startConversationReconcilerFn(ctx, manager, convCfg); err != nil {
 		logrus.Fatalf("failed to start conversation reconciler: %v", err)
 	}
 
@@ -304,7 +369,7 @@ func runOperator(ctx context.Context, kubeconfig string, convCfg controllers.Con
 }
 
 func runLLM(ctx context.Context, cfg llm.Config) {
-	server, err := llm.New(cfg)
+	server, err := newLLMServerFn(cfg)
 	if err != nil {
 		logrus.Fatalf("failed to initialise llm server: %v", err)
 	}
@@ -314,7 +379,7 @@ func runLLM(ctx context.Context, cfg llm.Config) {
 }
 
 func runIngress(ctx context.Context, cfg ingress.Config) {
-	server, err := ingress.New(cfg)
+	server, err := newIngressServerFn(cfg)
 	if err != nil {
 		logrus.Fatalf("failed to initialise ingress server: %v", err)
 	}
@@ -324,7 +389,7 @@ func runIngress(ctx context.Context, cfg ingress.Config) {
 }
 
 func runDispatcher(ctx context.Context, cfg dispatcher.Config) {
-	server, err := dispatcher.New(cfg)
+	server, err := newDispatcherServerFn(cfg)
 	if err != nil {
 		logrus.Fatalf("failed to initialise dispatcher: %v", err)
 	}

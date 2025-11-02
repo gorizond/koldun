@@ -7,9 +7,14 @@ coverage.out
 *.coverprofile
 *_coverage.out
 coverage.html
+*.out
+coverage.func
 
 # Test binaries
 *.test
 koldun.test
+
+# Binaries and envtest downloads
+bin/
 
 /reasoning

@@ -5,14 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/apply/injectors"
+	"github.com/rancher/wrangler/v3/pkg/generic"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/rancher/wrangler/v3/pkg/objectset"
 	"github.com/sirupsen/logrus"
@@ -341,6 +344,318 @@ func TestConversationSyncDeletesWhenNoKeysFound(t *testing.T) {
 	reconciler.sync(context.Background())
 
 	require.Empty(t, fakeApply.appliedObjects, "no sessions should be applied when KV empty")
+}
+
+func TestConversationSyncSkipsOnKeyError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessionsController := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	sessionCache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+
+	sessionsController.EXPECT().Cache().Return(sessionCache).AnyTimes()
+
+	fakeApply := newFakeApply()
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			TTLPrefix: "nats_ttl_",
+		},
+		log:      logrus.New().WithField("component", "conversation-sync-test"),
+		sessions: sessionsController,
+		apply:    fakeApply,
+		kv: &fakeMemoryKV{
+			keysErr: errors.New("kv lookup failed"),
+		},
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Empty(t, fakeApply.appliedObjects, "no apply operations should occur on KV error")
+}
+
+func TestEnsureConversationBucketCreatesAndReuses(t *testing.T) {
+	srv := runJetStreamServer(t)
+	nc, err := nats.Connect(srv.ClientURL(), nats.Name("conversation-bucket-test"))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	bucket := fmt.Sprintf("test-bucket-%d", time.Now().UnixNano())
+
+	kv, err := ensureConversationBucket(js, bucket)
+	require.NoError(t, err)
+	require.NotNil(t, kv)
+
+	rev, err := kv.PutString("greeting", "world")
+	require.NoError(t, err)
+	require.Greater(t, rev, uint64(0))
+
+	kvExisting, err := ensureConversationBucket(js, bucket)
+	require.NoError(t, err)
+	require.NotNil(t, kvExisting)
+
+	entry, err := kvExisting.Get("greeting")
+	require.NoError(t, err)
+	require.Equal(t, "world", string(entry.Value()))
+}
+
+func TestEnsureConversationBucketRejectsEmptyName(t *testing.T) {
+	_, err := ensureConversationBucket(nil, "   ")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bucket name cannot be empty")
+}
+
+func TestEnsureConversationBucketPropagatesLookupError(t *testing.T) {
+	srv := runJetStreamServer(t)
+	nc, err := nats.Connect(srv.ClientURL(), nats.Name("conversation-bucket-error"))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	_, err = ensureConversationBucket(js, "invalid bucket name")
+	require.Error(t, err)
+	require.ErrorIs(t, err, nats.ErrInvalidBucketName)
+}
+
+func TestStartConversationReconcilerReturnsDialError(t *testing.T) {
+	cfg := ConversationConfig{
+		NATSURL:  "nats://should-not-connect:4222",
+		KVBucket: "test-bucket",
+	}
+	cfg.dialer = func(string, ...nats.Option) (natsConnection, error) {
+		return nil, errors.New("dial failure")
+	}
+
+	err := StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "connect NATS")
+	require.Contains(t, err.Error(), "dial failure")
+}
+
+func TestStartConversationReconcilerClosesOnJetStreamError(t *testing.T) {
+	cfg := ConversationConfig{
+		NATSURL:  "nats://example:4222",
+		KVBucket: "test-bucket",
+	}
+	fakeConn := &fakeNATSConn{
+		jsErr: errors.New("jetstream unavailable"),
+	}
+	cfg.dialer = func(string, ...nats.Option) (natsConnection, error) {
+		return fakeConn, nil
+	}
+
+	err := StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "jetstream context")
+	require.True(t, fakeConn.closed, "connection should be closed on jetstream error")
+	require.False(t, fakeConn.drained, "drain should not run on jetstream error")
+}
+
+func TestStartConversationReconcilerClosesOnBucketError(t *testing.T) {
+	srv := runJetStreamServer(t)
+
+	cfg := ConversationConfig{
+		NATSURL:  srv.ClientURL(),
+		KVBucket: "invalid bucket name",
+	}
+
+	var tracked *trackingConn
+	cfg.dialer = func(url string, opts ...nats.Option) (natsConnection, error) {
+		conn, err := nats.Connect(url, opts...)
+		if err != nil {
+			return nil, err
+		}
+		tracked = newTrackingConn(conn)
+		return tracked, nil
+	}
+
+	err := StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "kv bucket")
+	require.NotNil(t, tracked, "dialer should have captured the connection")
+	require.True(t, tracked.Closed(), "connection should be closed on bucket failure")
+	require.False(t, tracked.Drained(), "drain should not run on setup failure")
+}
+
+func TestStartConversationReconcilerDrainsOnContextCancel(t *testing.T) {
+	srv := runJetStreamServer(t)
+
+	mockCtrl := gomock.NewController(t)
+	t.Cleanup(mockCtrl.Finish)
+
+	sessionController := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](mockCtrl)
+	sessionCache := genericfake.NewMockCacheInterface[*v1.Session](mockCtrl)
+
+	sessionController.EXPECT().Cache().Return(sessionCache).AnyTimes()
+	sessionCache.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	sessionController.EXPECT().Delete(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	manager := &Manager{
+		Kold: &fakeKoldInterface{
+			session: sessionController,
+		},
+		apply: newFakeApply(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := ConversationConfig{
+		NATSURL:      srv.ClientURL(),
+		KVBucket:     fmt.Sprintf("session-bucket-%d", time.Now().UnixNano()),
+		PollInterval: 5 * time.Millisecond,
+	}
+
+	var tracked *trackingConn
+	cfg.dialer = func(url string, opts ...nats.Option) (natsConnection, error) {
+		conn, err := nats.Connect(url, opts...)
+		if err != nil {
+			return nil, err
+		}
+		tracked = newTrackingConn(conn)
+		return tracked, nil
+	}
+
+	err := StartConversationReconciler(ctx, manager, cfg)
+	require.NoError(t, err)
+	require.NotNil(t, tracked, "tracking connection should be initialised")
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		return tracked.Drained()
+	}, 2*time.Second, 10*time.Millisecond, "connection was not drained after cancellation")
+
+	require.True(t, tracked.Closed(), "connection must be closed after drain")
+}
+
+func runJetStreamServer(t *testing.T) *server.Server {
+	t.Helper()
+
+	opts := &server.Options{
+		JetStream: true,
+		Host:      "127.0.0.1",
+		Port:      -1,
+	}
+
+	srv, err := server.NewServer(opts)
+	require.NoError(t, err)
+
+	go srv.Start()
+
+	if !srv.ReadyForConnections(10 * time.Second) {
+		srv.Shutdown()
+		require.FailNow(t, "nats server not ready for connections")
+	}
+
+	t.Cleanup(func() {
+		srv.Shutdown()
+		srv.WaitForShutdown()
+	})
+
+	return srv
+}
+
+type trackingConn struct {
+	*nats.Conn
+
+	mu      sync.Mutex
+	drained bool
+	closed  bool
+}
+
+func newTrackingConn(conn *nats.Conn) *trackingConn {
+	return &trackingConn{Conn: conn}
+}
+
+func (t *trackingConn) JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error) {
+	return t.Conn.JetStream(opts...)
+}
+
+func (t *trackingConn) Close() {
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	t.Conn.Close()
+}
+
+func (t *trackingConn) Drain() error {
+	t.mu.Lock()
+	t.drained = true
+	t.mu.Unlock()
+	err := t.Conn.Drain()
+	t.mu.Lock()
+	t.closed = true
+	t.mu.Unlock()
+	return err
+}
+
+func (t *trackingConn) Closed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+func (t *trackingConn) Drained() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.drained
+}
+
+type fakeNATSConn struct {
+	jsErr   error
+	closed  bool
+	drained bool
+}
+
+func (f *fakeNATSConn) JetStream(...nats.JSOpt) (nats.JetStreamContext, error) {
+	return nil, f.jsErr
+}
+
+func (f *fakeNATSConn) Close() {
+	f.closed = true
+}
+
+func (f *fakeNATSConn) Drain() error {
+	f.drained = true
+	return nil
+}
+
+type fakeKoldInterface struct {
+    dllama  generic.ControllerInterface[*v1.Dllama, *v1.DllamaList]
+    model   generic.ControllerInterface[*v1.Model, *v1.ModelList]
+    root    generic.ControllerInterface[*v1.Root, *v1.RootList]
+    worker  generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+    ingress generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
+    session generic.ControllerInterface[*v1.Session, *v1.SessionList]
+}
+
+func (f *fakeKoldInterface) Dllama() generic.ControllerInterface[*v1.Dllama, *v1.DllamaList] {
+    return f.dllama
+}
+
+func (f *fakeKoldInterface) Model() generic.ControllerInterface[*v1.Model, *v1.ModelList] {
+    return f.model
+}
+
+func (f *fakeKoldInterface) Root() generic.ControllerInterface[*v1.Root, *v1.RootList] {
+    return f.root
+}
+
+func (f *fakeKoldInterface) Worker() generic.ControllerInterface[*v1.Worker, *v1.WorkerList] {
+    return f.worker
+}
+
+func (f *fakeKoldInterface) Ingress() generic.ControllerInterface[*v1.Ingress, *v1.IngressList] {
+    return f.ingress
+}
+
+func (f *fakeKoldInterface) Session() generic.ControllerInterface[*v1.Session, *v1.SessionList] {
+    return f.session
 }
 
 type fakeApply struct {

@@ -12,6 +12,15 @@ Write Go 1.21+ idiomatic code: tabs for indentation, camelCase for locals, Pasca
 ## Testing Guidelines
 Adopt table-driven tests with `_test.go` suffixes co-located beside implementations. Prioritize reconciliation branches, memory sizing helpers, and NATS interactions, mocking JetStream or Kubernetes clients to keep tests hermetic. Collect coverage with `go test ./...`, and extend with `-race` when chasing data races.
 
+Envtest-powered controller tests (`pkg/controllers/dllama_reconcile_envtest_test.go`) require the kubebuilder toolchain. Install it once per machine and export `KUBEBUILDER_ASSETS`:
+
+```bash
+go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+eval "$(setup-envtest use --controller-runtime-version 0.20.4 --install-dir ./bin/envtest)"
+```
+
+The refreshed `envtest_suite_test.go` will skip gracefully (with guidance) when assets are missing, so CI logs stay quiet.
+
 ## Commit & Pull Request Guidelines
 Prefer short, imperative commit subjects (for example `feat: add dispatcher autoscaling`), adding a scope when it clarifies impact. Pull requests should summarize behavioral changes, link issues, and list validation steps such as `go test ./...` or Helm smoke tests. Include relevant logs or screenshots for user-facing updates and confirm Helm charts, manifests, and Docker packaging stay in sync.
 

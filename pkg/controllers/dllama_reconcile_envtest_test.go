@@ -17,6 +17,9 @@ func TestDllamaReconciliationCreatesRootAndWorker(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping envtest integration in short mode")
 	}
+	if reason := envtestSkipReason; reason != "" {
+		t.Skip(reason)
+	}
 	if testEnvConfig == nil {
 		t.Skip("envtest assets unavailable")
 	}

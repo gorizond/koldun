@@ -158,3 +158,26 @@ func parseLabelBool(value string) bool {
 func normalise(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
+
+// IsHashJetStreamSafe reports whether the provided token hash can be used as a JetStream KeyValue key segment.
+// JetStream rejects keys containing path separators or control characters. Koldun hashes should be lowercase
+// hex strings, so we only allow [a-z0-9_-] to ensure compatibility while still protecting against
+// unexpected secret contents (e.g. cluster bootstrap secrets).
+func IsHashJetStreamSafe(hash string) bool {
+	if strings.TrimSpace(hash) == "" {
+		return false
+	}
+	for _, r := range hash {
+		switch {
+		case r >= 'a' && r <= 'z':
+			continue
+		case r >= '0' && r <= '9':
+			continue
+		case r == '-' || r == '_':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
