@@ -144,6 +144,207 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestWorkerHandlerEnsureStatusInitializesNilConditions(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+	handler := &workerHandler{
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	statefulsets.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("models", "test-worker").Return(&appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: int32Ptr(1),
+		},
+		Status: appsv1.StatefulSetStatus{
+			ReadyReplicas: 0,
+		},
+	}, nil)
+
+	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
+		require.NotNil(t, updated.Status.Conditions)
+		require.Len(t, updated.Status.Conditions, 1)
+		requireCondition(t, updated.Status.Conditions, metav1.Condition{
+			Type:    conditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  "StatefulSetNotReady",
+			Message: "Worker statefulset is not yet ready",
+		})
+		return updated, nil
+	})
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+		},
+		Status: v1.WorkerStatus{
+			Conditions: nil, // Explicitly nil conditions
+		},
+	}
+	worker.Generation = 1
+
+	result, err := handler.ensureStatus(worker)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+func TestWorkerHandlerEnsureStatusStatefulSetNotFound(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+	handler := &workerHandler{
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	statefulsets.EXPECT().Cache().Return(stsCache)
+	notFoundErr := apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "test-worker")
+	stsCache.EXPECT().Get("models", "test-worker").Return(nil, notFoundErr)
+
+	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
+		require.EqualValues(t, 2, updated.Status.ObservedGeneration)
+		requireCondition(t, updated.Status.Conditions, metav1.Condition{
+			Type:    conditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  "StatefulSetNotReady",
+			Message: "Worker statefulset is not yet ready",
+		})
+		return updated, nil
+	})
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+		},
+		Status: v1.WorkerStatus{
+			Conditions: []metav1.Condition{},
+		},
+	}
+	worker.Generation = 2
+
+	result, err := handler.ensureStatus(worker)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+func TestWorkerHandlerEnsureStatusPartiallyReadyReplicas(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+	handler := &workerHandler{
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	statefulsets.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("models", "test-worker").Return(&appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: int32Ptr(5),
+		},
+		Status: appsv1.StatefulSetStatus{
+			ReadyReplicas: 3, // Only 3 out of 5 ready
+		},
+	}, nil)
+
+	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
+		requireCondition(t, updated.Status.Conditions, metav1.Condition{
+			Type:    conditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  "StatefulSetNotReady",
+			Message: "Worker statefulset is not yet ready",
+		})
+		return updated, nil
+	})
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+		},
+		Status: v1.WorkerStatus{
+			Conditions: []metav1.Condition{},
+		},
+	}
+	worker.Generation = 1
+
+	result, err := handler.ensureStatus(worker)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
+func TestWorkerHandlerEnsureStatusNilReplicas(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+	handler := &workerHandler{
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	statefulsets.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("models", "test-worker").Return(&appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: nil, // Should default to 1
+		},
+		Status: appsv1.StatefulSetStatus{
+			ReadyReplicas: 1,
+		},
+	}, nil)
+
+	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
+		requireCondition(t, updated.Status.Conditions, metav1.Condition{
+			Type:    conditionReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  "StatefulSetReady",
+			Message: "Worker statefulset is ready",
+		})
+		return updated, nil
+	})
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+		},
+		Status: v1.WorkerStatus{
+			Conditions: []metav1.Condition{},
+		},
+	}
+	worker.Generation = 1
+
+	result, err := handler.ensureStatus(worker)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+}
+
 func TestWorkerHandlerEnsureStatefulSetUsesModelMemoryPlan(t *testing.T) {
 	t.Parallel()
 
