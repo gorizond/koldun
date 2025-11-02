@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -499,6 +500,265 @@ func TestEnsureConversionJobSkipsWhenMissingBucketForConvert(t *testing.T) {
 
 	if err := handler.ensureConversionJob(model); err != nil {
 		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+}
+
+func TestEnsureConversionJobRespectsPVOverrides(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			LocalPath: "s3://override-bucket/models",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "source-bucket",
+				BucketForConvert: "convert-bucket",
+			},
+			Conversion: &v1.ModelConversionSpec{
+				ConverterVersion: "v0.20.0",
+				ToolsImage:       "custom-tools:1.0",
+				WeightsFloatType: "q6",
+			},
+			PV: &v1.ModelPVSpec{
+				Capacity:            "20Gi",
+				StorageClassName:    "custom-class",
+				AccessModes:         []string{"ReadWriteMany", "ReadWriteOnce", "ReadOnlyMany"},
+				ReclaimPolicy:       "Delete",
+				CSIDriver:           "example.csi/driver",
+				CSIMounter:          "geesefs",
+				CSIOptions:          "cache=true",
+				VolumeAttributes:    map[string]string{"foo": "bar", "bucket": "ignored"},
+				CSISecretName:       "custom-secret",
+				CSISecretNamespace:  "custom-namespace",
+				PVCStorageClassName: "custom-pvc-class",
+				PVCCapacity:         "15Gi",
+				PVCAccessModes:      []string{"ReadWriteOnce"},
+			},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 3,
+		},
+	}
+	model.Generation = 3
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+	if applySpy.Count != 5 {
+		t.Fatalf("expected 5 apply calls (PV, PVC, output PV/PVC, Job), got %d", applySpy.Count)
+	}
+
+	var (
+		inputPV, outputPV   *corev1.PersistentVolume
+		inputPVC, outputPVC *corev1.PersistentVolumeClaim
+		conversionJob       *batchv1.Job
+	)
+	for _, set := range applySpy.Objects {
+		for _, obj := range set.All() {
+			switch o := obj.(type) {
+			case *corev1.PersistentVolume:
+				if strings.Contains(o.Name, "-output-") {
+					outputPV = o
+				} else {
+					inputPV = o
+				}
+			case *corev1.PersistentVolumeClaim:
+				if strings.Contains(o.Name, "-output-") {
+					outputPVC = o
+				} else {
+					inputPVC = o
+				}
+			case *batchv1.Job:
+				conversionJob = o
+			}
+		}
+	}
+
+	if inputPV == nil || outputPV == nil || inputPVC == nil || outputPVC == nil || conversionJob == nil {
+		t.Fatalf("expected all resources to be applied (input/output PV/PVC and job)")
+	}
+
+	if inputPV.Spec.StorageClassName != "custom-class" {
+		t.Fatalf("input PV StorageClassName = %s, want custom-class", inputPV.Spec.StorageClassName)
+	}
+	pvModes := map[corev1.PersistentVolumeAccessMode]bool{}
+	for _, m := range inputPV.Spec.AccessModes {
+		pvModes[m] = true
+	}
+	if !(pvModes[corev1.ReadWriteMany] && pvModes[corev1.ReadWriteOnce] && pvModes[corev1.ReadOnlyMany]) {
+		t.Fatalf("input PV access modes = %v, expected all RWX/RWO/ROX", inputPV.Spec.AccessModes)
+	}
+	csi := inputPV.Spec.PersistentVolumeSource.CSI
+	if csi == nil {
+		t.Fatalf("input PV CSI source is nil")
+	}
+	if csi.Driver != "example.csi/driver" {
+		t.Fatalf("input PV CSI driver = %s, want example.csi/driver", csi.Driver)
+	}
+	if csi.ControllerPublishSecretRef == nil || csi.ControllerPublishSecretRef.Name != "custom-secret" || csi.ControllerPublishSecretRef.Namespace != "custom-namespace" {
+		t.Fatalf("input PV controller secret = %#v, want custom-secret/custom-namespace", csi.ControllerPublishSecretRef)
+	}
+	if csi.NodePublishSecretRef == nil || csi.NodePublishSecretRef.Name != "custom-secret" || csi.NodePublishSecretRef.Namespace != "custom-namespace" {
+		t.Fatalf("input PV node publish secret = %#v, want custom-secret/custom-namespace", csi.NodePublishSecretRef)
+	}
+	if got := csi.VolumeAttributes["bucket"]; got != "ignored" {
+		t.Fatalf("input PV volume attribute bucket = %s, want ignored", got)
+	}
+	if got := csi.VolumeAttributes["foo"]; got != "bar" {
+		t.Fatalf("input PV volume attribute foo = %s, want bar", got)
+	}
+	if got := csi.VolumeAttributes["prefix"]; got != "models" {
+		t.Fatalf("input PV volume attribute prefix = %s, want models", got)
+	}
+	if got := csi.VolumeAttributes["mounter"]; got != "geesefs" {
+		t.Fatalf("input PV volume attribute mounter = %s, want geesefs", got)
+	}
+	if got := csi.VolumeAttributes["options"]; got != "cache=true" {
+		t.Fatalf("input PV volume attribute options = %s, want cache=true", got)
+	}
+	if csi.VolumeHandle != "override-bucket/models" {
+		t.Fatalf("input PV volume handle = %s, want override-bucket/models", csi.VolumeHandle)
+	}
+
+	if inputPVC.Spec.StorageClassName == nil || *inputPVC.Spec.StorageClassName != "custom-pvc-class" {
+		t.Fatalf("input PVC storage class = %v, want custom-pvc-class", inputPVC.Spec.StorageClassName)
+	}
+	if qty := inputPVC.Spec.Resources.Requests[corev1.ResourceStorage]; qty.String() != "15Gi" {
+		t.Fatalf("input PVC storage request = %s, want 15Gi", qty.String())
+	}
+	if len(inputPVC.Spec.AccessModes) != 1 || inputPVC.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Fatalf("input PVC access modes = %v, want [ReadWriteOnce]", inputPVC.Spec.AccessModes)
+	}
+
+	if outputPV.Spec.PersistentVolumeSource.CSI.VolumeAttributes["bucket"] != "convert-bucket" {
+		t.Fatalf("output PV bucket = %s, want convert-bucket", outputPV.Spec.PersistentVolumeSource.CSI.VolumeAttributes["bucket"])
+	}
+	if prefix, ok := outputPV.Spec.PersistentVolumeSource.CSI.VolumeAttributes["prefix"]; !ok || prefix == "" {
+		t.Fatalf("output PV must include non-empty prefix attribute, got %q", prefix)
+	}
+	if _, ok := outputPV.Spec.PersistentVolumeSource.CSI.VolumeAttributes["foo"]; !ok {
+		t.Fatalf("output PV must retain custom volume attribute foo")
+	}
+
+	if qty := outputPVC.Spec.Resources.Requests[corev1.ResourceStorage]; qty.String() != "15Gi" {
+		t.Fatalf("output PVC storage request = %s, want 15Gi", qty.String())
+	}
+	if len(outputPVC.Spec.AccessModes) != 1 || outputPVC.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Fatalf("output PVC access modes = %v, want [ReadWriteOnce]", outputPVC.Spec.AccessModes)
+	}
+
+	if len(conversionJob.Spec.Template.Spec.Volumes) < 3 {
+		t.Fatalf("expected at least three volumes (workspace, s3, s3-output), got %d", len(conversionJob.Spec.Template.Spec.Volumes))
+	}
+	if len(conversionJob.Spec.Template.Spec.InitContainers) != 1 {
+		t.Fatalf("expected single init container, got %d", len(conversionJob.Spec.Template.Spec.InitContainers))
+	}
+	if conversionJob.Spec.Template.Spec.InitContainers[0].Image != "custom-tools:1.0" {
+		t.Fatalf("init container image = %s, want custom-tools:1.0", conversionJob.Spec.Template.Spec.InitContainers[0].Image)
+	}
+	mainContainer := conversionJob.Spec.Template.Spec.Containers[0]
+	foundOutputMount := false
+	for _, mount := range mainContainer.VolumeMounts {
+		if mount.Name == "s3-output" && mount.MountPath == "/mnt/s3-output" {
+			foundOutputMount = true
+			break
+		}
+	}
+	if !foundOutputMount {
+		t.Fatalf("expected main container to mount s3-output PVC")
+	}
+	foundOutputEnv := false
+	for _, env := range mainContainer.Env {
+		if env.Name == "CONVERSION_OUTPUT_PATH" && env.Value == "/mnt/s3-output" {
+			foundOutputEnv = true
+		}
+	}
+	if !foundOutputEnv {
+		t.Fatalf("expected CONVERSION_OUTPUT_PATH env var to be set")
+	}
+}
+
+func TestEnsureConversionJobFallsBackPVAccessModes(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "dst",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+			PV: &v1.ModelPVSpec{
+				AccessModes:    []string{"unsupported"},
+				PVCAccessModes: []string{"invalid"},
+			},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 1,
+		},
+	}
+	model.Generation = 1
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+
+	var (
+		inputPV  *corev1.PersistentVolume
+		inputPVC *corev1.PersistentVolumeClaim
+	)
+	for _, set := range applySpy.Objects {
+		for _, obj := range set.All() {
+			switch o := obj.(type) {
+			case *corev1.PersistentVolume:
+				if !strings.Contains(o.Name, "-output-") {
+					inputPV = o
+				}
+			case *corev1.PersistentVolumeClaim:
+				if !strings.Contains(o.Name, "-output-") {
+					inputPVC = o
+				}
+			}
+		}
+	}
+
+	if inputPV == nil || inputPVC == nil {
+		t.Fatalf("expected input PV and PVC to be applied")
+	}
+	if len(inputPV.Spec.AccessModes) != 1 || inputPV.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("fallback PV access modes = %v, want [ReadWriteMany]", inputPV.Spec.AccessModes)
+	}
+	if len(inputPVC.Spec.AccessModes) != 1 || inputPVC.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("fallback PVC access modes = %v, want [ReadWriteMany]", inputPVC.Spec.AccessModes)
 	}
 }
 

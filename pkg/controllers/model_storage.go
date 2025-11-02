@@ -14,6 +14,17 @@ import (
 	"k8s.io/klog/v2"
 )
 
+type minioClient interface {
+	BucketExists(ctx context.Context, bucket string) (bool, error)
+	MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error
+}
+
+type minioFactory func(host string, opts *minio.Options) (minioClient, error)
+
+func defaultMinioFactory(host string, opts *minio.Options) (minioClient, error) {
+	return minio.New(host, opts)
+}
+
 // Object Storage functions
 //
 // This file contains functions for interacting with S3/MinIO object storage:
@@ -86,7 +97,12 @@ func (h *modelHandler) ensureObjectStorageBuckets(obj *v1.Model) error {
 		secure = parsedEndpoint.Scheme != "http"
 	}
 
-	client, err := minio.New(host, &minio.Options{
+	factory := h.minioFactory
+	if factory == nil {
+		factory = defaultMinioFactory
+	}
+
+	client, err := factory(host, &minio.Options{
 		Creds:        credentials.NewStaticV4(accessKey, secretKey, sessionToken),
 		Secure:       secure,
 		Region:       region,
