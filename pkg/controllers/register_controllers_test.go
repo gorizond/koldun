@@ -47,6 +47,7 @@ func TestRegisterRootController(t *testing.T) {
 	rootCtrl := newControllerStub[*v1.Root, *v1.RootList](schema.GroupVersionKind{})
 	dllamaCtrl := newControllerStub[*v1.Dllama, *v1.DllamaList](schema.GroupVersionKind{})
 	modelCtrl := newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{})
+	workerCtrl := newControllerStub[*v1.Worker, *v1.WorkerList](schema.GroupVersionKind{})
 	statefulsetCtrl := newControllerStub[*appsv1.StatefulSet, *appsv1.StatefulSetList](schema.GroupVersionKind{})
 	serviceCtrl := newControllerStub[*corev1.Service, *corev1.ServiceList](schema.GroupVersionKind{})
 
@@ -56,6 +57,7 @@ func TestRegisterRootController(t *testing.T) {
 			root:   rootCtrl,
 			dllama: dllamaCtrl,
 			model:  modelCtrl,
+			worker: workerCtrl,
 		},
 		Apps: &rootAppsStub{statefulset: statefulsetCtrl},
 		Core: &rootCoreStub{service: serviceCtrl},
@@ -69,6 +71,8 @@ func TestRegisterRootController(t *testing.T) {
 	require.NotNil(t, serviceCtrl.lastOnChange())
 	require.NotNil(t, dllamaCtrl.lastOnChange())
 	require.NotNil(t, modelCtrl.lastOnChange())
+	require.NotNil(t, workerCtrl.lastOnChange())
+	require.NotNil(t, workerCtrl.lastOnRemove())
 }
 
 func TestRegisterModelController(t *testing.T) {
@@ -99,11 +103,17 @@ func TestRegisterModelController(t *testing.T) {
 
 func TestRegisterSessionController(t *testing.T) {
 	sessionCtrl := newControllerStub[*v1.Session, *v1.SessionList](schema.GroupVersionKind{})
+	dllamaCtrl := newControllerStub[*v1.Dllama, *v1.DllamaList](schema.GroupVersionKind{})
+	rootCtrl := newControllerStub[*v1.Root, *v1.RootList](schema.GroupVersionKind{})
+	workerCtrl := newControllerStub[*v1.Worker, *v1.WorkerList](schema.GroupVersionKind{})
 
 	mgr := &Manager{
 		apply: newFakeApply(),
 		Kold: &fakeKoldInterface{
 			session: sessionCtrl,
+			dllama:  dllamaCtrl,
+			root:    rootCtrl,
+			worker:  workerCtrl,
 		},
 	}
 
@@ -111,6 +121,9 @@ func TestRegisterSessionController(t *testing.T) {
 
 	require.NotNil(t, sessionCtrl.lastOnChange())
 	require.NotNil(t, sessionCtrl.lastOnRemove())
+	require.NotNil(t, dllamaCtrl.lastOnChange())
+	require.NotNil(t, rootCtrl.lastOnChange())
+	require.NotNil(t, workerCtrl.lastOnChange())
 }
 
 // Test stubs for worker controller

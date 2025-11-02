@@ -515,3 +515,16 @@ func TestRecord_ScalingDefaults(t *testing.T) {
 		t.Error("DesiredDllamas should be >= MinDllamas")
 	}
 }
+
+func TestRecordNamespacedName(t *testing.T) {
+	record := &Record{
+		Namespace: "test-ns",
+		Session:   "my-session",
+	}
+
+	result := record.NamespacedName()
+	expected := "test-ns/my-session"
+	if result != expected {
+		t.Errorf("NamespacedName() = %q, want %q", result, expected)
+	}
+}
