@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -18,6 +19,32 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
+
+type staticResponseTransport struct {
+	resp *http.Response
+	err  error
+}
+
+func (s staticResponseTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.resp, nil
+}
+
+type failingStreamReader struct {
+	sent bool
+}
+
+func (r *failingStreamReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		data := []byte("data: {\"id\":\"chunk-1\"}\n\n")
+		copy(p, data)
+		r.sent = true
+		return len(data), nil
+	}
+	return 0, errors.New("stream read failure")
+}
 
 func TestServerSidecarEndpoint(t *testing.T) {
 	server := &Server{
@@ -412,6 +439,149 @@ func TestStreamToSidecarPublishesErrorOnFailure(t *testing.T) {
 	msg, err = sub.NextMsg(time.Second)
 	require.NoError(t, err)
 	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestStreamToSidecarClientErrorPublishesError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	clientErr := errors.New("client boom")
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-stream",
+			SidecarURL: "http://localhost:12345",
+		},
+		nc:         nc,
+		client:     &http.Client{Transport: staticResponseTransport{err: clientErr}},
+		log:        logrus.NewEntry(logrus.New()),
+		outSubject: "stream.responses",
+	}
+
+	sub, err := nc.SubscribeSync("stream.responses")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		Request: openai.ChatCompletionRequest{
+			Stream: true,
+		},
+	}
+
+	err = srv.streamToSidecar(payload)
+	require.ErrorIs(t, err, clientErr)
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(msg.Data, &body))
+	require.Contains(t, body["error"], "client boom")
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestStreamToSidecarScannerError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	reader := &failingStreamReader{}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(reader),
+		Header:     make(http.Header),
+	}
+	resp.Header.Set("Content-Type", "text/event-stream")
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-stream",
+			SidecarURL: "http://localhost:12345",
+		},
+		nc:         nc,
+		client:     &http.Client{Transport: staticResponseTransport{resp: resp}},
+		log:        logrus.NewEntry(logger),
+		outSubject: "stream.responses",
+	}
+
+	sub, err := nc.SubscribeSync("stream.responses")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		Request: openai.ChatCompletionRequest{
+			Stream: true,
+		},
+	}
+
+	err = srv.streamToSidecar(payload)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "stream read failure")
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"chunk-1"}`, string(msg.Data))
+
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require.ErrorIs(t, err, nats.ErrTimeout)
+}
+
+func TestStreamToSidecarDonePublishFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\"}\n\n"))
+		flusher.Flush()
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-stream",
+			SidecarURL: sidecar.URL,
+		},
+		nc:         nc,
+		client:     sidecar.Client(),
+		log:        logrus.NewEntry(logger),
+		outSubject: "stream.responses",
+	}
+
+	nc.Close()
+
+	payload := inboundRequest{
+		Request: openai.ChatCompletionRequest{
+			Stream: true,
+		},
+	}
+
+	err := srv.streamToSidecar(payload)
+	require.Error(t, err)
+	require.ErrorIs(t, err, nats.ErrConnectionClosed)
 }
 
 func TestExecuteOncePublishesResponse(t *testing.T) {

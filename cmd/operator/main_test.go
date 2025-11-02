@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"os"
 	"sync"
 	"testing"
@@ -363,22 +364,132 @@ func TestRunDispatcherDelegatesToServer(t *testing.T) {
 	require.Equal(t, cfg, captured)
 }
 
+func TestRunLLMFatalOnInitError(t *testing.T) {
+	origFn := newLLMServerFn
+	defer func() { newLLMServerFn = origFn }()
+
+	newLLMServerFn = func(cfg llmserver.Config) (llmServer, error) {
+		return nil, errors.New("boom")
+	}
+
+	expectFatal(t, func() {
+		runLLM(context.Background(), llmserver.Config{})
+	})
+}
+
+func TestRunLLMFatalOnRunError(t *testing.T) {
+	origFn := newLLMServerFn
+	defer func() { newLLMServerFn = origFn }()
+
+	stub := &stubRunServer{}
+	stub.setError(errors.New("run failed"))
+	newLLMServerFn = func(cfg llmserver.Config) (llmServer, error) {
+		return stub, nil
+	}
+
+	expectFatal(t, func() {
+		runLLM(context.Background(), llmserver.Config{})
+	})
+}
+
+func TestRunIngressFatalOnInitError(t *testing.T) {
+	origFn := newIngressServerFn
+	defer func() { newIngressServerFn = origFn }()
+
+	newIngressServerFn = func(cfg ingress.Config) (ingressServer, error) {
+		return nil, errors.New("boom")
+	}
+
+	expectFatal(t, func() {
+		runIngress(context.Background(), ingress.Config{})
+	})
+}
+
+func TestRunIngressFatalOnRunError(t *testing.T) {
+	origFn := newIngressServerFn
+	defer func() { newIngressServerFn = origFn }()
+
+	stub := &stubRunServer{}
+	stub.setError(errors.New("ingress failed"))
+	newIngressServerFn = func(cfg ingress.Config) (ingressServer, error) {
+		return stub, nil
+	}
+
+	expectFatal(t, func() {
+		runIngress(context.Background(), ingress.Config{})
+	})
+}
+
+func TestRunDispatcherFatalOnInitError(t *testing.T) {
+	origFn := newDispatcherServerFn
+	defer func() { newDispatcherServerFn = origFn }()
+
+	newDispatcherServerFn = func(cfg dispatcher.Config) (dispatcherServer, error) {
+		return nil, errors.New("boom")
+	}
+
+	expectFatal(t, func() {
+		runDispatcher(context.Background(), dispatcher.Config{})
+	})
+}
+
+func TestRunDispatcherFatalOnRunError(t *testing.T) {
+	origFn := newDispatcherServerFn
+	defer func() { newDispatcherServerFn = origFn }()
+
+	stub := &stubRunServer{}
+	stub.setError(errors.New("dispatcher failed"))
+	newDispatcherServerFn = func(cfg dispatcher.Config) (dispatcherServer, error) {
+		return stub, nil
+	}
+
+	expectFatal(t, func() {
+		runDispatcher(context.Background(), dispatcher.Config{})
+	})
+}
+
 type stubRunServer struct {
 	mu      sync.Mutex
 	count   int
 	context []context.Context
+	err     error
 }
 
 func (s *stubRunServer) Run(ctx context.Context) error {
 	s.mu.Lock()
 	s.count++
 	s.context = append(s.context, ctx)
+	err := s.err
 	s.mu.Unlock()
-	return nil
+	return err
 }
 
 func (s *stubRunServer) runCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.count
+}
+
+func (s *stubRunServer) setError(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+}
+
+type fatalExit struct{}
+
+func expectFatal(t *testing.T, fn func()) {
+	t.Helper()
+
+	origExit := logrus.StandardLogger().ExitFunc
+	defer func() { logrus.StandardLogger().ExitFunc = origExit }()
+
+	fatalCalled := false
+	logrus.StandardLogger().ExitFunc = func(code int) {
+		fatalCalled = true
+		panic(fatalExit{})
+	}
+
+	require.PanicsWithValue(t, fatalExit{}, fn)
+	require.True(t, fatalCalled, "expected fatal exit to be triggered")
 }

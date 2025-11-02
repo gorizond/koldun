@@ -309,6 +309,20 @@ func startTestNATSServer(t *testing.T) *server.Server {
 		t.Fatal("NATS server not ready")
 	}
 
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		nc, connectErr := nats.Connect(ns.ClientURL())
+		if connectErr == nil {
+			nc.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			ns.Shutdown()
+			t.Fatalf("NATS server not ready for JetStream: %v", connectErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	t.Cleanup(func() {
 		ns.Shutdown()
 	})
