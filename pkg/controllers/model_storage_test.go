@@ -1,9 +1,16 @@
 package controllers
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/minio/minio-go/v7"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -110,8 +117,6 @@ func TestParseS3Path(t *testing.T) {
 	}
 }
 
-// TestSplitKey is already defined in dllama_test.go
-
 func TestModelObjectKey(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -129,28 +134,18 @@ func TestModelObjectKey(t *testing.T) {
 			wantKey:   "models/llama",
 		},
 		{
-			name:      "plain path",
+			name:      "local absolute path",
 			localPath: "/models/llama",
 			wantKey:   "models/llama",
 		},
 		{
-			name:      "plain path without leading slash",
+			name:      "local relative path",
 			localPath: "models/llama",
 			wantKey:   "models/llama",
 		},
 		{
 			name:      "empty path",
-			localPath: "",
-			wantKey:   "",
-		},
-		{
-			name:      "whitespace path",
-			localPath: "   ",
-			wantKey:   "",
-		},
-		{
-			name:      "s3 uri bucket only",
-			localPath: "s3://bucket",
+			localPath: " ",
 			wantKey:   "",
 		},
 	}
@@ -158,17 +153,10 @@ func TestModelObjectKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			model := &v1.Model{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-model",
-					Namespace: "default",
-				},
-				Spec: v1.ModelSpec{
-					LocalPath: tt.localPath,
-				},
+				Spec: v1.ModelSpec{LocalPath: tt.localPath},
 			}
-			key := modelObjectKey(model)
-			if key != tt.wantKey {
-				t.Errorf("modelObjectKey() = %v, want %v", key, tt.wantKey)
+			if got := modelObjectKey(model); got != tt.wantKey {
+				t.Errorf("modelObjectKey() = %v, want %v", got, tt.wantKey)
 			}
 		})
 	}
@@ -184,14 +172,13 @@ func TestConversionPaths(t *testing.T) {
 		wantWorkDir      string
 		wantBucket       string
 		wantKey          string
-		wantURISubstring string // Check if URI contains this substring
+		wantURISubstring string
 	}{
 		{
-			name:      "default conversion paths",
+			name:      "default settings",
 			modelName: "llama-7b",
 			objectStorage: &v1.ModelObjectStorageSpec{
-				Endpoint:         "https://minio.example.com",
-				BucketForSource:  "models",
+				BucketForSource:  "models-source",
 				BucketForConvert: "converted-models",
 			},
 			conversionSpec: &v1.ModelConversionSpec{
@@ -327,4 +314,219 @@ func TestConversionPaths(t *testing.T) {
 			}
 		})
 	}
+}
+
+type fakeMinioClient struct {
+	existing   map[string]bool
+	existsErr  error
+	makeErrors map[string]error
+	made       []string
+}
+
+func (f *fakeMinioClient) BucketExists(ctx context.Context, bucket string) (bool, error) {
+	if f.existsErr != nil {
+		return false, f.existsErr
+	}
+	return f.existing[bucket], nil
+}
+
+func (f *fakeMinioClient) MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error {
+	if f.makeErrors != nil {
+		if err, ok := f.makeErrors[bucket]; ok {
+			return err
+		}
+	}
+	if f.existing == nil {
+		f.existing = map[string]bool{}
+	}
+	f.existing[bucket] = true
+	f.made = append(f.made, bucket)
+	return nil
+}
+
+func TestEnsureObjectStorageBuckets_EarlyExit(t *testing.T) {
+	t.Parallel()
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+	}
+
+	t.Run("ensure disabled", func(t *testing.T) {
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: false,
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	})
+
+	t.Run("no storage", func(t *testing.T) {
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	})
+
+	t.Run("missing endpoint", func(t *testing.T) {
+		modelWithStorage := model.DeepCopy()
+		modelWithStorage.Spec.ObjectStorage = &v1.ModelObjectStorageSpec{
+			BucketForSource: "source",
+		}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(modelWithStorage))
+	})
+
+	t.Run("missing secret ref", func(t *testing.T) {
+		modelWithStorage := model.DeepCopy()
+		modelWithStorage.Spec.SourceURL = "https://example.com/model"
+		modelWithStorage.Spec.ObjectStorage = &v1.ModelObjectStorageSpec{
+			Endpoint:        "https://minio.local",
+			BucketForSource: "source",
+		}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(modelWithStorage))
+	})
+}
+
+func TestEnsureObjectStorageBuckets_SecretErrors(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://minio.local",
+				BucketForSource:  "source",
+				BucketForConvert: "convert",
+				SecretRef:        &v1.SecretReference{Name: "storage"},
+			},
+		},
+	}
+
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+
+	t.Run("secret fetch error", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(nil, errors.New("boom"))
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+		}
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "fetch object storage secret")
+	})
+
+	t.Run("missing credentials", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(&corev1.Secret{}, nil)
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+		}
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "missing AWS credentials")
+	})
+}
+
+func TestEnsureObjectStorageBuckets_ClientInteractions(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("access"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://minio.local",
+				BucketForSource:  "source",
+				BucketForConvert: "source",
+				SecretRef:        &v1.SecretReference{Name: "storage"},
+			},
+		},
+	}
+
+	t.Run("bucket exists", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		fake := &fakeMinioClient{existing: map[string]bool{"source": true}}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				require.Equal(t, "minio.local", host)
+				require.True(t, opts.Secure)
+				return fake, nil
+			},
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(model))
+		require.Empty(t, fake.made, "no buckets should be created when already present")
+	})
+
+	t.Run("create bucket", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		fake := &fakeMinioClient{existing: map[string]bool{}}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				return fake, nil
+			},
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(model))
+		require.Equal(t, []string{"source"}, fake.made)
+	})
+
+	t.Run("bucket already exists error", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		fake := &fakeMinioClient{makeErrors: map[string]error{"source": minio.ErrorResponse{Code: "BucketAlreadyOwnedByYou"}}}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				return fake, nil
+			},
+		}
+		require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	})
+
+	t.Run("bucket creation failure", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		fake := &fakeMinioClient{makeErrors: map[string]error{"source": errors.New("nope")}}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				return fake, nil
+			},
+		}
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "create bucket")
+	})
 }

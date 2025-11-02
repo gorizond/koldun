@@ -43,6 +43,7 @@ type modelHandler struct {
 	pods          corectlv1.PodController
 	secrets       corectlv1.SecretController
 	ensureBuckets bool
+	minioFactory  minioFactory
 }
 
 func registerModelController(ctx context.Context, m *Manager) error {
@@ -56,6 +57,7 @@ func registerModelController(ctx context.Context, m *Manager) error {
 		pods:          m.Core.Pod(),
 		secrets:       m.Core.Secret(),
 		ensureBuckets: m.EnsureObjectStorageBuckets(),
+		minioFactory:  defaultMinioFactory,
 	}
 
 	handler.models.OnChange(ctx, "koldun-model-controller", handler.onChange)
