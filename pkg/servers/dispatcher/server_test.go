@@ -451,6 +451,113 @@ func TestRecoverAssignmentsRequeuesAndDeletes(t *testing.T) {
 	}
 }
 
+func TestRunHandlesContextCancellation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration-style dispatcher run test in short mode")
+	}
+
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	dispatcher.cfg.MetricsAddr = "127.0.0.1:0"
+
+	dispatcher.workers = map[string]*workerState{
+		"worker-1": {
+			name:          "worker-1",
+			state:         "idle",
+			active:        0,
+			lastHeartbeat: time.Now(),
+		},
+	}
+
+	env := conversation.AssignmentEnvelope{
+		AssignmentID: "assign-run",
+		RequestID:    "req-run",
+		Payload:      []byte(`{"hello":"world"}`),
+	}
+	body, err := json.Marshal(env)
+	require.NoError(t, err)
+	_, err = dispatcher.assignments.Put(env.RequestID, body)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- dispatcher.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		dispatcher.mu.Lock()
+		defer dispatcher.mu.Unlock()
+		return dispatcher.backlogSub != nil && dispatcher.stateSub != nil
+	}, 2*time.Second, 50*time.Millisecond, "subscriptions not established")
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestHandleBacklogDispatchesToIdleWorker(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping NATS dependent test in short mode")
+	}
+
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	dispatcher.workers = map[string]*workerState{
+		"worker-1": {
+			name:          "worker-1",
+			state:         "idle",
+			active:        0,
+			lastHeartbeat: time.Now(),
+		},
+	}
+
+	assignSubject := fmt.Sprintf("%s%s.in", dispatcher.cfg.DllamaSubjectPrefix, "worker-1")
+	assignCh := make(chan *nats.Msg, 1)
+	sub, err := dispatcher.nc.Subscribe(assignSubject, func(msg *nats.Msg) {
+		assignCh <- msg
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sub.Unsubscribe()
+	})
+
+	backlog := conversation.BacklogMessage{
+		ID:      "request-123",
+		Payload: json.RawMessage(`{"foo":"bar"}`),
+	}
+	data, err := json.Marshal(backlog)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: dispatcher.cfg.BacklogSubject,
+		Data:    data,
+	}
+
+	dispatcher.handleBacklog(msg)
+	require.NoError(t, dispatcher.nc.Flush())
+
+	var env conversation.AssignmentEnvelope
+	select {
+	case assignment := <-assignCh:
+		require.NoError(t, json.Unmarshal(assignment.Data, &env))
+	default:
+		t.Fatal("expected assignment to be published to worker subject")
+	}
+
+	require.Equal(t, backlog.ID, env.RequestID)
+	require.NotEmpty(t, env.AssignmentID)
+
+	dispatcher.mu.Lock()
+	_, exists := dispatcher.inflight[env.AssignmentID]
+	dispatcher.mu.Unlock()
+	require.True(t, exists, "assignment should be tracked as inflight")
+
+	value, err := dispatcher.assignments.Get(backlog.ID)
+	require.NoError(t, err)
+	require.NotNil(t, value)
+}
+
 func TestUpdateMetricsReflectsState(t *testing.T) {
 	srv := &Server{
 		workers: map[string]*workerState{

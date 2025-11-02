@@ -162,6 +162,20 @@ spec:
 - Prefer Go table-driven tests and mocks from `go.uber.org/mock` for JetStream/Kubernetes clients.
 - Avoid committing secrets; store NATS credentials and hash secrets in Kubernetes Secrets labelled `koldun.gorizond.io/token`.
 
+### Envtest Integration Suite
+Controllers rely on [`envtest`](https://book.kubebuilder.io/reference/envtest.html) binaries (`kube-apiserver`, `etcd`) when running the integration test in `pkg/controllers/dllama_reconcile_envtest_test.go`. Install the assets once and export `KUBEBUILDER_ASSETS` before running the suite:
+
+```bash
+go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+# Downloads the stack compatible with controller-runtime v0.20.4 and prints the export lines
+eval "$(setup-envtest use --controller-runtime-version 0.20.4 --install-dir ./bin/envtest)"
+
+# Verify the integration test; it will skip with a helpful message if assets are missing
+go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -count=1
+```
+
+The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
+
 ### Key Commands
 | Purpose | Command |
 | --- | --- |

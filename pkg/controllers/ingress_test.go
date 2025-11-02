@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -8,6 +9,9 @@ import (
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	fakeapply "github.com/rancher/wrangler/v3/pkg/apply/fake"
+	appscontroller "github.com/rancher/wrangler/v3/pkg/generated/controllers/apps/v1"
+	corecontroller "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/v3/pkg/generic"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -64,6 +68,273 @@ func newIngress() *v1.Ingress {
 		},
 		Spec: *spec,
 	}
+}
+
+type fakeKoldControllers struct {
+	ingress generic.ControllerInterface[*v1.Ingress, *v1.IngressList]
+}
+
+func (f fakeKoldControllers) Dllama() generic.ControllerInterface[*v1.Dllama, *v1.DllamaList] {
+	return nil
+}
+
+func (f fakeKoldControllers) Model() generic.ControllerInterface[*v1.Model, *v1.ModelList] {
+	return nil
+}
+
+func (f fakeKoldControllers) Root() generic.ControllerInterface[*v1.Root, *v1.RootList] {
+	return nil
+}
+
+func (f fakeKoldControllers) Worker() generic.ControllerInterface[*v1.Worker, *v1.WorkerList] {
+	return nil
+}
+
+func (f fakeKoldControllers) Ingress() generic.ControllerInterface[*v1.Ingress, *v1.IngressList] {
+	return f.ingress
+}
+
+func (f fakeKoldControllers) Session() generic.ControllerInterface[*v1.Session, *v1.SessionList] {
+	return nil
+}
+
+type fakeAppsControllers struct {
+	deployment appscontroller.DeploymentController
+}
+
+func (f fakeAppsControllers) DaemonSet() appscontroller.DaemonSetController {
+	return nil
+}
+
+func (f fakeAppsControllers) Deployment() appscontroller.DeploymentController {
+	return f.deployment
+}
+
+func (f fakeAppsControllers) StatefulSet() appscontroller.StatefulSetController {
+	return nil
+}
+
+type fakeCoreControllers struct {
+    secret  corecontroller.SecretController
+    service corecontroller.ServiceController
+}
+
+func (f fakeCoreControllers) ConfigMap() corecontroller.ConfigMapController {
+	return nil
+}
+
+func (f fakeCoreControllers) Endpoints() corecontroller.EndpointsController {
+	return nil
+}
+
+func (f fakeCoreControllers) Event() corecontroller.EventController {
+	return nil
+}
+
+func (f fakeCoreControllers) Namespace() corecontroller.NamespaceController {
+	return nil
+}
+
+func (f fakeCoreControllers) Node() corecontroller.NodeController {
+	return nil
+}
+
+func (f fakeCoreControllers) PersistentVolume() corecontroller.PersistentVolumeController {
+	return nil
+}
+
+func (f fakeCoreControllers) PersistentVolumeClaim() corecontroller.PersistentVolumeClaimController {
+	return nil
+}
+
+func (f fakeCoreControllers) Pod() corecontroller.PodController {
+	return nil
+}
+
+func (f fakeCoreControllers) Secret() corecontroller.SecretController {
+    return f.secret
+}
+
+func (f fakeCoreControllers) Service() corecontroller.ServiceController {
+	return f.service
+}
+
+func (f fakeCoreControllers) ServiceAccount() corecontroller.ServiceAccountController {
+	return nil
+}
+
+func TestRegisterIngressControllerRegistersHandlers(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingresses := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	deployments := genericfake.NewMockControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList](ctrl)
+	services := genericfake.NewMockControllerInterface[*corev1.Service, *corev1.ServiceList](ctrl)
+
+	ingresses.EXPECT().
+		OnChange(gomock.Any(), "koldun-ingress-controller", gomock.AssignableToTypeOf(generic.ObjectHandler[*v1.Ingress](nil)))
+	ingresses.EXPECT().
+		OnRemove(gomock.Any(), "koldun-ingress-controller", gomock.AssignableToTypeOf(generic.ObjectHandler[*v1.Ingress](nil)))
+	deployments.EXPECT().
+		OnChange(gomock.Any(), "koldun-ingress-deployment-watch", gomock.AssignableToTypeOf(generic.ObjectHandler[*appsv1.Deployment](nil)))
+	services.EXPECT().
+		OnChange(gomock.Any(), "koldun-ingress-service-watch", gomock.AssignableToTypeOf(generic.ObjectHandler[*corev1.Service](nil)))
+
+	manager := &Manager{
+		apply: &fakeapply.FakeApply{},
+		Kold:  fakeKoldControllers{ingress: ingresses},
+		Apps:  fakeAppsControllers{deployment: deployments},
+		Core:  fakeCoreControllers{service: services},
+	}
+
+	err := registerIngressController(context.Background(), manager)
+	require.NoError(t, err)
+}
+
+func TestIngressOnChangeScenarios(t *testing.T) {
+	t.Run("nil object returns nil", func(t *testing.T) {
+		handler := &ingressHandler{}
+
+		obj, err := handler.onChange("testing/chat", nil)
+		require.NoError(t, err)
+		require.Nil(t, obj)
+	})
+
+	t.Run("deletion timestamp skips reconciliation", func(t *testing.T) {
+		handler := &ingressHandler{}
+		ing := newIngress()
+		now := metav1.Now()
+		ing.DeletionTimestamp = &now
+
+		obj, err := handler.onChange("testing/chat", ing)
+		require.NoError(t, err)
+		require.Same(t, ing, obj)
+	})
+
+	t.Run("ensureResources failure bubbles up", func(t *testing.T) {
+		handler := &ingressHandler{apply: &fakeapply.FakeApply{}}
+		ing := newIngress()
+		ing.Spec.Backend.Image = ""
+
+		obj, err := handler.onChange("testing/chat", ing)
+		require.Error(t, err)
+		require.Same(t, ing, obj)
+	})
+
+	t.Run("successful reconciliation applies resources and updates status", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		applySpy := &fakeapply.FakeApply{}
+		deployments := genericfake.NewMockControllerInterface[*appsv1.Deployment, *appsv1.DeploymentList](ctrl)
+		deploymentsCache := genericfake.NewMockCacheInterface[*appsv1.Deployment](ctrl)
+		ingresses := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+
+		handler := &ingressHandler{
+			apply:       applySpy,
+			deployments: deployments,
+			ingresses:   ingresses,
+		}
+
+		deployments.EXPECT().Cache().Return(deploymentsCache)
+		deploymentsCache.EXPECT().
+			Get("testing", "chat-backend-backend").
+			Return(&appsv1.Deployment{Status: appsv1.DeploymentStatus{ReadyReplicas: 1}}, nil)
+		ingresses.EXPECT().
+			UpdateStatus(gomock.AssignableToTypeOf(&v1.Ingress{})).
+			DoAndReturn(func(obj *v1.Ingress) (*v1.Ingress, error) {
+				cond := meta.FindStatusCondition(obj.Status.Conditions, conditionReady)
+				require.NotNil(t, cond)
+				require.Equal(t, metav1.ConditionTrue, cond.Status)
+				return obj, nil
+			})
+
+		ing := newIngress()
+		ing.Generation = 5
+
+		obj, err := handler.onChange("testing/chat", ing)
+		require.NoError(t, err)
+		require.NotNil(t, obj)
+		require.Equal(t, 1, applySpy.Count)
+	})
+}
+
+func TestIngressOnRelatedDeployment(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingresses := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	handler := &ingressHandler{ingresses: ingresses}
+
+	t.Run("nil object", func(t *testing.T) {
+		obj, err := handler.onRelatedDeployment("ns/key", nil)
+		require.NoError(t, err)
+		require.Nil(t, obj)
+	})
+
+	t.Run("non backend component", func(t *testing.T) {
+		deploy := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}
+		obj, err := handler.onRelatedDeployment("ns/key", deploy)
+		require.NoError(t, err)
+		require.Same(t, deploy, obj)
+	})
+
+	t.Run("enqueue backend ingress", func(t *testing.T) {
+		deploy := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "worker",
+				Namespace: "testing",
+				Labels: map[string]string{
+					labelComponent:   componentBackend,
+					labelBackendName: "chat",
+				},
+			},
+		}
+		ingresses.EXPECT().Enqueue("testing", "chat")
+
+		obj, err := handler.onRelatedDeployment("ns/key", deploy)
+		require.NoError(t, err)
+		require.Same(t, deploy, obj)
+	})
+}
+
+func TestIngressOnRelatedService(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingresses := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	handler := &ingressHandler{ingresses: ingresses}
+
+	t.Run("nil object", func(t *testing.T) {
+		obj, err := handler.onRelatedService("ns/key", nil)
+		require.NoError(t, err)
+		require.Nil(t, obj)
+	})
+
+	t.Run("non backend component", func(t *testing.T) {
+		svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}}}
+		obj, err := handler.onRelatedService("ns/key", svc)
+		require.NoError(t, err)
+		require.Same(t, svc, obj)
+	})
+
+	t.Run("enqueue backend ingress", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "backend",
+				Namespace: "testing",
+				Labels: map[string]string{
+					labelComponent:   componentBackend,
+					labelBackendName: "chat",
+				},
+			},
+		}
+		ingresses.EXPECT().Enqueue("testing", "chat")
+
+		obj, err := handler.onRelatedService("ns/key", svc)
+		require.NoError(t, err)
+		require.Same(t, svc, obj)
+	})
 }
 
 func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {

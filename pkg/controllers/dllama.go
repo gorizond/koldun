@@ -46,6 +46,7 @@ func registerDllamaController(ctx context.Context, m *Manager) error {
 	handler.roots.OnChange(ctx, "koldun-dllama-root-watch", handler.onRelatedRoot)
 	handler.workers.OnChange(ctx, "koldun-dllama-worker-watch", handler.onRelatedWorker)
 	handler.ingresses.OnChange(ctx, "koldun-dllama-ingress-watch", handler.onRelatedIngress)
+	handler.statefulsets.OnChange(ctx, "koldun-dllama-statefulset-watch", handler.onRelatedStatefulSet)
 	return nil
 }
 
@@ -127,6 +128,16 @@ func (h *dllamaHandler) onRelatedIngress(key string, obj *v1.Ingress) (*v1.Ingre
 		h.dllamas.Enqueue(dllama.Namespace, dllama.Name)
 	}
 
+	return obj, nil
+}
+
+func (h *dllamaHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	if name := labelValue(obj.Labels, labelDllamaName); name != "" {
+		h.dllamas.Enqueue(obj.Namespace, name)
+	}
 	return obj, nil
 }
 

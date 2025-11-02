@@ -204,7 +204,11 @@ func (r *registrySync) deleteModel(namespace, name string) error {
 }
 
 func (r *registrySync) putToken(token *registry.Token) error {
-	key := r.cfg.TokenPrefix + strings.ToLower(strings.TrimSpace(token.Hash))
+	key, ok := r.tokenKey(token.Hash)
+	if !ok {
+		return fmt.Errorf("invalid token hash: %q", token.Hash)
+	}
+
 	payload, err := json.Marshal(token)
 	if err != nil {
 		return err
@@ -214,7 +218,11 @@ func (r *registrySync) putToken(token *registry.Token) error {
 }
 
 func (r *registrySync) deleteToken(hash string) error {
-	key := r.cfg.TokenPrefix + strings.ToLower(strings.TrimSpace(hash))
+	key, ok := r.tokenKey(hash)
+	if !ok {
+		// Hash contains characters that JetStream rejects; nothing to delete.
+		return nil
+	}
 	return ignoreNotFound(r.tokensKV.Delete(key))
 }
 
@@ -231,6 +239,14 @@ func modelKey(namespace, name string) string {
 		ns = "default"
 	}
 	return fmt.Sprintf("%s/%s", ns, strings.TrimSpace(name))
+}
+
+func (r *registrySync) tokenKey(hash string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(hash))
+	if !tokens.IsHashJetStreamSafe(trimmed) {
+		return "", false
+	}
+	return r.cfg.TokenPrefix + trimmed, true
 }
 
 func modelReady(model *v1.Model) bool {

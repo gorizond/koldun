@@ -9,6 +9,7 @@ import (
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/registry"
 	"github.com/gorizond/koldun/pkg/tokens"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,57 @@ func TestModelKey(t *testing.T) {
 
 	require.Equal(t, "default/model", modelKey(" ", "model"))
 	require.Equal(t, "ns/demo", modelKey("ns", " demo "))
+}
+
+func startRegistryJetStreamServer(t *testing.T) *server.Server {
+	t.Helper()
+
+	opts := &server.Options{
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+		Port:      -1,
+	}
+
+	ns, err := server.NewServer(opts)
+	require.NoError(t, err)
+
+	go ns.Start()
+	if !ns.ReadyForConnections(5 * time.Second) {
+		ns.Shutdown()
+		t.Fatal("NATS server not ready")
+	}
+
+	t.Cleanup(func() {
+		ns.Shutdown()
+	})
+
+	return ns
+}
+
+func TestEnsureBucketCreatesAndReuses(t *testing.T) {
+	ns := startRegistryJetStreamServer(t)
+
+	nc, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(func() { nc.Drain(); nc.Close() })
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	name := "registry-test-bucket"
+
+	kv, err := ensureBucket(js, name)
+	require.NoError(t, err)
+	require.NotNil(t, kv)
+
+	// Second invocation should return the existing bucket without error
+	kv2, err := ensureBucket(js, name)
+	require.NoError(t, err)
+	require.NotNil(t, kv2)
+
+	info, err := kv.Status()
+	require.NoError(t, err)
+	require.Equal(t, name, info.Bucket())
 }
 
 func TestIgnoreNotFound(t *testing.T) {
@@ -174,6 +226,40 @@ func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
 	require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
 
 	require.NoError(t, sync.deleteToken("missing"), "ignore missing keys")
+}
+
+func TestRegistrySyncPutTokenRejectsInvalidHash(t *testing.T) {
+	t.Parallel()
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{TokenPrefix: "token/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		tokensKV: &fakeMemoryKV{},
+	}
+
+	token := &registry.Token{
+		Hash: "$1:9770a2e01028d699",
+	}
+
+	err := sync.putToken(token)
+	require.EqualError(t, err, `invalid token hash: "$1:9770a2e01028d699"`)
+}
+
+func TestRegistrySyncDeleteTokenSkipsInvalidHash(t *testing.T) {
+	t.Parallel()
+
+	kv := &fakeMemoryKV{
+		payload: make(map[string][]byte),
+	}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{TokenPrefix: "token/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		tokensKV: kv,
+	}
+
+	require.NoError(t, sync.deleteToken("$1:9770a2e01028d699"))
+	require.Empty(t, kv.deleteCalls, "invalid hashes should be ignored")
 }
 
 func TestRegistrySyncOnModelChange(t *testing.T) {

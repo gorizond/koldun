@@ -474,6 +474,31 @@ func TestDisabledFromSecret(t *testing.T) {
 	}
 }
 
+func TestIsHashJetStreamSafe(t *testing.T) {
+	tests := []struct {
+		name string
+		hash string
+		ok   bool
+	}{
+		{name: "empty", hash: "", ok: false},
+		{name: "lowercase hex", hash: "abc123", ok: true},
+		{name: "with dash", hash: "abc-123", ok: true},
+		{name: "with underscore", hash: "abc_123", ok: true},
+		{name: "uppercase rejected", hash: "ABC123", ok: false},
+		{name: "slash rejected", hash: "abc/123", ok: false},
+		{name: "colon rejected", hash: "abc:123", ok: false},
+		{name: "plus rejected", hash: "abc+123", ok: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsHashJetStreamSafe(tt.hash); got != tt.ok {
+				t.Errorf("IsHashJetStreamSafe(%q) = %v, want %v", tt.hash, got, tt.ok)
+			}
+		})
+	}
+}
+
 func TestMetadataFromSecret(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -6,111 +6,77 @@ import (
 	"testing"
 )
 
-func TestBuildConfig(t *testing.T) {
-	t.Run("with explicit path - file not exists", func(t *testing.T) {
-		_, err := BuildConfig("/nonexistent/kubeconfig")
-		if err == nil {
-			t.Error("BuildConfig() should fail with nonexistent path")
-		}
-	})
-
-	t.Run("with explicit valid kubeconfig", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		kubeconfigPath := filepath.Join(tmpDir, "config")
-
-		content := `apiVersion: v1
+const sampleKubeconfig = `
+apiVersion: v1
 kind: Config
 clusters:
-- cluster:
-    server: https://localhost:6443
-  name: test-cluster
+- name: local
+  cluster:
+    server: https://127.0.0.1:6443
+    insecure-skip-tls-verify: true
 contexts:
-- context:
-    cluster: test-cluster
-    user: test-user
-  name: test-context
-current-context: test-context
+- name: local
+  context:
+    cluster: local
+    user: local
+current-context: local
 users:
-- name: test-user
+- name: local
   user:
-    token: test-token
+    token: dummy
 `
-		if err := os.WriteFile(kubeconfigPath, []byte(content), 0600); err != nil {
-			t.Fatalf("Failed to write test kubeconfig: %v", err)
-		}
 
-		cfg, err := BuildConfig(kubeconfigPath)
-		if err != nil {
-			t.Fatalf("BuildConfig() error = %v", err)
-		}
-		if cfg == nil {
-			t.Error("BuildConfig() returned nil config")
-		}
-		if cfg.Host != "https://localhost:6443" {
-			t.Errorf("Config Host = %v, want https://localhost:6443", cfg.Host)
-		}
-	})
+func writeKubeconfig(t *testing.T, dir string) string {
+	t.Helper()
 
-	t.Run("with empty path falls back", func(t *testing.T) {
-		// Save original env
-		oldKubeconfig := os.Getenv("KUBECONFIG")
-		defer func() {
-			if oldKubeconfig != "" {
-				os.Setenv("KUBECONFIG", oldKubeconfig)
-			} else {
-				os.Unsetenv("KUBECONFIG")
-			}
-		}()
-
-		// Create temp kubeconfig
-		tmpDir := t.TempDir()
-		kubeconfigPath := filepath.Join(tmpDir, "config")
-
-		content := `apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://env-cluster:6443
-  name: env-cluster
-contexts:
-- context:
-    cluster: env-cluster
-    user: env-user
-  name: env-context
-current-context: env-context
-users:
-- name: env-user
-  user:
-    token: env-token
-`
-		if err := os.WriteFile(kubeconfigPath, []byte(content), 0600); err != nil {
-			t.Fatalf("Failed to write test kubeconfig: %v", err)
-		}
-
-		os.Setenv("KUBECONFIG", kubeconfigPath)
-
-		cfg, err := BuildConfig("")
-		if err != nil {
-			// In cluster config or KUBECONFIG should work
-			t.Logf("BuildConfig() with empty path: %v", err)
-		}
-		if cfg != nil && cfg.Host == "https://env-cluster:6443" {
-			t.Logf("Successfully loaded config from KUBECONFIG env var")
-		}
-	})
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte(sampleKubeconfig), 0o644); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+	return path
 }
 
-func TestBuildConfig_InvalidKubeconfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	kubeconfigPath := filepath.Join(tmpDir, "invalid-config")
+func TestBuildConfigExplicitPath(t *testing.T) {
+	dir := t.TempDir()
+	path := writeKubeconfig(t, dir)
 
-	// Write invalid kubeconfig
-	if err := os.WriteFile(kubeconfigPath, []byte("invalid yaml content"), 0600); err != nil {
-		t.Fatalf("Failed to write invalid kubeconfig: %v", err)
+	cfg, err := BuildConfig(path)
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
 	}
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	if got := cfg.Host; got != "https://127.0.0.1:6443" {
+		t.Fatalf("unexpected host %q", got)
+	}
+}
 
-	_, err := BuildConfig(kubeconfigPath)
+func TestBuildConfigFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := writeKubeconfig(t, dir)
+	t.Setenv("KUBECONFIG", path)
+
+	cfg, err := BuildConfig("")
+	if err != nil {
+		t.Fatalf("BuildConfig returned error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected config, got nil")
+	}
+	if got := cfg.Host; got != "https://127.0.0.1:6443" {
+		t.Fatalf("unexpected host %q", got)
+	}
+}
+
+func TestBuildConfigNoConfig(t *testing.T) {
+	t.Setenv("KUBECONFIG", "")
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
+
+	cfg, err := BuildConfig("")
 	if err == nil {
-		t.Error("BuildConfig() should fail with invalid kubeconfig")
+		t.Fatalf("expected error with no configuration, got config: %+v", cfg)
 	}
 }

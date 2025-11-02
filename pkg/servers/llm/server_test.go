@@ -44,6 +44,84 @@ func TestServerSidecarEndpointInvalidURL(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestHandleHealth(t *testing.T) {
+	t.Run("disconnected", func(t *testing.T) {
+		srv := &Server{}
+
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rr := httptest.NewRecorder()
+		srv.handleHealth(rr, req)
+
+		require.Equal(t, http.StatusServiceUnavailable, rr.Code)
+	})
+
+	t.Run("connected", func(t *testing.T) {
+		ns := startJetStreamServer(t)
+		_, nc := connectJetStream(t, ns)
+
+		srv := &Server{
+			nc:  nc,
+			log: logrus.New().WithField("component", "test"),
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rr := httptest.NewRecorder()
+		srv.handleHealth(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, "ok", rr.Body.String())
+	})
+}
+
+func TestNewRequiresHash(t *testing.T) {
+	_, err := New(Config{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Hash")
+}
+
+func TestNewAppliesDefaults(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+
+	cfg := Config{
+		Hash:     "tenant-1",
+		NATSURL:  ns.ClientURL(),
+		InPrefix: "tenant.in.",
+		Logger:   logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	t.Cleanup(func() {
+		if srv.sub != nil {
+			_ = srv.sub.Unsubscribe()
+		}
+		if srv.nc != nil {
+			_ = srv.nc.Drain()
+			srv.nc.Close()
+		}
+	})
+
+	require.Equal(t, defaultListenAddress, srv.cfg.ListenAddress)
+	require.Equal(t, cfg.InPrefix, srv.cfg.InPrefix)
+	require.Equal(t, defaultOutPrefix, srv.cfg.OutPrefix)
+	require.Equal(t, cfg.Hash, srv.cfg.DllamaName)
+	require.Equal(t, srv.cfg.RequestSubject, srv.inSubject)
+	require.Equal(t, srv.cfg.OutPrefix+srv.cfg.Hash, srv.outSubject)
+	require.Equal(t, srv.cfg.StateSubject, srv.stateSubject)
+	require.Equal(t, llmRequestStreamName, srv.streamName)
+
+	info, err := srv.js.StreamInfo(srv.streamName)
+	require.NoError(t, err)
+	require.Contains(t, info.Config.Subjects, defaultInPrefix+">")
+	require.Contains(t, info.Config.Subjects, srv.cfg.InPrefix+">")
+}
+
 func TestServerWaitForSidecarSuccess(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/models", r.URL.Path)
@@ -222,6 +300,448 @@ func TestPublishErrorUsesTargetOrFallback(t *testing.T) {
 	msg, err = defaultSub.NextMsg(time.Second)
 	require.NoError(t, err)
 	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestStreamToSidecarPublishesChunks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\"}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"id\":\"chunk-2\"}\n\n"))
+		flusher.Flush()
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-stream",
+			SidecarURL: sidecar.URL,
+		},
+		nc:         nc,
+		client:     sidecar.Client(),
+		log:        logrus.NewEntry(logger),
+		outSubject: "stream.responses",
+	}
+
+	sub, err := nc.SubscribeSync("stream.responses")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		Request: openai.ChatCompletionRequest{
+			Stream: true,
+		},
+	}
+
+	err = srv.streamToSidecar(payload)
+	require.NoError(t, err)
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"chunk-1"}`, string(msg.Data))
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"chunk-2"}`, string(msg.Data))
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestStreamToSidecarPublishesErrorOnFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping streaming test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("sidecar failure"))
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-stream",
+			SidecarURL: sidecar.URL,
+		},
+		nc:     nc,
+		client: sidecar.Client(),
+		log:    logrus.NewEntry(logger),
+	}
+
+	sub, err := nc.SubscribeSync("custom.responses")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		ResponseSubject: "custom.responses",
+		Request: openai.ChatCompletionRequest{
+			Stream: true,
+		},
+	}
+
+	err = srv.streamToSidecar(payload)
+	require.Error(t, err)
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(msg.Data, &body))
+	require.Contains(t, body["error"], "sidecar responded 500")
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestExecuteOncePublishesResponse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping executeOnce test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"once-success"}`))
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName:     "dllama-execute",
+			SidecarURL:     sidecar.URL,
+			SidecarTimeout: time.Second,
+		},
+		nc:         nc,
+		client:     sidecar.Client(),
+		log:        logrus.NewEntry(logger),
+		outSubject: "execute.responses",
+	}
+
+	sub, err := nc.SubscribeSync("execute.responses")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		ResponseSubject: "execute.responses",
+		Request: openai.ChatCompletionRequest{
+			Model: "model",
+		},
+	}
+
+	require.NoError(t, srv.executeOnce(payload))
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"id":"once-success"}`, string(msg.Data))
+}
+
+func TestExecuteOncePublishesErrorOnFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping executeOnce test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(sidecar.Close)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-execute",
+			SidecarURL: sidecar.URL,
+		},
+		nc:         nc,
+		client:     sidecar.Client(),
+		log:        logrus.NewEntry(logger),
+		outSubject: "execute.errors",
+	}
+
+	sub, err := nc.SubscribeSync("execute.errors")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	payload := inboundRequest{
+		ResponseSubject: "execute.errors",
+		Request: openai.ChatCompletionRequest{
+			Model: "model",
+		},
+	}
+
+	err = srv.executeOnce(payload)
+	require.Error(t, err)
+
+	msg, err := sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(msg.Data, &body))
+	require.Contains(t, body["error"], "sidecar responded 500")
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "[DONE]", string(msg.Data))
+}
+
+func TestRunStartsAndStops(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping NATS dependent test in short mode")
+	}
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == sidecarModelsPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer sidecar.Close()
+
+	ns := startJetStreamServer(t)
+
+	cfg := Config{
+		Hash:           "tenant-run",
+		NATSURL:        ns.ClientURL(),
+		InPrefix:       "tenant.in.",
+		SidecarURL:     sidecar.URL,
+		SidecarTimeout: 500 * time.Millisecond,
+		Logger:         logrus.New().WithField("component", "test"),
+		HealthOnly:     true,
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	srv.client = sidecar.Client()
+	srv.cfg.SidecarMonitorInterval = 0
+	srv.cfg.SidecarFailureThreshold = 0
+	srv.sidecarMonitorInterval = 0
+	srv.sidecarFailureThreshold = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool {
+		return srv.sub != nil
+	}, 2*time.Second, 50*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	if srv.sub != nil {
+		_ = srv.sub.Unsubscribe()
+	}
+	if srv.nc != nil {
+		_ = srv.nc.Drain()
+		srv.nc.Close()
+	}
+}
+
+func TestEnsureQueueSubscriptionUpdatesExistingConsumer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping NATS dependent test in short mode")
+	}
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == sidecarModelsPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer sidecar.Close()
+
+	ns := startJetStreamServer(t)
+
+	cfg := Config{
+		Hash:           "tenant-sub",
+		NATSURL:        ns.ClientURL(),
+		SidecarURL:     sidecar.URL,
+		SidecarTimeout: 500 * time.Millisecond,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	srv.client = sidecar.Client()
+
+	queue := durableName(srv.cfg.DllamaName)
+
+	sub, err := srv.ensureQueueSubscription(queue, 250*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, sub)
+	require.NoError(t, srv.nc.Flush())
+
+	require.NoError(t, sub.Unsubscribe())
+
+	_, err = srv.ensureQueueSubscription(queue, 400*time.Millisecond)
+	require.NoError(t, err)
+
+	info, err := srv.js.ConsumerInfo(srv.streamName, queue)
+	require.NoError(t, err)
+	require.Equal(t, 400*time.Millisecond, info.Config.AckWait)
+
+	if srv.nc != nil {
+		_ = srv.nc.Drain()
+		srv.nc.Close()
+	}
+}
+
+func TestEnsureQueueSubscriptionReturnsLookupError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	js, nc := connectJetStream(t, ns)
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	srv := &Server{
+		js:         js,
+		nc:         nc,
+		log:        logrus.NewEntry(logger),
+		inSubject:  "tenant.in.hash",
+		streamName: "missing-stream",
+	}
+
+	_, err := srv.ensureQueueSubscription("queue-name", time.Second)
+	require.Error(t, err)
+	require.ErrorIs(t, err, nats.ErrStreamNotFound)
+	require.Contains(t, err.Error(), "lookup consumer")
+}
+
+func TestEvictDllamaDisabled(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "",
+		},
+		namespace: "",
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.ErrorIs(t, err, errEvictionDisabled)
+}
+
+func TestEvictDllamaWithoutKube(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "test-dllama",
+		},
+		namespace: "default",
+		kube:      nil,
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.ErrorIs(t, err, errEvictionDisabled)
+}
+
+func TestEvictDllamaWithoutNamespace(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "test-dllama",
+		},
+		namespace: "",
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.ErrorIs(t, err, errEvictionDisabled)
+}
+
+func TestTriggerEvictionSetsShutdownError(t *testing.T) {
+	var cancelled bool
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "dllama-evict",
+		},
+		log:    logrus.New().WithField("component", "test"),
+		cancel: func() { cancelled = true },
+	}
+
+	srv.triggerEviction("sidecar failure")
+	require.Error(t, srv.shutdownError())
+	require.True(t, cancelled)
+
+	// Ensure second trigger does not overwrite error
+	srv.triggerEviction("duplicate")
+	err := srv.shutdownError()
+	require.EqualError(t, err, "sidecar failure")
+}
+
+func TestMonitorSidecarTriggersEviction(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping monitor test in short mode")
+	}
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusInternalServerError)
+	}))
+	defer sidecar.Close()
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName:              "dllama-monitor",
+			SidecarURL:              sidecar.URL,
+			SidecarTimeout:          50 * time.Millisecond,
+			SidecarMonitorInterval:  10 * time.Millisecond,
+			SidecarFailureThreshold: 1,
+		},
+		client:                  sidecar.Client(),
+		log:                     logrus.New().WithField("component", "test"),
+		sidecarMonitorInterval:  10 * time.Millisecond,
+		sidecarFailureThreshold: 1,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		srv.monitorSidecar(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return srv.shutdownError() != nil
+	}, time.Second, 20*time.Millisecond)
+
+	cancel()
+	<-done
+	require.Error(t, srv.shutdownError())
 }
 
 func TestProbeSidecarUpdatesMetrics(t *testing.T) {
@@ -434,6 +954,31 @@ func TestStartHeartbeatLoopPublishesPeriodicIdleState(t *testing.T) {
 
 	cancel()
 	srv.wg.Wait()
+}
+
+func TestCleanupInactiveConsumersWithNilJetStream(t *testing.T) {
+	logger := logrus.NewEntry(logrus.New())
+	cleanupInactiveConsumers(nil, "test-stream", logger)
+}
+
+func TestCleanupInactiveConsumersWithEmptyStream(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	js, _ := connectJetStream(t, ns)
+	logger := logrus.NewEntry(logrus.New())
+
+	cleanupInactiveConsumers(js, "", logger)
+	cleanupInactiveConsumers(js, "   ", logger)
+}
+
+func TestInClusterNamespaceReturnsEmpty(t *testing.T) {
+	ns := inClusterNamespace()
+	if ns != "" {
+		t.Logf("Running in cluster, namespace: %s", ns)
+	}
 }
 
 func startJetStreamServer(t *testing.T) *server.Server {
