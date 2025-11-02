@@ -657,3 +657,402 @@ func TestWorkerHandlerOnChangeEnsureStatusError(t *testing.T) {
 	require.ErrorIs(t, err, expectedErr)
 	require.Nil(t, result)
 }
+
+func TestWorkerHandlerEnsureStatefulSetWithConversationHash(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "mistral").Return(nil, apierrors.NewNotFound(schema.GroupResource{}, "mistral"))
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-workers",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelComponent:        componentWorker,
+				labelWorkerName:       "mistral-workers",
+				labelDllamaName:       "mistral",
+				labelConversationHash: "abc123def",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  5,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		svc := objs[0].(*corev1.Service)
+		require.Equal(t, "abc123def", svc.Labels[labelConversationHash])
+
+		sts := objs[1].(*appsv1.StatefulSet)
+		require.Equal(t, "abc123def", sts.Labels[labelConversationHash])
+		require.Equal(t, "abc123def", sts.Spec.Template.Labels[labelConversationHash])
+
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
+
+func TestWorkerHandlerEnsureStatefulSetWithoutDllamaLabel(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+	}
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "standalone-worker",
+			Namespace: "default",
+			Labels: map[string]string{
+				labelComponent:  componentWorker,
+				labelWorkerName: "standalone-worker",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts := objs[1].(*appsv1.StatefulSet)
+		require.EqualValues(t, 1, *sts.Spec.Replicas)
+		container := sts.Spec.Template.Spec.Containers[0]
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
+
+func TestWorkerHandlerEnsureStatefulSetReplicasZeroOrNegative(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "test-dllama").Return(&v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dllama",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: -5,
+		},
+	}, nil)
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "test-dllama",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts := objs[1].(*appsv1.StatefulSet)
+		require.EqualValues(t, 1, *sts.Spec.Replicas)
+		container := sts.Spec.Template.Spec.Containers[0]
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
+
+func TestWorkerHandlerEnsureStatefulSetThreadsZeroOrNegative(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "test-dllama").Return(&v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dllama",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: -3,
+		},
+	}, nil)
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "test-dllama",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts := objs[1].(*appsv1.StatefulSet)
+		container := sts.Spec.Template.Spec.Containers[0]
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
+
+func TestWorkerHandlerEnsureStatefulSetModelCacheError(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+		models:  models,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "test-dllama").Return(&v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dllama",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: 2,
+			ModelRef: v1.ModelReference{
+				Name: "test-model",
+				Kind: "Model",
+			},
+		},
+	}, nil)
+
+	expectedErr := errors.New("model cache error")
+	models.EXPECT().Cache().Return(modelCache)
+	modelCache.EXPECT().Get("models", "test-model").Return(nil, expectedErr)
+	mockApply.EXPECT().ApplyObjects(gomock.Any()).Times(0)
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "test-dllama",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	err := handler.ensureStatefulSet(worker)
+	require.ErrorIs(t, err, expectedErr)
+}
+
+func TestWorkerHandlerEnsureStatefulSetEmptyModelName(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+		models:  models,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "test-dllama").Return(&v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dllama",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: 2,
+			ModelRef: v1.ModelReference{
+				Name: "  ",
+				Kind: "Model",
+			},
+		},
+	}, nil)
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "test-dllama",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts := objs[1].(*appsv1.StatefulSet)
+		require.EqualValues(t, 3, *sts.Spec.Replicas)
+		container := sts.Spec.Template.Spec.Containers[0]
+		require.Empty(t, container.Resources.Requests)
+		require.Empty(t, container.Resources.Limits)
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
+
+func TestWorkerHandlerEnsureStatefulSetEmptyConversionSizeHuman(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+
+	handler := &workerHandler{
+		apply:   mockApply,
+		dllamas: dllamas,
+		models:  models,
+	}
+
+	dllamas.EXPECT().Cache().Return(dllamaCache)
+	dllamaCache.EXPECT().Get("models", "test-dllama").Return(&v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-dllama",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: 2,
+			ModelRef: v1.ModelReference{
+				Name: "test-model",
+				Kind: "Model",
+			},
+		},
+	}, nil)
+
+	models.EXPECT().Cache().Return(modelCache)
+	modelCache.EXPECT().Get("models", "test-model").Return(&v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-model",
+			Namespace: "models",
+		},
+		Status: v1.ModelStatus{
+			ConversionSizeBytes: 128 * 1024 * 1024,
+			ConversionSizeHuman: "  ",
+		},
+	}, nil)
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-worker",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "test-dllama",
+			},
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+			Slot:  1,
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts := objs[1].(*appsv1.StatefulSet)
+		conversionSize := sts.Spec.Template.Annotations[annotationConversionSizeHuman]
+		require.Equal(t, "134217728B", conversionSize)
+		memPlan := sts.Spec.Template.Annotations[annotationMemoryPlan]
+		require.Contains(t, memPlan, "model=134217728B")
+		return nil
+	})
+
+	err := handler.ensureStatefulSet(worker)
+	require.NoError(t, err)
+}
