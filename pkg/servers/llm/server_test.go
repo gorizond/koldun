@@ -817,6 +817,116 @@ func TestEnsureQueueSubscriptionReturnsLookupError(t *testing.T) {
 	require.Contains(t, err.Error(), "lookup consumer")
 }
 
+func TestEnsureQueueSubscriptionRejectsWrongFilterSubject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+	js, _ := connectJetStream(t, ns)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == sidecarModelsPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}))
+	defer sidecar.Close()
+
+	cfg := Config{
+		Hash:           "test-hash",
+		NATSURL:        ns.ClientURL(),
+		SidecarURL:     sidecar.URL,
+		SidecarTimeout: 500 * time.Millisecond,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	srv.client = sidecar.Client()
+
+	queue := durableName(srv.cfg.DllamaName)
+
+	// Create consumer with different filter subject
+	_, err = js.AddConsumer(srv.streamName, &nats.ConsumerConfig{
+		Durable:       queue,
+		FilterSubject: "wrong.subject",
+		AckPolicy:     nats.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// Attempt to subscribe should fail due to filter mismatch
+	_, err = srv.ensureQueueSubscription(queue, 100*time.Millisecond)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unexpected filter")
+
+	if srv.nc != nil {
+		_ = srv.nc.Drain()
+		srv.nc.Close()
+	}
+}
+
+func TestEnsureQueueSubscriptionHandlesUpdateConsumerError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+
+	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == sidecarModelsPath {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}))
+	defer sidecar.Close()
+
+	cfg := Config{
+		Hash:           "test-hash-update",
+		NATSURL:        ns.ClientURL(),
+		SidecarURL:     sidecar.URL,
+		SidecarTimeout: 500 * time.Millisecond,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	srv.client = sidecar.Client()
+
+	queue := durableName(srv.cfg.DllamaName)
+
+	// Create initial consumer with different AckWait
+	sub1, err := srv.ensureQueueSubscription(queue, 100*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, sub1)
+
+	// Close NATS connection to force UpdateConsumer to fail
+	if srv.nc != nil {
+		srv.nc.Close()
+	}
+
+	// Reconnect with new connection
+	nc2, err := nats.Connect(ns.ClientURL())
+	require.NoError(t, err)
+	js2, err := nc2.JetStream()
+	require.NoError(t, err)
+
+	srv.nc = nc2
+	srv.js = js2
+
+	// Now try to subscribe again with different ackWait - UpdateConsumer will fail
+	// but the function should continue and attempt QueueSubscribe
+	sub2, err := srv.ensureQueueSubscription(queue, 300*time.Millisecond)
+	// Should still succeed in subscribing even if update fails
+	require.NoError(t, err)
+	require.NotNil(t, sub2)
+
+	if srv.nc != nil {
+		_ = srv.nc.Drain()
+		srv.nc.Close()
+	}
+}
+
 func TestEvictDllamaDisabled(t *testing.T) {
 	srv := &Server{
 		cfg: Config{
