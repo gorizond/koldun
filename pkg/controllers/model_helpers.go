@@ -21,6 +21,24 @@ func normalizeForceToken(value string, requested bool, resourceVersion string) s
 	return token
 }
 
+// forceTokenMatches reports whether the processed sizing token satisfies the requested token.
+// It treats tokens as equal when they match exactly or when the processed token preserves the
+// requested value with a "-<resourceVersion>" suffix produced by older runs.
+func forceTokenMatches(requested, processed, resourceVersion string) bool {
+	req := strings.TrimSpace(requested)
+	proc := strings.TrimSpace(processed)
+	if req == "" {
+		return proc == ""
+	}
+	if req == proc {
+		return true
+	}
+	if resourceVersion != "" && proc == req+"-"+resourceVersion {
+		return true
+	}
+	return false
+}
+
 // effectiveDownloadSpec returns a ModelDownloadSpec with defaults applied.
 // If spec is nil, returns a spec with all default values.
 // Otherwise, fills in missing fields with sensible defaults.

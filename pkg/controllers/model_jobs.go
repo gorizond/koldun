@@ -22,7 +22,8 @@ import (
 
 func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	storage := obj.Spec.ObjectStorage
-	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
+	sourceURL := strings.TrimSpace(obj.Spec.SourceURL)
+	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || sourceURL == "" {
 		klog.V(4).Infof("Model %s/%s: skipping download job creation - missing objectStorage or source URL", obj.Namespace, obj.Name)
 		return nil
 	}
@@ -101,14 +102,44 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 		return nil
 	}
 
+	// Track whether a recent job creation was recorded to avoid immediate recreation.
+	recentDownloadCreation := false
+	hasDownloadCreationCondition := false
+	var timeSinceCreation time.Duration
+	if obj.Status.DownloadJobName == jobName && obj.Status.DownloadJobName != "" {
+		for _, cond := range obj.Status.Conditions {
+			if cond.Type != conditionDownloaded || cond.Status != metav1.ConditionFalse {
+				continue
+			}
+			if cond.Reason != "JobCreated" && cond.Reason != "JobPending" {
+				continue
+			}
+			hasDownloadCreationCondition = true
+			if !cond.LastTransitionTime.IsZero() {
+				timeSinceCreation = time.Since(cond.LastTransitionTime.Time)
+				if cond.LastTransitionTime.Time.Add(60 * time.Second).After(time.Now()) {
+					recentDownloadCreation = true
+				}
+			} else {
+				recentDownloadCreation = true
+			}
+			break
+		}
+	}
+
 	// Additional check: if we already have a job with this name and it's not failed, don't recreate
 	klog.V(1).Infof("Model %s/%s: checking Status.DownloadJobName=%s, Status.DownloadState=%s",
 		obj.Namespace, obj.Name, obj.Status.DownloadJobName, obj.Status.DownloadState)
 
 	if obj.Status.DownloadJobName == jobName && obj.Status.DownloadJobName != "" {
-		if !strings.EqualFold(obj.Status.DownloadState, "Failed") {
+		if !strings.EqualFold(obj.Status.DownloadState, "Failed") && recentDownloadCreation {
 			// Job exists and is not failed, no need to recreate
-			klog.V(1).Infof("Model %s/%s: job %s already exists in status and is not failed, skipping recreation", obj.Namespace, obj.Name, jobName)
+			klog.V(1).Infof("Model %s/%s: job %s already exists in status and is not failed (created %v ago), skipping recreation",
+				obj.Namespace, obj.Name, jobName, timeSinceCreation)
+			return nil
+		}
+		if !strings.EqualFold(obj.Status.DownloadState, "Failed") && !hasDownloadCreationCondition {
+			klog.V(1).Infof("Model %s/%s: job %s tracked in status without creation condition, assuming still running", obj.Namespace, obj.Name, jobName)
 			return nil
 		}
 	}
@@ -116,14 +147,12 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	// Final safety check: ensure we don't create a job if one already exists and is running
 	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
 		klog.V(1).Infof("Model %s/%s: final safety check - found existing job %s", obj.Namespace, obj.Name, jobName)
-		if existing.DeletionTimestamp == nil && !isJobFinished(existing) {
-			// Job exists, is not being deleted, and is not finished - don't create another
-			klog.V(1).Infof("Model %s/%s: job %s already exists and is not finished, skipping creation", obj.Namespace, obj.Name, jobName)
-			return nil
-		}
-		// If job exists but is finished, we should have handled it above
 		if !isJobFinished(existing) {
-			klog.V(1).Infof("Model %s/%s: job %s exists but is not finished, skipping creation", obj.Namespace, obj.Name, jobName)
+			if existing.DeletionTimestamp == nil {
+				klog.V(1).Infof("Model %s/%s: job %s already exists and is not finished, skipping creation", obj.Namespace, obj.Name, jobName)
+			} else {
+				klog.V(1).Infof("Model %s/%s: job %s is deleting and not finished, skipping recreation", obj.Namespace, obj.Name, jobName)
+			}
 			return nil
 		}
 	}
@@ -131,20 +160,10 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	// Additional check: if we recently created a job, don't create another one immediately
 	// This prevents rapid recreation cycles
 	klog.V(1).Infof("Model %s/%s: checking recent job creation conditions", obj.Namespace, obj.Name)
-	if obj.Status.DownloadJobName == jobName {
-		// Check if we have a condition indicating recent job creation
-		for _, cond := range obj.Status.Conditions {
-			if cond.Type == conditionDownloaded && cond.Status == metav1.ConditionFalse {
-				if cond.Reason == "JobCreated" || cond.Reason == "JobPending" {
-					// Check if the condition was created recently (within last 60 seconds)
-					if cond.LastTransitionTime.Time.Add(60 * time.Second).After(time.Now()) {
-						klog.V(1).Infof("Model %s/%s: job %s was recently created (%v ago), skipping immediate recreation",
-							obj.Namespace, obj.Name, jobName, time.Since(cond.LastTransitionTime.Time))
-						return nil
-					}
-				}
-			}
-		}
+	if obj.Status.DownloadJobName == jobName && hasDownloadCreationCondition && recentDownloadCreation {
+		klog.V(1).Infof("Model %s/%s: job %s was recently created (%v ago), skipping immediate recreation",
+			obj.Namespace, obj.Name, jobName, timeSinceCreation)
+		return nil
 	}
 
 	// Check if we recently deleted a job and shouldn't create another one immediately
@@ -197,7 +216,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	}
 
 	// Build container responsible for performing the download
-	downloadContainer := h.buildDownloadContainer(obj, spec, obj.Spec.SourceURL, objectKey, expectedGeneration)
+	downloadContainer := h.buildDownloadContainer(obj, spec, sourceURL, objectKey, expectedGeneration)
 	downloadContainer.VolumeMounts = append(downloadContainer.VolumeMounts, corev1.VolumeMount{
 		Name:      "script",
 		MountPath: "/opt/script",
@@ -757,7 +776,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 	alreadySucceeded := obj.Status.ConversionSizeGeneration == obj.Generation &&
 		strings.EqualFold(obj.Status.ConversionSizeState, "Succeeded") &&
 		obj.Status.ConversionSizeJobName == jobName
-	if alreadySucceeded && (!forceRequested || forceToken == processedToken) {
+	if alreadySucceeded && (!forceRequested || forceTokenMatches(forceToken, processedToken, obj.ResourceVersion)) {
 		return nil
 	}
 
@@ -789,7 +808,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 			state := strings.ToLower(obj.Status.ConversionSizeState)
 			switch state {
 			case "succeeded":
-				if obj.Status.ConversionSizeGeneration == obj.Generation && (forceToken == "" || forceToken == processedToken) {
+				if obj.Status.ConversionSizeGeneration == obj.Generation && (forceToken == "" || forceTokenMatches(forceToken, processedToken, obj.ResourceVersion)) {
 					propagation := metav1.DeletePropagationBackground
 					if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
 						return fmt.Errorf("failed to delete completed sizing job: %w", err)

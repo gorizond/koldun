@@ -36,6 +36,12 @@ type sessionHandler struct {
 
 	mu               sync.RWMutex
 	resourceSessions map[string]string
+
+	// test hooks
+	ensureTopologyFn     func(*v1.Session) error
+	ensureStatusFn       func(*v1.Session) (*v1.Session, error)
+	lookupRootEndpointFn func(string, string) string
+	checkHealthFn        func(string) bool
 }
 
 const (
@@ -143,6 +149,10 @@ func (h *sessionHandler) onRelatedWorker(key string, worker *v1.Worker) (*v1.Wor
 }
 
 func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
+	if hook := h.ensureTopologyFn; hook != nil {
+		return hook(sess)
+	}
+
 	selector := labels.SelectorFromSet(map[string]string{labelSessionName: sess.Name})
 	dllamas, err := h.dllamas.Cache().List(sess.Namespace, selector)
 	if err != nil {
@@ -204,6 +214,10 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 }
 
 func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
+	if hook := h.ensureStatusFn; hook != nil {
+		return hook(sess)
+	}
+
 	updated := sess.DeepCopy()
 	if updated.Status.Conditions == nil {
 		updated.Status.Conditions = []metav1.Condition{}
@@ -318,6 +332,10 @@ func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
 }
 
 func (h *sessionHandler) lookupRootEndpoint(namespace, dllamaName string) string {
+	if hook := h.lookupRootEndpointFn; hook != nil {
+		return hook(namespace, dllamaName)
+	}
+
 	rootName := fmt.Sprintf("%s-root", dllamaName)
 	root, err := h.roots.Cache().Get(namespace, rootName)
 	if err != nil {
@@ -327,6 +345,10 @@ func (h *sessionHandler) lookupRootEndpoint(namespace, dllamaName string) string
 }
 
 func (h *sessionHandler) checkHealth(endpoint string) bool {
+	if hook := h.checkHealthFn; hook != nil {
+		return hook(endpoint)
+	}
+
 	if endpoint == "" {
 		return false
 	}
@@ -575,6 +597,13 @@ func guessSessionFromWorkerName(name string) string {
 	return guessSessionFromDllamaName(strings.TrimSuffix(name, "-workers"))
 }
 
+func (h *sessionHandler) enqueueSession(sess *v1.Session) {
+	if h.sessions == nil || sess == nil {
+		return
+	}
+	h.sessions.Enqueue(sess.Namespace, sess.Name)
+}
+
 func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
 	spec := desiredDllamaSpecForSession(sess)
 	hash := strings.TrimSpace(sess.Spec.Hash)
@@ -604,6 +633,7 @@ func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
 		if apierrors.IsAlreadyExists(err) {
 			return nil
 		}
+		h.enqueueSession(sess)
 		return err
 	}
 
@@ -614,6 +644,7 @@ func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
 		}
 		copy.Labels[labelDllamaName] = sanitizeLabelValue(created.Name)
 		if _, err := h.dllamas.Update(copy); err != nil && !apierrors.IsNotFound(err) {
+			h.enqueueSession(sess)
 			return err
 		}
 	}
@@ -683,7 +714,11 @@ func (h *sessionHandler) ensureDispatcher(sess *v1.Session) error {
 		WithDefaultNamespace(sess.Namespace).
 		WithSetID(fmt.Sprintf("session-%s-dispatcher", sess.Name))
 
-	return apply.ApplyObjects(deployment)
+	err := apply.ApplyObjects(deployment)
+	if err != nil {
+		h.enqueueSession(sess)
+	}
+	return err
 }
 
 func desiredDispatcherDeployment(sess *v1.Session, labels map[string]string, queueGroup, image, backlogSubject, assignmentsBucket, dllamaPrefix, statePrefix string, ackWait time.Duration) *appsv1.Deployment {

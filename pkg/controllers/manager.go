@@ -15,10 +15,42 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+type sharedFactory interface {
+	Sync(ctx context.Context) error
+	ControllerFactory() lassocontroller.SharedControllerFactory
+}
+
+type controllerStarter interface {
+	Start(ctx context.Context, workers int) error
+}
+
+var (
+	registerIngressControllerFn = registerIngressController
+	registerModelControllerFn   = registerModelController
+	registerRootControllerFn    = registerRootController
+	registerWorkerControllerFn  = registerWorkerController
+	registerSessionControllerFn = registerSessionController
+	registerDllamaControllerFn  = registerDllamaController
+	addSchemesFn                = schemes.AddToScheme
+	newFactoryFromConfigFn      = func(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+		return generic.NewFactoryFromConfigWithOptions(cfg, opts)
+	}
+	newApplyForConfigFn = apply.NewForConfig
+	factoryOptionsFn    = func(health *Health) *generic.FactoryOptions {
+		return &generic.FactoryOptions{
+			HealthCallback: health.SetAPIHealthy,
+		}
+	}
+	newCoreControllersFn  = corev1.New
+	newAppsControllersFn  = appsv1.New
+	newBatchControllersFn = batchv1.New
+	newKoldControllersFn  = koldv1.New
+)
+
 // Manager wires together Wrangler factories, controllers, and reconcilers for the operator.
 type Manager struct {
-	factory           *generic.Factory
-	controllerFactory lassocontroller.SharedControllerFactory
+	factory           sharedFactory
+	controllerFactory controllerStarter
 	apply             apply.Apply
 
 	health *Health
@@ -33,26 +65,25 @@ type Manager struct {
 
 // NewManager creates all controller factories required by the operator and prepares the reconciliation pipeline.
 func NewManager(cfg *rest.Config) (*Manager, error) {
-	if err := schemes.AddToScheme(schemes.All); err != nil {
+	if err := addSchemesFn(schemes.All); err != nil {
 		return nil, fmt.Errorf("register base schemes: %w", err)
 	}
 
 	health := NewHealth()
 
-	factory, err := generic.NewFactoryFromConfigWithOptions(cfg, &generic.FactoryOptions{
-		HealthCallback: health.SetAPIHealthy,
-	})
+	factoryOptions := factoryOptionsFn(health)
+	factory, err := newFactoryFromConfigFn(cfg, factoryOptions)
 	if err != nil {
 		return nil, fmt.Errorf("build controller factory: %w", err)
 	}
 
 	ctrlFactory := factory.ControllerFactory()
-	core := corev1.New(ctrlFactory)
-	apps := appsv1.New(ctrlFactory)
-	batch := batchv1.New(ctrlFactory)
-	kold := koldv1.New(ctrlFactory)
+	core := newCoreControllersFn(ctrlFactory)
+	apps := newAppsControllersFn(ctrlFactory)
+	batch := newBatchControllersFn(ctrlFactory)
+	kold := newKoldControllersFn(ctrlFactory)
 
-	applier, err := apply.NewForConfig(cfg)
+	applier, err := newApplyForConfigFn(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build apply client: %w", err)
 	}
@@ -92,22 +123,22 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 
 // Register initialises all controller handlers.
 func (m *Manager) Register(ctx context.Context) error {
-	if err := registerIngressController(ctx, m); err != nil {
+	if err := registerIngressControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register ingress controller: %w", err)
 	}
-	if err := registerModelController(ctx, m); err != nil {
+	if err := registerModelControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register model controller: %w", err)
 	}
-	if err := registerRootController(ctx, m); err != nil {
+	if err := registerRootControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register root controller: %w", err)
 	}
-	if err := registerWorkerController(ctx, m); err != nil {
+	if err := registerWorkerControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register worker controller: %w", err)
 	}
-	if err := registerSessionController(ctx, m); err != nil {
+	if err := registerSessionControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register session controller: %w", err)
 	}
-	if err := registerDllamaController(ctx, m); err != nil {
+	if err := registerDllamaControllerFn(ctx, m); err != nil {
 		return fmt.Errorf("register dllama controller: %w", err)
 	}
 	return nil

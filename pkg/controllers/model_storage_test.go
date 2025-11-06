@@ -222,6 +222,22 @@ func TestConversionPaths(t *testing.T) {
 			wantURISubstring: "s3://custom-bucket/custom/path/llama-7b",
 		},
 		{
+			name:      "custom s3 output path with nonstandard float type",
+			modelName: "falcon-40b",
+			objectStorage: &v1.ModelObjectStorageSpec{
+				BucketForConvert: "default-bucket",
+			},
+			conversionSpec: &v1.ModelConversionSpec{
+				WeightsFloatType: "bf16-mixed",
+				OutputPath:       "s3://alt-bucket/exports/falcon/",
+			},
+			defaultInputKey:  "downloads/falcon",
+			wantWorkDir:      "/workspace/hf",
+			wantBucket:       "alt-bucket",
+			wantKey:          "exports/falcon/falcon-40b",
+			wantURISubstring: "s3://alt-bucket/exports/falcon/falcon-40b",
+		},
+		{
 			name:      "custom local output path",
 			modelName: "llama-7b",
 			objectStorage: &v1.ModelObjectStorageSpec{
@@ -285,6 +301,37 @@ func TestConversionPaths(t *testing.T) {
 			wantKey:          "input/converted/model",
 			wantURISubstring: "s3://override-bucket/input/converted/model",
 		},
+		{
+			name:      "leading slash in model name is sanitized",
+			modelName: "/bad-model",
+			objectStorage: &v1.ModelObjectStorageSpec{
+				BucketForConvert: "converted-bucket",
+			},
+			conversionSpec: &v1.ModelConversionSpec{
+				WeightsFloatType: "f16",
+				OutputPath:       "s3://converted-bucket/edge",
+			},
+			defaultInputKey:  "downloads",
+			wantWorkDir:      "/workspace/hf",
+			wantBucket:       "converted-bucket",
+			wantKey:          "edge/bad-model",
+			wantURISubstring: "s3://converted-bucket/edge/bad-model",
+		},
+		{
+			name:      "default output with exotic float type",
+			modelName: "phoenix",
+			objectStorage: &v1.ModelObjectStorageSpec{
+				BucketForConvert: "converted",
+			},
+			conversionSpec: &v1.ModelConversionSpec{
+				WeightsFloatType: "fp8-e4m3",
+			},
+			defaultInputKey:  "models/phoenix",
+			wantWorkDir:      "/workspace/hf",
+			wantBucket:       "converted",
+			wantKey:          "models/phoenix/converted/fp8-e4m3/phoenix",
+			wantURISubstring: "s3://converted/models/phoenix/converted/fp8-e4m3/phoenix",
+		},
 	}
 
 	for _, tt := range tests {
@@ -312,6 +359,75 @@ func TestConversionPaths(t *testing.T) {
 			if tt.wantURISubstring != "" && uri != tt.wantURISubstring {
 				t.Errorf("conversionPaths() uri = %v, want %v", uri, tt.wantURISubstring)
 			}
+		})
+	}
+}
+
+func TestModelObjectKeyHandlesBucketOnlyURI(t *testing.T) {
+	t.Parallel()
+
+	model := &v1.Model{
+		Spec: v1.ModelSpec{
+			LocalPath: " \ts3://weights-cache \n",
+		},
+	}
+
+	require.Equal(t, "", modelObjectKey(model), "bucket-only URIs should yield an empty key")
+}
+
+func TestConversionPathsWithoutObjectStorageDefaults(t *testing.T) {
+	t.Parallel()
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "tiny-llm"},
+	}
+	spec := &v1.ModelConversionSpec{
+		WeightsFloatType: "q4",
+		OutputPath:       "relative/output",
+	}
+
+	workDir, bucket, key, uri := conversionPaths(model, spec, "inputs/tiny")
+
+	require.Equal(t, "/workspace/relative/output", workDir)
+	require.Equal(t, "", bucket, "bucket should remain empty when object storage is not configured")
+	require.Equal(t, "inputs/tiny/converted/q4/tiny-llm", key)
+	require.Equal(t, "", uri, "uri should remain empty without a bucket")
+}
+
+func TestSplitKeyEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		key   string
+		first string
+		rest  string
+	}{
+		{
+			name:  "leading slash is ignored",
+			key:   "/namespace/resource",
+			first: "",
+			rest:  "namespace/resource",
+		},
+		{
+			name:  "multiple segments return remainder intact",
+			key:   "models/llama/weights",
+			first: "models",
+			rest:  "llama/weights",
+		},
+		{
+			name:  "missing separator returns empty parts",
+			key:   "singleton",
+			first: "",
+			rest:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			first, rest := splitKey(tt.key)
+			require.Equal(t, tt.first, first)
+			require.Equal(t, tt.rest, rest)
 		})
 	}
 }
@@ -440,6 +556,98 @@ func TestEnsureObjectStorageBuckets_SecretErrors(t *testing.T) {
 	})
 }
 
+func TestEnsureObjectStorageBuckets_SecretNamespaceFallbackAndInsecureEndpoint(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("access"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:        "http://minio.local:9000",
+				BucketForSource: "source",
+				SecretRef:       &v1.SecretReference{Name: "storage"},
+			},
+		},
+	}
+
+	secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+	fake := &fakeMinioClient{}
+	handler := &modelHandler{
+		ctx:           context.Background(),
+		ensureBuckets: true,
+		secrets:       secrets,
+		minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+			require.Equal(t, "minio.local:9000", host)
+			require.False(t, opts.Secure, "http endpoint should disable TLS")
+			return fake, nil
+		},
+	}
+
+	require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	require.Equal(t, []string{"source"}, fake.made)
+}
+
+func TestEnsureObjectStorageBuckets_RegionPropagatedToClient(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("access"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+			"AWS_REGION":            []byte("us-east-2"),
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://minio.local",
+				BucketForConvert: "convert",
+				SecretRef:        &v1.SecretReference{Name: "storage", Namespace: "custom-ns"},
+			},
+		},
+	}
+
+	secretCache.EXPECT().Get("custom-ns", "storage").Return(secret, nil)
+	fake := &fakeMinioClient{}
+	handler := &modelHandler{
+		ctx:           context.Background(),
+		ensureBuckets: true,
+		secrets:       secrets,
+		minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+			require.Equal(t, "minio.local", host)
+			require.True(t, opts.Secure, "https endpoint should enable TLS")
+			require.Equal(t, "us-east-2", opts.Region)
+			return fake, nil
+		},
+	}
+
+	require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	require.Equal(t, []string{"convert"}, fake.made)
+}
+
 func TestEnsureObjectStorageBuckets_ClientInteractions(t *testing.T) {
 	t.Parallel()
 
@@ -529,4 +737,98 @@ func TestEnsureObjectStorageBuckets_ClientInteractions(t *testing.T) {
 		err := handler.ensureObjectStorageBuckets(model)
 		require.ErrorContains(t, err, "create bucket")
 	})
+
+	t.Run("bucket exists check failure", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		fake := &fakeMinioClient{existsErr: errors.New("dial failed")}
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				return fake, nil
+			},
+		}
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "check bucket source existence")
+	})
+
+	t.Run("factory creation failure", func(t *testing.T) {
+		secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+			minioFactory: func(host string, opts *minio.Options) (minioClient, error) {
+				return nil, errors.New("connect refused")
+			},
+		}
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "initialise object storage client")
+	})
+}
+
+func TestEnsureObjectStorageBuckets_EndpointErrors(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("access"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+		},
+	}
+	secretCache.EXPECT().Get("models", "storage").Return(secret, nil).AnyTimes()
+
+	base := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL: "https://example.com/model",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://minio.local",
+				BucketForSource:  "source",
+				BucketForConvert: "convert",
+				SecretRef:        &v1.SecretReference{Name: "storage"},
+			},
+		},
+	}
+
+	t.Run("invalid endpoint parse", func(t *testing.T) {
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+		}
+		model := base.DeepCopy()
+		model.Spec.ObjectStorage.Endpoint = "://bad-endpoint"
+
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "parse object storage endpoint")
+	})
+
+	t.Run("endpoint missing host", func(t *testing.T) {
+		handler := &modelHandler{
+			ctx:           context.Background(),
+			ensureBuckets: true,
+			secrets:       secrets,
+		}
+		model := base.DeepCopy()
+		model.Spec.ObjectStorage.Endpoint = "https://"
+
+		err := handler.ensureObjectStorageBuckets(model)
+		require.ErrorContains(t, err, "missing host")
+	})
+}
+
+func TestDefaultMinioFactory(t *testing.T) {
+	t.Parallel()
+
+	client, err := defaultMinioFactory("play.min.io", &minio.Options{Secure: true})
+	require.NoError(t, err)
+	require.NotNil(t, client)
 }

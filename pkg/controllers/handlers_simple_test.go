@@ -55,6 +55,14 @@ func TestWorkerHandlerOnRemove(t *testing.T) {
 	if result != worker {
 		t.Fatalf("expected worker pointer to be returned")
 	}
+
+	nilResult, err := handler.onRemove("demo/worker", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if nilResult != nil {
+		t.Fatalf("expected nil to be returned when object is nil")
+	}
 }
 
 func objMeta(ns, name string) metav1.ObjectMeta {

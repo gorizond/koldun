@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"testing"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/tokens"
@@ -88,4 +89,86 @@ func TestStartRegistrySyncPublishesModelAndToken(t *testing.T) {
 
 	_, err = tokenKV.Get("token/abc123")
 	require.NoError(t, err)
+}
+
+func TestStartRegistrySyncSkipsWhenNATSURLBlank(t *testing.T) {
+	ctx := context.Background()
+	mgr := &Manager{}
+
+	err := StartRegistrySync(ctx, mgr, RegistryConfig{NATSURL: "   "})
+	require.NoError(t, err)
+}
+
+func TestStartRegistrySyncConnectError(t *testing.T) {
+	ctx := context.Background()
+	mgr := &Manager{}
+
+	err := StartRegistrySync(ctx, mgr, RegistryConfig{NATSURL: "not-a-valid-url"})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "connect NATS for registry")
+}
+
+func TestStartRegistrySyncBucketErrors(t *testing.T) {
+	ns := startRegistryJetStreamServer(t)
+
+	mgr := &Manager{
+		Kold: &fakeKoldInterface{model: newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{})},
+		Core: fakeCoreControllers{secret: newControllerStub[*corev1.Secret, *corev1.SecretList](schema.GroupVersionKind{})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfgBadModels := RegistryConfig{
+		NATSURL:      ns.ClientURL(),
+		ModelsBucket: "invalid bucket name",
+		TokensBucket: "tokens",
+	}
+	err := StartRegistrySync(ctx, mgr, cfgBadModels)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ensure models bucket")
+
+	cfgBadTokens := RegistryConfig{
+		NATSURL:      ns.ClientURL(),
+		ModelsBucket: "models",
+		TokensBucket: "invalid bucket name",
+	}
+	err = StartRegistrySync(ctx, mgr, cfgBadTokens)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ensure tokens bucket")
+}
+
+func TestStartRegistrySyncDrainsConnectionOnCancel(t *testing.T) {
+	ns := startRegistryJetStreamServer(t)
+
+	modelCtrl := newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{})
+	secretCtrl := newControllerStub[*corev1.Secret, *corev1.SecretList](schema.GroupVersionKind{})
+
+	mgr := &Manager{
+		Kold: &fakeKoldInterface{model: modelCtrl},
+		Core: fakeCoreControllers{secret: secretCtrl},
+	}
+
+	cfg := RegistryConfig{
+		NATSURL:      ns.ClientURL(),
+		ModelsBucket: "models",
+		TokensBucket: "tokens",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, StartRegistrySync(ctx, mgr, cfg))
+
+	require.Eventually(t, func() bool {
+		connz, err := ns.Connz(nil)
+		require.NoError(t, err)
+		return connz.Total == 1
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		connz, err := ns.Connz(nil)
+		require.NoError(t, err)
+		return connz.Total == 0
+	}, time.Second, 10*time.Millisecond)
 }

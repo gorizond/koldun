@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
@@ -1256,4 +1258,408 @@ func TestWorkerHandlerEnsureStatefulSetEmptyConversionSizeHuman(t *testing.T) {
 
 	err := handler.ensureStatefulSet(worker)
 	require.NoError(t, err)
+}
+
+// TestWorkerContainer tests the workerContainer function
+func TestWorkerContainer(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		worker    *v1.Worker
+		threads   int32
+		resources corev1.ResourceRequirements
+		validate  func(t *testing.T, container corev1.Container)
+	}{
+		{
+			name: "basic worker with minimal config",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:v1.0.0",
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, "worker", container.Name)
+				require.Equal(t, "ghcr.io/gorizond/dllama:v1.0.0", container.Image)
+				require.Equal(t, corev1.PullIfNotPresent, container.ImagePullPolicy)
+				require.Equal(t, []string{"dllama"}, container.Command)
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "4"}, container.Args)
+				require.Len(t, container.Env, 1)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+				require.Equal(t, "worker", container.Env[0].Value)
+				require.Len(t, container.Ports, 1)
+				require.Equal(t, int32(9999), container.Ports[0].ContainerPort)
+				require.Empty(t, container.Resources.Requests)
+				require.Empty(t, container.Resources.Limits)
+			},
+		},
+		{
+			name: "worker with custom args",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					Args:  []string{"--foo", "bar", "--verbose"},
+				},
+			},
+			threads:   2,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2", "--foo", "bar", "--verbose"}, container.Args)
+			},
+		},
+		{
+			name: "worker with cache config",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					CacheSpec: &v1.CacheSpec{
+						Endpoint: "https://minio:9000",
+						Bucket:   "models",
+					},
+				},
+			},
+			threads:   8,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 3)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+				require.Equal(t, "worker", container.Env[0].Value)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
+				require.Equal(t, "https://minio:9000", container.Env[1].Value)
+				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
+				require.Equal(t, "models", container.Env[2].Value)
+			},
+		},
+		{
+			name: "worker with cache and secret",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					CacheSpec: &v1.CacheSpec{
+						Endpoint: "https://s3.amazonaws.com",
+						Bucket:   "my-bucket",
+						SecretRef: &v1.SecretReference{
+							Name: "s3-credentials",
+						},
+					},
+				},
+			},
+			threads:   1,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 4)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
+				require.Equal(t, "https://s3.amazonaws.com", container.Env[1].Value)
+				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
+				require.Equal(t, "my-bucket", container.Env[2].Value)
+				require.Equal(t, "CACHE_SECRET", container.Env[3].Name)
+				require.Empty(t, container.Env[3].Value)
+				require.NotNil(t, container.Env[3].ValueFrom)
+				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef)
+				require.Equal(t, "s3-credentials", container.Env[3].ValueFrom.SecretKeyRef.Name)
+				require.Equal(t, "credentials", container.Env[3].ValueFrom.SecretKeyRef.Key)
+				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef.Optional)
+				require.True(t, *container.Env[3].ValueFrom.SecretKeyRef.Optional)
+			},
+		},
+		{
+			name: "worker with NATS config",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					NATS: &v1.WorkerNATSConfig{
+						URL: "nats://nats.example.com:4222",
+					},
+				},
+			},
+			threads:   16,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 2)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+				require.Equal(t, "NATS_URL", container.Env[1].Name)
+				require.Equal(t, "nats://nats.example.com:4222", container.Env[1].Value)
+			},
+		},
+		{
+			name: "worker with NATS and credentials secret",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					NATS: &v1.WorkerNATSConfig{
+						URL: "nats://secured.example.com:4222",
+						CredentialsSecret: &v1.SecretReference{
+							Name: "nats-creds-secret",
+						},
+					},
+				},
+			},
+			threads:   3,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 3)
+				require.Equal(t, "NATS_URL", container.Env[1].Name)
+				require.Equal(t, "nats://secured.example.com:4222", container.Env[1].Value)
+				require.Equal(t, "NATS_CREDS", container.Env[2].Name)
+				require.Empty(t, container.Env[2].Value)
+				require.NotNil(t, container.Env[2].ValueFrom)
+				require.NotNil(t, container.Env[2].ValueFrom.SecretKeyRef)
+				require.Equal(t, "nats-creds-secret", container.Env[2].ValueFrom.SecretKeyRef.Name)
+				require.Equal(t, "nats.creds", container.Env[2].ValueFrom.SecretKeyRef.Key)
+				require.NotNil(t, container.Env[2].ValueFrom.SecretKeyRef.Optional)
+				require.True(t, *container.Env[2].ValueFrom.SecretKeyRef.Optional)
+			},
+		},
+		{
+			name: "worker with all configs (cache + NATS)",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					Args:  []string{"--debug"},
+					CacheSpec: &v1.CacheSpec{
+						Endpoint: "https://minio:9000",
+						Bucket:   "models",
+						SecretRef: &v1.SecretReference{
+							Name: "cache-creds",
+						},
+					},
+					NATS: &v1.WorkerNATSConfig{
+						URL: "nats://nats:4222",
+						CredentialsSecret: &v1.SecretReference{
+							Name: "nats-creds",
+						},
+					},
+				},
+			},
+			threads:   6,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "6", "--debug"}, container.Args)
+				require.Len(t, container.Env, 6)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
+				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
+				require.Equal(t, "CACHE_SECRET", container.Env[3].Name)
+				require.Equal(t, "NATS_URL", container.Env[4].Name)
+				require.Equal(t, "NATS_CREDS", container.Env[5].Name)
+			},
+		},
+		{
+			name: "worker with resource requirements",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads: 4,
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceMemory: mustParseQuantity("1Gi"),
+					corev1.ResourceCPU:    mustParseQuantity("500m"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: mustParseQuantity("2Gi"),
+					corev1.ResourceCPU:    mustParseQuantity("1000m"),
+				},
+			},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.NotEmpty(t, container.Resources.Requests)
+				require.NotEmpty(t, container.Resources.Limits)
+				requestMem := container.Resources.Requests[corev1.ResourceMemory]
+				requestCPU := container.Resources.Requests[corev1.ResourceCPU]
+				limitMem := container.Resources.Limits[corev1.ResourceMemory]
+				limitCPU := container.Resources.Limits[corev1.ResourceCPU]
+				require.Equal(t, "1Gi", requestMem.String())
+				require.Equal(t, "500m", requestCPU.String())
+				require.Equal(t, "2Gi", limitMem.String())
+				require.Equal(t, "1", limitCPU.String())
+			},
+		},
+		{
+			name: "worker with zero threads",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads:   0,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "0"}, container.Args)
+			},
+		},
+		{
+			name: "worker with negative threads",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads:   -5,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "-5"}, container.Args)
+			},
+		},
+		{
+			name: "worker with empty args slice",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					Args:  []string{},
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "4"}, container.Args)
+			},
+		},
+		{
+			name: "worker with nil cache spec",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image:     "ghcr.io/gorizond/dllama:latest",
+					CacheSpec: nil,
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 1)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+			},
+		},
+		{
+			name: "worker with nil NATS config",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					NATS:  nil,
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 1)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+			},
+		},
+		{
+			name: "worker with cache but nil secret ref",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					CacheSpec: &v1.CacheSpec{
+						Endpoint:  "https://minio:9000",
+						Bucket:    "models",
+						SecretRef: nil,
+					},
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 3)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
+				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
+			},
+		},
+		{
+			name: "worker with NATS but nil credentials secret",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+					NATS: &v1.WorkerNATSConfig{
+						URL:               "nats://nats:4222",
+						CredentialsSecret: nil,
+					},
+				},
+			},
+			threads:   4,
+			resources: corev1.ResourceRequirements{},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Len(t, container.Env, 2)
+				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
+				require.Equal(t, "NATS_URL", container.Env[1].Name)
+			},
+		},
+		{
+			name: "worker with empty resource requirements",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads: 4,
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{},
+				Limits:   corev1.ResourceList{},
+			},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Empty(t, container.Resources.Requests)
+				require.Empty(t, container.Resources.Limits)
+			},
+		},
+		{
+			name: "worker with partial resource requirements (only requests)",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads: 4,
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceMemory: mustParseQuantity("512Mi"),
+				},
+			},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.NotEmpty(t, container.Resources.Requests)
+				require.Empty(t, container.Resources.Limits)
+				requestMem := container.Resources.Requests[corev1.ResourceMemory]
+				require.Equal(t, "512Mi", requestMem.String())
+			},
+		},
+		{
+			name: "worker with partial resource requirements (only limits)",
+			worker: &v1.Worker{
+				Spec: v1.WorkerSpec{
+					Image: "ghcr.io/gorizond/dllama:latest",
+				},
+			},
+			threads: 4,
+			resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: mustParseQuantity("1Gi"),
+				},
+			},
+			validate: func(t *testing.T, container corev1.Container) {
+				require.Empty(t, container.Resources.Requests)
+				require.NotEmpty(t, container.Resources.Limits)
+				limitMem := container.Resources.Limits[corev1.ResourceMemory]
+				require.Equal(t, "1Gi", limitMem.String())
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := &workerHandler{}
+			container := handler.workerContainer(tt.worker, tt.threads, tt.resources)
+			tt.validate(t, container)
+		})
+	}
+}
+
+func mustParseQuantity(s string) resource.Quantity {
+	q, err := resource.ParseQuantity(s)
+	if err != nil {
+		panic(fmt.Sprintf("failed to parse quantity %q: %v", s, err))
+	}
+	return q
 }

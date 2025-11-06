@@ -5,11 +5,11 @@ import (
 	"time"
 
 	"github.com/rancher/wrangler/v3/pkg/generic"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
@@ -29,9 +29,13 @@ func (c *controllerStub[T, TL]) Informer() cache.SharedIndexInformer { return ni
 
 func (c *controllerStub[T, TL]) GroupVersionKind() schema.GroupVersionKind { return c.gvk }
 
-func (c *controllerStub[T, TL]) AddGenericHandler(context.Context, string, generic.Handler) {}
+func (c *controllerStub[T, TL]) AddGenericHandler(context.Context, string, generic.Handler) {
+	return
+}
 
-func (c *controllerStub[T, TL]) AddGenericRemoveHandler(context.Context, string, generic.Handler) {}
+func (c *controllerStub[T, TL]) AddGenericRemoveHandler(context.Context, string, generic.Handler) {
+	return
+}
 
 func (c *controllerStub[T, TL]) Updater() generic.Updater { return nil }
 
@@ -43,9 +47,13 @@ func (c *controllerStub[T, TL]) OnRemove(_ context.Context, _ string, handler ge
 	c.onRemove = handler
 }
 
-func (c *controllerStub[T, TL]) Enqueue(string, string) {}
+func (c *controllerStub[T, TL]) Enqueue(string, string) {
+	return
+}
 
-func (c *controllerStub[T, TL]) EnqueueAfter(string, string, time.Duration) {}
+func (c *controllerStub[T, TL]) EnqueueAfter(string, string, time.Duration) {
+	return
+}
 
 func (c *controllerStub[T, TL]) Cache() generic.CacheInterface[T] { return nil }
 
@@ -76,7 +84,9 @@ func (c *controllerStub[T, TL]) List(string, metav1.ListOptions) (TL, error) {
 	return zero, nil
 }
 
-func (c *controllerStub[T, TL]) Watch(string, metav1.ListOptions) (watch.Interface, error) { return nil, nil }
+func (c *controllerStub[T, TL]) Watch(string, metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
 
 func (c *controllerStub[T, TL]) Patch(string, string, types.PatchType, []byte, ...string) (T, error) {
 	var zero T

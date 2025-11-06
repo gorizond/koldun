@@ -627,6 +627,26 @@ func TestChooseScaleDownCandidate(t *testing.T) {
 			state: sessionPoolState{
 				idleReady: []*v1.Dllama{
 					{ObjectMeta: metav1.ObjectMeta{
+						Name:              "dllama-with-hb",
+						CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)},
+					}},
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:              "dllama-no-hb",
+						CreationTimestamp: metav1.Time{Time: now.Add(-1 * time.Hour)},
+					}},
+				},
+				workerMetrics: map[string]v1.SessionWorker{
+					"dllama-no-hb":   {},
+					"dllama-with-hb": {LastHeartbeat: &metav1.Time{Time: now.Add(-5 * time.Minute)}},
+				},
+			},
+			expectedName: "dllama-no-hb",
+		},
+		{
+			name: "heartbeat present when compared against missing heartbeat",
+			state: sessionPoolState{
+				idleReady: []*v1.Dllama{
+					{ObjectMeta: metav1.ObjectMeta{
 						Name:              "dllama-no-hb",
 						CreationTimestamp: metav1.Time{Time: now.Add(-1 * time.Hour)},
 					}},
@@ -641,6 +661,26 @@ func TestChooseScaleDownCandidate(t *testing.T) {
 				},
 			},
 			expectedName: "dllama-no-hb",
+		},
+		{
+			name: "ties on heartbeat prefer oldest creation timestamp",
+			state: sessionPoolState{
+				idleReady: []*v1.Dllama{
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:              "dllama-older",
+						CreationTimestamp: metav1.Time{Time: now.Add(-3 * time.Hour)},
+					}},
+					{ObjectMeta: metav1.ObjectMeta{
+						Name:              "dllama-newer",
+						CreationTimestamp: metav1.Time{Time: now.Add(-2 * time.Hour)},
+					}},
+				},
+				workerMetrics: map[string]v1.SessionWorker{
+					"dllama-older": {LastHeartbeat: &metav1.Time{Time: now.Add(-15 * time.Minute)}},
+					"dllama-newer": {LastHeartbeat: &metav1.Time{Time: now.Add(-15 * time.Minute)}},
+				},
+			},
+			expectedName: "dllama-older",
 		},
 	}
 

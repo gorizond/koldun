@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
@@ -25,6 +26,7 @@ func TestWorkersForReplicaPower(t *testing.T) {
 		{"power of 2", 2, 3},
 		{"power of 3", 3, 7},
 		{"power of 5", 5, 31},
+		{"max clamp", 31, int32(math.MaxInt32)},
 	}
 
 	for _, tt := range tests {
@@ -340,6 +342,17 @@ func TestReadyReplicasForWorkerError(t *testing.T) {
 	}
 	if ready != 0 {
 		t.Fatalf("readyReplicasForWorker = %d, want %d", ready, 0)
+	}
+}
+
+func TestReadyReplicasForWorkerNilWorker(t *testing.T) {
+	handler := &dllamaHandler{}
+	ready, err := handler.readyReplicasForWorker(nil)
+	if err != nil {
+		t.Fatalf("readyReplicasForWorker returned error: %v", err)
+	}
+	if ready != 0 {
+		t.Fatalf("readyReplicasForWorker = %d, want 0", ready)
 	}
 }
 

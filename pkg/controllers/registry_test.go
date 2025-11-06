@@ -199,6 +199,33 @@ func TestRegistrySyncPutModelAndDelete(t *testing.T) {
 	require.NoError(t, sync.deleteModel("demo", "missing"), "ignore missing keys")
 }
 
+func TestRegistrySyncPutModelHandlesKVErrors(t *testing.T) {
+	t.Parallel()
+
+	kv := &fakeMemoryKV{putErr: errors.New("kv failure")}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{ModelPrefix: "model/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		modelsKV: kv,
+	}
+
+	err := sync.putModel(&registry.Model{Namespace: "demo", Name: "model"})
+	require.EqualError(t, err, "kv failure")
+	require.Empty(t, kv.putCalls)
+}
+
+func TestRegistrySyncPutModelHandlesMarshalErrors(t *testing.T) {
+	origMarshal := jsonMarshal
+	t.Cleanup(func() { jsonMarshal = origMarshal })
+
+	jsonMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal failure") }
+
+	sync := &registrySync{cfg: RegistryConfig{ModelPrefix: "model/"}, log: logrus.New().WithField("component", "registry-test"), modelsKV: &fakeMemoryKV{}}
+	err := sync.putModel(&registry.Model{Namespace: "demo", Name: "model"})
+	require.EqualError(t, err, "marshal failure")
+}
+
 func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
 	t.Parallel()
 
@@ -226,6 +253,34 @@ func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
 	require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
 
 	require.NoError(t, sync.deleteToken("missing"), "ignore missing keys")
+}
+
+func TestRegistrySyncPutTokenHandlesKVErrors(t *testing.T) {
+	t.Parallel()
+
+	kv := &fakeMemoryKV{putErr: errors.New("kv failure")}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{TokenPrefix: "token/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		tokensKV: kv,
+	}
+
+	token := &registry.Token{Hash: "abc123"}
+	err := sync.putToken(token)
+	require.EqualError(t, err, "kv failure")
+	require.Empty(t, kv.putCalls)
+}
+
+func TestRegistrySyncPutTokenHandlesMarshalErrors(t *testing.T) {
+	origMarshal := jsonMarshal
+	t.Cleanup(func() { jsonMarshal = origMarshal })
+
+	jsonMarshal = func(any) ([]byte, error) { return nil, errors.New("marshal failure") }
+
+	sync := &registrySync{cfg: RegistryConfig{TokenPrefix: "token/"}, log: logrus.New().WithField("component", "registry-test"), tokensKV: &fakeMemoryKV{}}
+	err := sync.putToken(&registry.Token{Hash: "abc123"})
+	require.EqualError(t, err, "marshal failure")
 }
 
 func TestRegistrySyncPutTokenRejectsInvalidHash(t *testing.T) {
@@ -264,6 +319,14 @@ func TestRegistrySyncDeleteTokenSkipsInvalidHash(t *testing.T) {
 
 func TestRegistrySyncOnModelChange(t *testing.T) {
 	t.Parallel()
+
+	t.Run("nil model ignored", func(t *testing.T) {
+		sync := &registrySync{}
+
+		result, err := sync.onModelChange("demo/model", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
 
 	t.Run("ready model published", func(t *testing.T) {
 		kv := &fakeMemoryKV{
@@ -318,6 +381,33 @@ func TestRegistrySyncOnModelChange(t *testing.T) {
 				Name:      "model",
 			},
 			Status: v1.ModelStatus{},
+		}
+
+		result, err := sync.onModelChange("demo/model", model)
+		require.NoError(t, err)
+		require.Equal(t, model, result)
+		require.Equal(t, []string{"model/demo/model"}, kv.deleteCalls)
+	})
+
+	t.Run("not ready delete error tolerated", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: map[string][]byte{
+				"model/demo/model": []byte(`{"namespace":"demo","name":"model"}`),
+			},
+			deleteErr: errors.New("kv delete failure"),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{ModelPrefix: "model/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			modelsKV: kv,
+		}
+
+		model := &v1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "model",
+			},
 		}
 
 		result, err := sync.onModelChange("demo/model", model)
@@ -388,8 +478,89 @@ func TestRegistrySyncOnModelRemove(t *testing.T) {
 	require.Nil(t, nilModel)
 }
 
+func TestRegistrySyncOnModelRemoveHandlesDeleteErrors(t *testing.T) {
+	kv := &fakeMemoryKV{
+		payload:   map[string][]byte{"model/demo/model": []byte(`{}`)},
+		deleteErr: errors.New("delete failure"),
+	}
+
+	sync := &registrySync{
+		cfg:      RegistryConfig{ModelPrefix: "model/"},
+		log:      logrus.New().WithField("component", "registry-test"),
+		modelsKV: kv,
+	}
+
+	model := &v1.Model{ObjectMeta: metav1.ObjectMeta{Namespace: "demo", Name: "model"}}
+	result, err := sync.onModelRemove("demo/model", model)
+	require.NoError(t, err)
+	require.Equal(t, model, result)
+	require.Equal(t, []string{"model/demo/model"}, kv.deleteCalls)
+}
+
 func TestRegistrySyncOnSecretChange(t *testing.T) {
 	t.Parallel()
+
+	t.Run("non token secret removes hash", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: map[string][]byte{
+				"token/abc123": []byte(`{"hash":"abc123"}`),
+			},
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "token",
+				Labels: map[string]string{
+					"unrelated": "true",
+				},
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey: []byte("ABC123"),
+			},
+		}
+
+		result, err := sync.onSecretChange("key", secret)
+		require.Nil(t, result)
+		require.NoError(t, err)
+		require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
+	})
+
+	t.Run("non token delete error tolerated", func(t *testing.T) {
+		kv := &fakeMemoryKV{
+			payload: map[string][]byte{
+				"token/abc123": []byte(`{"hash":"abc123"}`),
+			},
+			deleteErr: errors.New("kv delete failure"),
+		}
+
+		sync := &registrySync{
+			cfg:      RegistryConfig{TokenPrefix: "token/"},
+			log:      logrus.New().WithField("component", "registry-test"),
+			tokensKV: kv,
+		}
+
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "demo",
+				Name:      "token",
+			},
+			Data: map[string][]byte{
+				tokens.DataHashKey: []byte("ABC123"),
+			},
+		}
+
+		result, err := sync.onSecretChange("key", secret)
+		require.Nil(t, result)
+		require.NoError(t, err)
+		require.Equal(t, []string{"token/abc123"}, kv.deleteCalls)
+	})
 
 	t.Run("nil secret ignored", func(t *testing.T) {
 		sync := &registrySync{}

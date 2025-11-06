@@ -325,21 +325,14 @@ func (h *dllamaHandler) readyReplicasForWorker(worker *v1.Worker) (int32, error)
 const maxInt32 = int64(^uint32(0) >> 1)
 
 func workersForReplicaPower(power int32) int32 {
-	if power <= 0 {
+	switch {
+	case power <= 0:
 		return 0
-	}
-
-	if power >= 31 {
+	case power >= 31:
 		return int32(maxInt32)
+	default:
+		return int32((int64(1) << power) - 1)
 	}
-	result := int64(1<<power) - 1
-	if result > maxInt32 {
-		return int32(maxInt32)
-	}
-	if result < 0 {
-		return 0
-	}
-	return int32(result)
 }
 
 func (h *dllamaHandler) getIngressNatsURL(dllama *v1.Dllama) string {

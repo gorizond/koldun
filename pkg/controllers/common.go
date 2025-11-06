@@ -114,9 +114,13 @@ func workerResourceName(dllamaName string) string {
 }
 
 func dllamaNameForSession(sessionName string, ordinal int32) string {
+	return dllamaNameForSessionWithLimit(sessionName, ordinal, validation.LabelValueMaxLength)
+}
+
+func dllamaNameForSessionWithLimit(sessionName string, ordinal int32, limit int) string {
 	suffix := fmt.Sprintf("-%d", ordinal)
 	base := fmt.Sprintf("%s-dllama", sessionName)
-	max := validation.LabelValueMaxLength - len(suffix)
+	max := limit - len(suffix)
 	if max < 1 {
 		max = 1
 	}
