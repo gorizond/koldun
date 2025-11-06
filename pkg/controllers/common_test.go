@@ -414,4 +414,25 @@ func TestDllamaNameForSession(t *testing.T) {
 			t.Errorf("dllamaNameForSession() = %s, want -dllama-0", got)
 		}
 	})
+
+	t.Run("limit smaller than suffix length clamps base", func(t *testing.T) {
+		suffix := "-123456"
+		suffixLen := len(suffix)
+		limit := suffixLen - 1
+		if limit < 0 {
+			t.Fatalf("invalid limit derived from suffix length")
+		}
+		got := dllamaNameForSessionWithLimit("session-name", 123456, limit)
+
+		wantLength := 1 + suffixLen
+		if len(got) != wantLength {
+			t.Fatalf("dllamaNameForSessionWithLimit() length = %d, want %d", len(got), wantLength)
+		}
+		if got[:1] != "s" {
+			t.Errorf("dllamaNameForSessionWithLimit() prefix = %s, want s", got[:1])
+		}
+		if got[1:] != suffix {
+			t.Errorf("dllamaNameForSessionWithLimit() suffix = %s, want %s", got[1:], suffix)
+		}
+	})
 }

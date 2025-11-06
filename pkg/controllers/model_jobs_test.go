@@ -1963,6 +1963,74 @@ func TestEnsureDownloadJobSkipsWhenJobRecentlyCreatedJobPendingReason(t *testing
 	}
 }
 
+func TestEnsureDownloadJobFiltersIrrelevantConditions(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().
+		Get("models", "mistral-download").
+		Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-download")).
+		Times(2)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL: "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource: "models-bucket",
+			},
+		},
+		Status: v1.ModelStatus{
+			ObservedGeneration: 7,
+			DownloadState:      "Failed",
+			DownloadJobName:    "mistral-download",
+			Conditions: []metav1.Condition{
+				{
+					Type:               conditionConverted,
+					Status:             metav1.ConditionFalse,
+					Reason:             "JobCreated",
+					LastTransitionTime: metav1.NewTime(time.Now()),
+				},
+				{
+					Type:               conditionDownloaded,
+					Status:             metav1.ConditionTrue,
+					Reason:             "JobCreated",
+					LastTransitionTime: metav1.NewTime(time.Now()),
+				},
+				{
+					Type:               conditionDownloaded,
+					Status:             metav1.ConditionFalse,
+					Reason:             "SomeOtherReason",
+					LastTransitionTime: metav1.NewTime(time.Now()),
+				},
+				{
+					Type:   conditionDownloaded,
+					Status: metav1.ConditionFalse,
+					Reason: "JobCreated",
+				},
+			},
+		},
+	}
+	model.Generation = 7
+
+	if err := handler.ensureDownloadJob(model); err != nil {
+		t.Fatalf("ensureDownloadJob returned error: %v", err)
+	}
+	if applySpy.Count != 0 {
+		t.Fatalf("expected no apply calls, got %d", applySpy.Count)
+	}
+}
+
 func TestEnsureDownloadJobWaitsForUnfinishedJobWithoutGeneration(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -2491,7 +2559,17 @@ func TestEnsureDownloadJobSkipsWithEmptySourceURL(t *testing.T) {
 }
 
 func TestEnsureDownloadJobSkipsWithWhitespaceSourceURL(t *testing.T) {
-	handler := &modelHandler{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	handler := &modelHandler{
+		jobs: jobs,
+	}
+
+	jobs.EXPECT().Cache().Times(0)
+
 	model := &v1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
 		Spec: v1.ModelSpec{
@@ -2502,9 +2580,8 @@ func TestEnsureDownloadJobSkipsWithWhitespaceSourceURL(t *testing.T) {
 		},
 	}
 
-	if err := handler.ensureDownloadJob(model); err == nil {
-		// Note: current implementation only checks if SourceURL == "", not trimmed
-		// This test documents current behavior
+	if err := handler.ensureDownloadJob(model); err != nil {
+		t.Fatalf("ensureDownloadJob should skip whitespace-only SourceURL, got error: %v", err)
 	}
 }
 
@@ -3418,7 +3495,16 @@ func TestEnsureSizingJobPropagatesDllamaLabel(t *testing.T) {
 }
 
 func TestEnsureSizingJobSkipsWithForceTokenAlreadyProcessed(t *testing.T) {
-	handler := &modelHandler{}
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	handler := &modelHandler{
+		jobs: jobs,
+	}
+
+	jobs.EXPECT().Cache().Times(0)
 	model := &v1.Model{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "mistral",

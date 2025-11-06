@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
@@ -66,4 +67,42 @@ func TestEnsureScriptConfigMapCreatesDownloadScript(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "mistral-download-script", cm.Name)
 	require.Contains(t, cm.Data["download.py"], "import")
+}
+
+func TestEnsureMetadataConfigMapApplyError(t *testing.T) {
+	t.Parallel()
+
+	applyErr := errors.New("apply metadata failed")
+	handler := &modelHandler{
+		apply: &failingApply{
+			fakeApply: newFakeApply(),
+			err:       applyErr,
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+	}
+
+	err := handler.ensureMetadataConfigMap(model)
+	require.ErrorIs(t, err, applyErr)
+}
+
+func TestEnsureScriptConfigMapApplyError(t *testing.T) {
+	t.Parallel()
+
+	applyErr := errors.New("apply script failed")
+	handler := &modelHandler{
+		apply: &failingApply{
+			fakeApply: newFakeApply(),
+			err:       applyErr,
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+	}
+
+	err := handler.ensureScriptConfigMap(model)
+	require.ErrorIs(t, err, applyErr)
 }

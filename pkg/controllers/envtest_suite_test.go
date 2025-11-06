@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +30,8 @@ var (
 // locally). When the assets are not installed the tests are skipped instead of
 // failing the entire package.
 func TestMain(m *testing.M) {
+	flag.Parse()
+
 	assetsDir, locateErr := locateKubebuilderAssets()
 	if locateErr != nil {
 		envtestSkipReason = locateErr.Error()
@@ -47,14 +50,14 @@ func TestMain(m *testing.M) {
 	}
 	defer logrus.SetLevel(originalLevel)
 
+	crdPath := filepath.Join(projectRoot(), "charts", "koldun", "templates", "crd", "bases")
+
 	testEnv = &envtest.Environment{
 		BinaryAssetsDirectory: assetsDir,
 		CRDInstallOptions: envtest.CRDInstallOptions{
 			ErrorIfPathMissing: true,
 		},
-		CRDDirectoryPaths: []string{
-			filepath.Join("charts", "koldun", "templates", "crd", "bases"),
-		},
+		CRDDirectoryPaths: []string{crdPath},
 	}
 
 	var err error
@@ -246,4 +249,21 @@ func validateKubebuilderAssets(dir string) error {
 	}
 
 	return nil
+}
+
+func projectRoot() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "."
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
 }

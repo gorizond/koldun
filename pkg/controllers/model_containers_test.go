@@ -5,6 +5,10 @@ import (
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // TestBuildDependencyInstallScript tests the buildDependencyInstallScript function
@@ -324,4 +328,171 @@ func TestModelHandler_ConversionArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestModelHandlerBuildDownloadContainerWithSecrets(t *testing.T) {
+	t.Parallel()
+
+	h := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			PipProxy: "http://proxy.internal:8080",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:        "https://s3.internal",
+				BucketForSource: "models-src",
+				SecretRef:       &v1.SecretReference{Name: "storage-creds"},
+			},
+		},
+	}
+	spec := &v1.ModelDownloadSpec{
+		Image:                     "downloader:1.0",
+		Memory:                    "256Mi",
+		ChunkMaxMiB:               32,
+		Concurrency:               4,
+		HuggingFaceTokenSecretRef: &v1.SecretReference{Name: "hf-token"},
+	}
+
+	container := h.buildDownloadContainer(model, spec, "https://huggingface.co/gpt", "models/llama", "5")
+	require.Equal(t, "model-downloader", container.Name)
+	require.Equal(t, spec.Image, container.Image)
+	require.Len(t, container.EnvFrom, 1)
+	require.Equal(t, "storage-creds", container.EnvFrom[0].SecretRef.Name)
+
+	env := toEnvMap(container.Env)
+	require.Equal(t, "models-src", env["CACHE_BUCKET"].Value)
+	require.Equal(t, "https://s3.internal", env["CACHE_ENDPOINT"].Value)
+	require.Equal(t, "models/llama", env["CACHE_OBJECT_KEY"].Value)
+	require.Equal(t, "5", env["MODEL_GENERATION"].Value)
+	require.Equal(t, "256Mi", env["MEMORY_LIMIT"].Value)
+	require.Equal(t, "268435456", env["MEMORY_LIMIT_BYTES"].Value)
+	require.Equal(t, "32", env["CHUNK_MAX_MIB"].Value)
+	require.Equal(t, "4", env["CONCURRENCY"].Value)
+	require.Equal(t, "http://proxy.internal:8080", env["PIP_PROXY"].Value)
+	require.Equal(t, "hf-token", env["HF_TOKEN"].ValueFrom.SecretKeyRef.Name)
+
+	limit := container.Resources.Limits[corev1.ResourceMemory]
+	require.True(t, limit.Equal(resource.MustParse("256Mi")))
+	request := container.Resources.Requests[corev1.ResourceMemory]
+	require.True(t, request.Equal(resource.MustParse("256Mi")))
+}
+
+func TestModelHandlerBuildDownloadContainerSkipsCrossNamespaceSecrets(t *testing.T) {
+	t.Parallel()
+
+	h := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:        "https://minio.internal",
+				BucketForSource: "models-src",
+				SecretRef:       &v1.SecretReference{Name: "storage-creds", Namespace: "other"},
+			},
+		},
+	}
+	spec := &v1.ModelDownloadSpec{
+		Image:                     "downloader:latest",
+		Memory:                    "not-a-quantity",
+		HuggingFaceTokenSecretRef: &v1.SecretReference{Name: "hf-token", Namespace: "other"},
+	}
+
+	container := h.buildDownloadContainer(model, spec, "https://hf.co/private", "models/llama", "7")
+	env := toEnvMap(container.Env)
+	require.NotContains(t, env, "HF_TOKEN", "cross-namespace HF secret must be ignored")
+	require.Equal(t, "https://minio.internal", env["CACHE_ENDPOINT"].Value)
+	require.Equal(t, "models-src", env["CACHE_BUCKET"].Value)
+	require.Empty(t, container.EnvFrom, "storage secret from another namespace should be skipped")
+
+	limit := container.Resources.Limits[corev1.ResourceMemory]
+	require.True(t, limit.Equal(resource.MustParse("128Mi")), "invalid memory should fall back to default")
+	request := container.Resources.Requests[corev1.ResourceMemory]
+	require.True(t, request.Equal(resource.MustParse("128Mi")))
+}
+
+func TestModelHandlerBuildConversionContainerDefaults(t *testing.T) {
+	t.Parallel()
+
+	h := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mixtral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			PipProxy: "http://proxy.internal",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://s3.internal",
+				BucketForSource:  "models-src",
+				BucketForConvert: "models-conv",
+				SecretRef:        &v1.SecretReference{Name: "storage-creds"},
+			},
+		},
+	}
+	spec := &v1.ModelConversionSpec{
+		WeightsFloatType: "fp16",
+		ConvertWeights:   "q4_0",
+		Memory:           "4Gi",
+	}
+
+	container := h.buildConversionContainer(model, spec, "/workspace/hf", "input/key", "bucket-out", "key-out", "s3://bucket/key", "fp16", "9")
+	require.Equal(t, "model-converter", container.Name)
+	require.Equal(t, defaultConversionImage, container.Image)
+	require.Equal(t, []string{"/bin/sh", "-c"}, container.Command)
+	require.Len(t, container.Args, 1)
+	require.Contains(t, container.Args[0], "/workspace/converter/convert-hf.py")
+	require.Len(t, container.EnvFrom, 1)
+	require.Equal(t, "storage-creds", container.EnvFrom[0].SecretRef.Name)
+
+	env := toEnvMap(container.Env)
+	require.Equal(t, "models-src", env["CACHE_BUCKET"].Value)
+	require.Equal(t, "input/key", env["CACHE_OBJECT_KEY"].Value)
+	require.Equal(t, "bucket-out", env["CONVERSION_BUCKET"].Value)
+	require.Equal(t, "key-out", env["CONVERSION_OBJECT_KEY"].Value)
+	require.Equal(t, "s3://bucket/key", env["CONVERSION_OUTPUT_URI"].Value)
+	require.Equal(t, "q4_0", env["CONVERSION_WEIGHTS_TYPE"].Value)
+	require.Equal(t, "http://proxy.internal", env["PIP_PROXY"].Value)
+
+	limit := container.Resources.Limits[corev1.ResourceMemory]
+	require.True(t, limit.Equal(resource.MustParse("4Gi")))
+}
+
+func TestModelHandlerBuildConversionContainerCustomCommand(t *testing.T) {
+	t.Parallel()
+
+	h := &modelHandler{}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mixtral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "https://s3.internal",
+				BucketForSource:  "models-src",
+				BucketForConvert: "models-conv",
+				SecretRef:        &v1.SecretReference{Name: "storage-creds", Namespace: "other"},
+			},
+		},
+	}
+	spec := &v1.ModelConversionSpec{
+		Image:   "converter:1.2",
+		Command: []string{"python"},
+		Args:    []string{"custom", "script.py"},
+		Memory:  "not-a-number",
+	}
+
+	container := h.buildConversionContainer(model, spec, "/workspace/custom", "input/key", "bucket", "key", "s3://bucket/key", "", "2")
+	require.Equal(t, "converter:1.2", container.Image)
+	require.Equal(t, spec.Command, container.Command)
+	require.Equal(t, spec.Args, container.Args)
+	require.Empty(t, container.EnvFrom, "cross-namespace storage secret should not be mounted")
+
+	env := toEnvMap(container.Env)
+	require.Equal(t, defaultWeightsType, env["CONVERSION_WEIGHTS_TYPE"].Value, "missing weights should fall back to default")
+
+	limit := container.Resources.Limits[corev1.ResourceMemory]
+	require.True(t, limit.Equal(resource.MustParse("2Gi")), "invalid memory should fall back to default")
+}
+
+func toEnvMap(env []corev1.EnvVar) map[string]corev1.EnvVar {
+	result := make(map[string]corev1.EnvVar, len(env))
+	for _, e := range env {
+		result[e.Name] = e
+	}
+	return result
 }

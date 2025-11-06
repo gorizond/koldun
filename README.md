@@ -170,17 +170,48 @@ go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 # Downloads the stack compatible with controller-runtime v0.20.4 and prints the export lines
 eval "$(setup-envtest use --controller-runtime-version 0.20.4 --install-dir ./bin/envtest)"
 
+# Persist for new shells / CI jobs (optional but recommended)
+export KUBEBUILDER_ASSETS="$(pwd)/bin/envtest/kubebuilder/bin"
+ls "$KUBEBUILDER_ASSETS"  # sanity-check kube-apiserver/etcd are present
+
 # Verify the integration test; it will skip with a helpful message if assets are missing
 go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -count=1
 ```
 
-The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
+- `make envtest-preflight` wraps the `setup-envtest use` invocation, validates that both `kube-apiserver` and `etcd` binaries exist, and reprints the `KUBEBUILDER_ASSETS` export line. Use it after toolchain upgrades or when bootstrapping CI runners.
+- `.envrc` now exports `KUBEBUILDER_ASSETS=$PWD/bin/envtest/kubebuilder/bin`; run `direnv allow` (or copy the line into your shell profile) so controller tests discover the assets automatically.
+- Capture the `KUBEBUILDER_ASSETS` path printed by `setup-envtest use` (typically `./bin/envtest/kubebuilder/bin`) for local shells and CI pipelines.
+- Cache the `./bin/envtest` directory in CI runners to avoid downloading the binaries on every job; re-run `setup-envtest use` only when bumping controller-runtime.
+- Add the `export KUBEBUILDER_ASSETS=…` line to your shell profile (e.g. `.envrc`, `.zshrc`) so `go test` picks it up without re-running `setup-envtest`.
+- The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
+- CI draft step:
+
+  ```yaml
+  - name: warm envtest assets
+    run: |
+      make envtest-preflight
+      direnv allow || true
+  - name: cache envtest toolchain
+    uses: actions/cache@v4
+    with:
+      path: bin/envtest
+      key: ${{ runner.os }}-envtest-${{ hashFiles('go.mod') }}
+      restore-keys: |
+        ${{ runner.os }}-envtest-
+  ```
+
+### Controller Coverage Snapshot
+- Generate a focused profile: `go test ./pkg/controllers -coverprofile=controllers.cover`
+- Inspect watchers and sizing helpers: `go tool cover -func=controllers.cover | grep -E 'root.go|dllama.go|model_jobs.go'`
+- Current reference (2025-11-02 19:30): controllers pkg coverage 77.9%; `worker.ensureStatefulSet` 88.0% (replica/memory planning paths covered), `worker.ensureStatus` 94.1% (ready + observedGeneration branches), root and worker watchers remain 100%, `persistModelAnnotation` error logging exercised via gomock, `ensureSizingJob` 87.9% (delete/apply errors mocked).
+- Remove the temporary profile when finished (`rm controllers.cover`) to keep the workspace clean.
 
 ### Key Commands
 | Purpose | Command |
 | --- | --- |
 | Format | `go fmt ./... && gofmt -w .` |
 | Unit tests | `go test ./...` (append `-race` for data race checks) |
+| Controllers smoke | `make controllers-smoke` (`go test ./pkg/controllers -count=1 -coverprofile=/tmp/controllers.cover`) |
 | Build binary | `go build ./cmd/operator` |
 | Run operator | `go run ./cmd/operator --mode=operator` |
 | Build/push image | `skaffold build` |

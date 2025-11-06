@@ -38,6 +38,8 @@ type registrySync struct {
 	tokensKV nats.KeyValue
 }
 
+var jsonMarshal = json.Marshal
+
 func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) error {
 	if strings.TrimSpace(cfg.NATSURL) == "" {
 		logrus.Info("registry sync disabled: operator-nats-url not set")
@@ -190,7 +192,7 @@ func (r *registrySync) onSecretChange(key string, secret *corev1.Secret) (*corev
 
 func (r *registrySync) putModel(model *registry.Model) error {
 	key := r.cfg.ModelPrefix + modelKey(model.Namespace, model.Name)
-	payload, err := json.Marshal(model)
+	payload, err := jsonMarshal(model)
 	if err != nil {
 		return err
 	}
@@ -209,7 +211,7 @@ func (r *registrySync) putToken(token *registry.Token) error {
 		return fmt.Errorf("invalid token hash: %q", token.Hash)
 	}
 
-	payload, err := json.Marshal(token)
+	payload, err := jsonMarshal(token)
 	if err != nil {
 		return err
 	}

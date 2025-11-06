@@ -115,8 +115,8 @@ func (f fakeAppsControllers) StatefulSet() appscontroller.StatefulSetController 
 }
 
 type fakeCoreControllers struct {
-    secret  corecontroller.SecretController
-    service corecontroller.ServiceController
+	secret  corecontroller.SecretController
+	service corecontroller.ServiceController
 }
 
 func (f fakeCoreControllers) ConfigMap() corecontroller.ConfigMapController {
@@ -152,7 +152,7 @@ func (f fakeCoreControllers) Pod() corecontroller.PodController {
 }
 
 func (f fakeCoreControllers) Secret() corecontroller.SecretController {
-    return f.secret
+	return f.secret
 }
 
 func (f fakeCoreControllers) Service() corecontroller.ServiceController {
@@ -279,6 +279,20 @@ func TestIngressOnRelatedDeployment(t *testing.T) {
 		require.Same(t, deploy, obj)
 	})
 
+	t.Run("backend component without name label", func(t *testing.T) {
+		ingresses.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+		deploy := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					labelComponent: componentBackend,
+				},
+			},
+		}
+		obj, err := handler.onRelatedDeployment("ns/key", deploy)
+		require.NoError(t, err)
+		require.Same(t, deploy, obj)
+	})
+
 	t.Run("enqueue backend ingress", func(t *testing.T) {
 		deploy := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
@@ -330,6 +344,21 @@ func TestIngressOnRelatedService(t *testing.T) {
 			},
 		}
 		ingresses.EXPECT().Enqueue("testing", "chat")
+
+		obj, err := handler.onRelatedService("ns/key", svc)
+		require.NoError(t, err)
+		require.Same(t, svc, obj)
+	})
+
+	t.Run("backend component without name is ignored", func(t *testing.T) {
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "testing",
+				Labels: map[string]string{
+					labelComponent: componentBackend,
+				},
+			},
+		}
 
 		obj, err := handler.onRelatedService("ns/key", svc)
 		require.NoError(t, err)

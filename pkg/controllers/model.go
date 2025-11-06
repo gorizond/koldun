@@ -44,6 +44,14 @@ type modelHandler struct {
 	secrets       corectlv1.SecretController
 	ensureBuckets bool
 	minioFactory  minioFactory
+
+	ensureMetadataFn    func(*v1.Model) error
+	ensureScriptFn      func(*v1.Model) error
+	ensureBucketsFn     func(*v1.Model) error
+	ensureDownloadJobFn func(*v1.Model) error
+	ensureConversionFn  func(*v1.Model) error
+	ensureSizingFn      func(*v1.Model) error
+	ensureStatusFn      func(*v1.Model) (*v1.Model, error)
 }
 
 func registerModelController(ctx context.Context, m *Manager) error {
@@ -60,11 +68,68 @@ func registerModelController(ctx context.Context, m *Manager) error {
 		minioFactory:  defaultMinioFactory,
 	}
 
+	handler.ensureMetadataFn = handler.ensureMetadataConfigMap
+	handler.ensureScriptFn = handler.ensureScriptConfigMap
+	handler.ensureBucketsFn = handler.ensureObjectStorageBuckets
+	handler.ensureDownloadJobFn = handler.ensureDownloadJob
+	handler.ensureConversionFn = handler.ensureConversionJob
+	handler.ensureSizingFn = handler.ensureSizingJob
+	handler.ensureStatusFn = handler.ensureStatus
+
 	handler.models.OnChange(ctx, "koldun-model-controller", handler.onChange)
 	handler.models.OnRemove(ctx, "koldun-model-controller", handler.onRemove)
 	handler.jobs.OnChange(ctx, "koldun-model-job-watch", handler.onRelatedJob)
 	handler.jobs.OnRemove(ctx, "koldun-model-job-remove", handler.onRelatedJob)
 	return nil
+}
+
+func (h *modelHandler) ensureMetadata(obj *v1.Model) error {
+	if h.ensureMetadataFn != nil {
+		return h.ensureMetadataFn(obj)
+	}
+	return h.ensureMetadataConfigMap(obj)
+}
+
+func (h *modelHandler) ensureScript(obj *v1.Model) error {
+	if h.ensureScriptFn != nil {
+		return h.ensureScriptFn(obj)
+	}
+	return h.ensureScriptConfigMap(obj)
+}
+
+func (h *modelHandler) ensureBucketsForModel(obj *v1.Model) error {
+	if h.ensureBucketsFn != nil {
+		return h.ensureBucketsFn(obj)
+	}
+	return h.ensureObjectStorageBuckets(obj)
+}
+
+func (h *modelHandler) ensureDownload(obj *v1.Model) error {
+	if h.ensureDownloadJobFn != nil {
+		return h.ensureDownloadJobFn(obj)
+	}
+	return h.ensureDownloadJob(obj)
+}
+
+func (h *modelHandler) ensureConversion(obj *v1.Model) error {
+	if h.ensureConversionFn != nil {
+		return h.ensureConversionFn(obj)
+	}
+	return h.ensureConversionJob(obj)
+}
+
+func (h *modelHandler) ensureSizing(obj *v1.Model) error {
+	if h.ensureSizingFn != nil {
+		return h.ensureSizingFn(obj)
+	}
+	return h.ensureSizingJob(obj)
+}
+
+func (h *modelHandler) ensureStatusUpdate(obj *v1.Model) (*v1.Model, error) {
+	if h.ensureStatusFn != nil {
+		return h.ensureStatusFn(obj)
+	}
+	return h.ensureStatus(obj)
 }
 
 func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
@@ -77,32 +142,32 @@ func (h *modelHandler) onChange(key string, obj *v1.Model) (*v1.Model, error) {
 
 	klog.V(1).Infof("Model %s/%s: onChange triggered for generation %d", obj.Namespace, obj.Name, obj.Generation)
 
-	if err := h.ensureMetadataConfigMap(obj); err != nil {
+	if err := h.ensureMetadata(obj); err != nil {
 		return obj, err
 	}
-	if err := h.ensureScriptConfigMap(obj); err != nil {
+	if err := h.ensureScript(obj); err != nil {
 		return obj, err
 	}
-	if err := h.ensureObjectStorageBuckets(obj); err != nil {
+	if err := h.ensureBucketsForModel(obj); err != nil {
 		klog.Errorf("Model %s/%s: failed to ensure object storage buckets: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
-	if err := h.ensureDownloadJob(obj); err != nil {
+	if err := h.ensureDownload(obj); err != nil {
 		klog.Errorf("Model %s/%s: failed to ensure download job: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
 
 	// Ensure conversion job after download logic. This will noop until download succeeds.
-	if err := h.ensureConversionJob(obj); err != nil {
+	if err := h.ensureConversion(obj); err != nil {
 		klog.Errorf("Model %s/%s: failed to ensure conversion job: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
-	if err := h.ensureSizingJob(obj); err != nil {
+	if err := h.ensureSizing(obj); err != nil {
 		klog.Errorf("Model %s/%s: failed to ensure sizing job: %v", obj.Namespace, obj.Name, err)
 		return obj, err
 	}
 
-	return h.ensureStatus(obj)
+	return h.ensureStatusUpdate(obj)
 }
 
 func (h *modelHandler) onRemove(key string, obj *v1.Model) (*v1.Model, error) {

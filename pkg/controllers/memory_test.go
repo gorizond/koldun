@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"fmt"
+	"math"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -97,6 +99,24 @@ func TestRootMemoryOverheadRatio(t *testing.T) {
 	}
 }
 
+func TestRootMemoryOverheadRatioDecayCurve(t *testing.T) {
+	t.Parallel()
+
+	ratioTwo := rootMemoryOverheadRatio(2, nil)
+	ratioFive := rootMemoryOverheadRatio(5, nil)
+	ratioTen := rootMemoryOverheadRatio(10, nil)
+
+	if ratioTwo < ratioFive {
+		t.Fatalf("expected ratioTwo >= ratioFive, got %f < %f", ratioTwo, ratioFive)
+	}
+	if ratioFive < ratioTen {
+		t.Fatalf("expected ratioFive >= ratioTen, got %f < %f", ratioFive, ratioTen)
+	}
+	if ratioTen < rootOverheadMinRatio {
+		t.Fatalf("ratioTen %f should not fall below min ratio %f", ratioTen, rootOverheadMinRatio)
+	}
+}
+
 func TestCalculateMemoryRequests(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -160,6 +180,13 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			name:                "negative workers returns not ok",
 			conversionSizeBytes: 1024 * 1024 * 1024,
 			workerReplicas:      -1,
+			override:            nil,
+			wantOk:              false,
+		},
+		{
+			name:                "extreme negative workers overflow guard",
+			conversionSizeBytes: 1024,
+			workerReplicas:      int32(math.MinInt32),
 			override:            nil,
 			wantOk:              false,
 		},
@@ -274,6 +301,24 @@ func TestCalculateMemoryRequests_Format(t *testing.T) {
 	}
 }
 
+func TestFormatFloatPtr(t *testing.T) {
+	t.Parallel()
+
+	if got := formatFloatPtr(nil); got != "nil" {
+		t.Errorf("formatFloatPtr(nil) = %q, want %q", got, "nil")
+	}
+
+	value := 1.375
+	if got := formatFloatPtr(&value); got != "1.375" {
+		t.Errorf("formatFloatPtr() = %q, want %q", got, "1.375")
+	}
+
+	whole := 2.0
+	if got := formatFloatPtr(&whole); got != "2" {
+		t.Errorf("formatFloatPtr() = %q, want %q", got, "2")
+	}
+}
+
 // Helper functions for tests
 
 func floatPtr(f float64) *float64 {
@@ -284,5 +329,5 @@ func formatFloatPtr(f *float64) string {
 	if f == nil {
 		return "nil"
 	}
-	return string(rune(*f))
+	return fmt.Sprintf("%g", *f)
 }
