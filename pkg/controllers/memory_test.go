@@ -52,6 +52,13 @@ func TestRootMemoryOverheadRatio(t *testing.T) {
 			wantMax:        rootOverheadMinRatio,
 		},
 		{
+			name:           "max int workers stays at min ratio",
+			workerReplicas: math.MaxInt32,
+			override:       nil,
+			wantMin:        rootOverheadMinRatio,
+			wantMax:        rootOverheadMinRatio,
+		},
+		{
 			name:           "override below min gets clamped",
 			workerReplicas: 5,
 			override:       floatPtr(1.0),
@@ -232,6 +239,28 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			wantRootMiMax:       420,
 			wantWorkerMiMin:     376,
 			wantWorkerMiMax:     420,
+			wantOk:              true,
+		},
+		{
+			name:                "override smaller than worker ratio clamps root",
+			conversionSizeBytes: int64(1_992_294), // ~1.9 MiB total, forces rootMi < workerMi before clamp
+			workerReplicas:      1,
+			override:            floatPtr(1.01),
+			wantRootMiMin:       2,
+			wantRootMiMax:       2,
+			wantWorkerMiMin:     2,
+			wantWorkerMiMax:     2,
+			wantOk:              true,
+		},
+		{
+			name:                "max worker replicas uses minimum allocations",
+			conversionSizeBytes: 512 * 1024 * 1024 * 1024, // 512 GiB
+			workerReplicas:      math.MaxInt32,
+			override:            nil,
+			wantRootMiMin:       1,
+			wantRootMiMax:       2,
+			wantWorkerMiMin:     1,
+			wantWorkerMiMax:     2,
 			wantOk:              true,
 		},
 	}
