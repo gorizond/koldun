@@ -31,6 +31,13 @@ func TestRootMemoryOverheadRatio(t *testing.T) {
 			wantMax:        rootOverheadMaxRatio,
 		},
 		{
+			name:           "negative workers fall back to max ratio",
+			workerReplicas: -4,
+			override:       nil,
+			wantMin:        rootOverheadMaxRatio,
+			wantMax:        rootOverheadMaxRatio,
+		},
+		{
 			name:           "two workers starts decay",
 			workerReplicas: 2,
 			override:       nil,
@@ -297,6 +304,28 @@ func TestCalculateMemoryRequests(t *testing.T) {
 					rootMi, workerMi)
 			}
 		})
+	}
+}
+
+func TestCalculateMemoryRequestsRounding(t *testing.T) {
+	conversionSizeBytes := int64(5 * 1024 * 1024) // 5 MiB model snapshot
+
+	root, worker, ok := calculateMemoryRequests(conversionSizeBytes, 1, nil)
+	if !ok {
+		t.Fatal("calculateMemoryRequests() returned not ok for positive size")
+	}
+
+	rootMi := root.Value() / (1024 * 1024)
+	workerMi := worker.Value() / (1024 * 1024)
+
+	if workerMi != 3 {
+		t.Fatalf("worker allocation should round up to 3Mi, got %dMi", workerMi)
+	}
+	if rootMi != 4 {
+		t.Fatalf("root allocation should round up to 4Mi, got %dMi", rootMi)
+	}
+	if rootMi < workerMi {
+		t.Fatalf("root allocation %dMi must be >= worker allocation %dMi", rootMi, workerMi)
 	}
 }
 

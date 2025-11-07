@@ -173,6 +173,12 @@ func TestEnsureOwnerReference(t *testing.T) {
 		require.True(t, ensureOwnerReference(meta, sess))
 		require.False(t, ensureOwnerReference(meta, sess))
 	})
+
+	t.Run("nil session returns false", func(t *testing.T) {
+		meta := &metav1.ObjectMeta{}
+		require.False(t, ensureOwnerReference(meta, nil))
+		require.Empty(t, meta.OwnerReferences)
+	})
 }
 
 func TestSessionHandlerEnqueueSession(t *testing.T) {

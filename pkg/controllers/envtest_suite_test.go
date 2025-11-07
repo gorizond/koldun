@@ -1,10 +1,12 @@
 package controllers
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -32,7 +34,7 @@ var (
 func TestMain(m *testing.M) {
 	flag.Parse()
 
-	assetsDir, locateErr := locateKubebuilderAssets()
+	assetsDir, locateErr := ensureKubebuilderAssets()
 	if locateErr != nil {
 		envtestSkipReason = locateErr.Error()
 		fmt.Fprintf(os.Stderr, "envtest disabled: %s\n", envtestSkipReason)
@@ -102,6 +104,19 @@ func shouldSkipEnvtest(err error) bool {
 	}
 }
 
+func ensureKubebuilderAssets() (string, error) {
+	dir, err := locateKubebuilderAssets()
+	if err == nil {
+		return dir, nil
+	}
+
+	if downloadErr := autoDownloadKubebuilderAssets(); downloadErr != nil {
+		return "", fmt.Errorf("%w; automatic setup-envtest download failed: %v", err, downloadErr)
+	}
+
+	return locateKubebuilderAssets()
+}
+
 func locateKubebuilderAssets() (string, error) {
 	candidates := kubebuilderAssetCandidates()
 	var attempted []string
@@ -136,39 +151,57 @@ func locateKubebuilderAssets() (string, error) {
 }
 
 func kubebuilderAssetCandidates() []string {
-	seen := make(map[string]struct{})
-	add := func(path string) {
+	projectDir := projectRoot()
+
+	expandPath := func(path string) []string {
+		path = strings.TrimSpace(path)
 		if path == "" {
-			return
+			return nil
 		}
 		clean := filepath.Clean(path)
-		if _, ok := seen[clean]; ok {
-			return
+		if filepath.IsAbs(clean) || projectDir == "" {
+			return []string{clean}
 		}
-		seen[clean] = struct{}{}
+		absolute := filepath.Join(projectDir, clean)
+		if absolute == clean {
+			return []string{clean}
+		}
+		return []string{clean, absolute}
 	}
 
-	var roots []string
+	seen := make(map[string]struct{})
+	add := func(path string) {
+		for _, candidate := range expandPath(path) {
+			if candidate == "" {
+				continue
+			}
+			if _, ok := seen[candidate]; ok {
+				continue
+			}
+			seen[candidate] = struct{}{}
+		}
+	}
 
-	if dir := strings.TrimSpace(os.Getenv("KUBEBUILDER_ASSETS")); dir != "" {
+	if dir := os.Getenv("KUBEBUILDER_ASSETS"); dir != "" {
 		add(dir)
 	}
 
-	roots = append(roots,
-		filepath.Join("bin", "envtest"),
-		filepath.Join("bin", "kubebuilder"),
-		"/usr/local/kubebuilder",
-		"/usr/local/kubebuilder/bin",
-	)
+	var roots []string
+	appendRoots := func(path string) {
+		roots = append(roots, expandPath(path)...)
+	}
+
+	appendRoots(filepath.Join("bin", "envtest"))
+	appendRoots(filepath.Join("bin", "kubebuilder"))
+	appendRoots("/usr/local/kubebuilder")
+	appendRoots("/usr/local/kubebuilder/bin")
 
 	if home, err := os.UserHomeDir(); err == nil {
-		roots = append(roots,
-			filepath.Join(home, ".cache", "controller-runtime", "setup-envtest"),
-			filepath.Join(home, ".cache", "kubebuilder-envtest"),
-			filepath.Join(home, ".local", "share", "kubebuilder-envtest"),
-			filepath.Join(home, "kubebuilder"),
-			filepath.Join(home, "kubebuilder", "bin"),
-		)
+		appendRoots(filepath.Join(home, ".cache", "controller-runtime", "setup-envtest"))
+		appendRoots(filepath.Join(home, ".cache", "kubebuilder-envtest"))
+		appendRoots(filepath.Join(home, ".local", "share", "kubebuilder-envtest"))
+		appendRoots(filepath.Join(home, "kubebuilder"))
+		appendRoots(filepath.Join(home, "kubebuilder", "bin"))
 	}
 
 	for _, root := range roots {
@@ -249,6 +282,61 @@ func validateKubebuilderAssets(dir string) error {
 	}
 
 	return nil
+}
+
+func autoDownloadKubebuilderAssets() error {
+	if skip := strings.TrimSpace(os.Getenv("KOLD_SKIP_ENVTEST_DOWNLOAD")); strings.EqualFold(skip, "1") || strings.EqualFold(skip, "true") {
+		return fmt.Errorf("automatic download disabled by KOLD_SKIP_ENVTEST_DOWNLOAD=%s", skip)
+	}
+
+	setupPath, err := exec.LookPath("setup-envtest")
+	if err != nil {
+		return fmt.Errorf("setup-envtest binary not found in PATH: %w", err)
+	}
+
+	installDir := filepath.Join(projectRoot(), "bin", "envtest")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		return fmt.Errorf("create envtest install dir: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "attempting automatic envtest download via %s (install dir: %s)\n", setupPath, installDir)
+
+	cmd := exec.Command(setupPath,
+		"use",
+		"--controller-runtime-version", controllerRuntimeVersion,
+		"--install-dir", installDir,
+	)
+	cmd.Env = os.Environ()
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("setup-envtest use failed: %w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+	}
+
+	if assetsDir := parseKubebuilderAssetsExport(stdout.String()); assetsDir != "" {
+		if err := os.Setenv("KUBEBUILDER_ASSETS", assetsDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to export KUBEBUILDER_ASSETS from setup-envtest output: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+func parseKubebuilderAssetsExport(output string) string {
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "export KUBEBUILDER_ASSETS=") {
+			continue
+		}
+		value := strings.TrimPrefix(line, "export KUBEBUILDER_ASSETS=")
+		value = strings.Trim(value, `"'`)
+		return value
+	}
+	return ""
 }
 
 func projectRoot() string {

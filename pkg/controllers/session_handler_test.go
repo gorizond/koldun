@@ -13,6 +13,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -179,6 +180,15 @@ func TestSessionCheckHealthScenarios(t *testing.T) {
 		}
 
 		require.False(t, handler.checkHealth("unreachable-host"))
+	})
+
+	t.Run("invalid endpoint returns false", func(t *testing.T) {
+		handler := &sessionHandler{
+			ctx:        context.Background(),
+			httpClient: &http.Client{Timeout: time.Second},
+		}
+
+		require.False(t, handler.checkHealth("://bad-endpoint"))
 	})
 }
 
@@ -733,6 +743,135 @@ func TestSessionEnsureStatusNoChanges(t *testing.T) {
 	require.Same(t, sess, result)
 }
 
+func TestSessionEnsureStatusHandlesDeletingDllama(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+
+	handler := &sessionHandler{
+		dllamas:  dllamas,
+		sessions: sessions,
+		log:      logrus.NewEntry(logrus.New()),
+		lookupRootEndpointFn: func(_, _ string) string {
+			return ""
+		},
+		checkHealthFn: func(string) bool {
+			return false
+		},
+	}
+
+	deleting := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "sess-dllama-0",
+			Namespace:         "ns",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+		},
+		Status: v1.DllamaStatus{
+			Conditions: []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionFalse}},
+			ReadyRoot:  false,
+		},
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("ns", gomock.Any()).Return([]*v1.Dllama{deleting}, nil)
+
+	var captured *v1.Session
+	sessions.EXPECT().UpdateStatus(gomock.Any()).DoAndReturn(func(updated *v1.Session) (*v1.Session, error) {
+		captured = updated
+		return updated, nil
+	})
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "sess",
+			Namespace:  "ns",
+			Generation: 2,
+		},
+		Status: v1.SessionStatus{
+			Workers: []v1.SessionWorker{
+				{Name: "sess-dllama-0"},
+			},
+		},
+	}
+
+	result, err := handler.ensureStatus(sess)
+	require.NoError(t, err)
+	require.Same(t, captured, result)
+	require.Len(t, captured.Status.Workers, 1)
+	require.Equal(t, "Terminating", captured.Status.Workers[0].Phase)
+	require.False(t, captured.Status.Workers[0].Healthy)
+	require.Equal(t, "", captured.Status.Workers[0].Endpoint)
+}
+
+func TestSessionEnsureStatusMarksWorkerUnhealthyWhenHealthChecksFail(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+
+	handler := &sessionHandler{
+		dllamas:  dllamas,
+		sessions: sessions,
+		log:      logrus.NewEntry(logrus.New()),
+		lookupRootEndpointFn: func(_, _ string) string {
+			return "root.endpoint.svc"
+		},
+		checkHealthFn: func(string) bool {
+			return false
+		},
+	}
+
+	ready := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sess-dllama-0",
+			Namespace: "ns",
+		},
+		Status: v1.DllamaStatus{
+			Conditions:   []metav1.Condition{{Type: conditionReady, Status: metav1.ConditionTrue}},
+			ReadyRoot:    true,
+			ReadyWorkers: 2,
+		},
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("ns", gomock.Any()).Return([]*v1.Dllama{ready}, nil)
+
+	var captured *v1.Session
+	sessions.EXPECT().UpdateStatus(gomock.Any()).DoAndReturn(func(updated *v1.Session) (*v1.Session, error) {
+		captured = updated
+		return updated, nil
+	})
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "sess",
+			Namespace:  "ns",
+			Generation: 4,
+		},
+		Status: v1.SessionStatus{},
+	}
+
+	result, err := handler.ensureStatus(sess)
+	require.NoError(t, err)
+	require.Same(t, captured, result)
+
+	require.Len(t, captured.Status.Workers, 1)
+	worker := captured.Status.Workers[0]
+	require.Equal(t, "sess-dllama-0", worker.Name)
+	require.Equal(t, "root.endpoint.svc", worker.Endpoint)
+	require.False(t, worker.Healthy, "health check failure should mark worker unhealthy")
+	require.Equal(t, "Ready", worker.Phase)
+	require.True(t, worker.Ready)
+	require.Len(t, captured.Status.Conditions, 1)
+	require.Equal(t, metav1.ConditionTrue, captured.Status.Conditions[0].Status)
+	require.Equal(t, "WorkersReady", captured.Status.Conditions[0].Reason)
+}
+
 func TestSessionCreateDllamaForSessionCreateError(t *testing.T) {
 	t.Parallel()
 
@@ -926,6 +1065,58 @@ func TestSessionCreateDllamaForSessionUpdateNotFoundIgnored(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestSessionReconcileDllamaUpdateNotFoundIgnored(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	handler := &sessionHandler{
+		dllamas: dllamas,
+		log:     logrus.NewEntry(logrus.New()),
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat",
+			Namespace: "models",
+		},
+		Spec: v1.SessionSpec{
+			Hash:        "hash",
+			ModelRef:    v1.ModelReference{Name: "model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+			NATS:        &v1.SessionNATSConfig{URL: "nats://demo:4222"},
+			Queue: &v1.SessionQueueSpec{
+				BacklogSubject:      "sessions.backlog",
+				AssignmentsBucket:   "sessions.assign",
+				DllamaSubjectPrefix: "sessions.dl",
+			},
+		},
+	}
+
+	existing := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-dllama-0",
+			Namespace: "models",
+		},
+		Spec: v1.DllamaSpec{
+			ModelRef:     v1.ModelReference{Name: "stale"},
+			ReplicaPower: 1,
+			RootImage:    "root:old",
+			WorkerImage:  "worker:old",
+			NATS:         &v1.DllamaNATSConfig{URL: "nats://demo:4222"},
+		},
+	}
+
+	dllamas.EXPECT().
+		Update(gomock.AssignableToTypeOf(&v1.Dllama{})).
+		Return(nil, apierrors.NewNotFound(schema.GroupResource{Group: v1.GroupName, Resource: "dllamas"}, "chat-dllama-0"))
+
+	require.NoError(t, handler.reconcileDllama(sess, existing))
+}
+
 func TestSessionEnsureDispatcherMissingImage(t *testing.T) {
 	t.Parallel()
 
@@ -1024,6 +1215,40 @@ func TestSessionEnsureDispatcherSkipsWithBlankNATSURL(t *testing.T) {
 	require.Empty(t, fakeApply.appliedObjects, "dispatcher should not be applied when NATS URL is blank")
 }
 
+func TestSessionEnsureDispatcherSkipsWithIncompleteQueue(t *testing.T) {
+	t.Parallel()
+
+	fakeApply := newFakeApply()
+	handler := &sessionHandler{
+		apply: fakeApply,
+		log:   logrus.NewEntry(logrus.New()),
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat",
+			Namespace: "models",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "hash",
+			Queue: &v1.SessionQueueSpec{
+				BacklogSubject:      "   ",
+				AssignmentsBucket:   "sessions.assign",
+				DllamaSubjectPrefix: "sessions.dl",
+			},
+			NATS: &v1.SessionNATSConfig{
+				URL: "nats://demo:4222",
+			},
+			DispatcherImage: "dispatcher:latest",
+			RootImage:       "root:latest",
+		},
+	}
+
+	err := handler.ensureDispatcher(sess)
+	require.NoError(t, err)
+	require.Empty(t, fakeApply.appliedObjects, "dispatcher should not be applied with incomplete queue config")
+}
+
 func TestSessionEnsureDispatcherApplyError(t *testing.T) {
 	t.Parallel()
 
@@ -1111,6 +1336,93 @@ func TestSessionEnsureDispatcherApplyErrorRequeuesEachAttempt(t *testing.T) {
 	require.ErrorIs(t, err, applyErr)
 }
 
+func TestSessionEnsureDispatcherHonorsAckTimeout(t *testing.T) {
+	t.Parallel()
+
+	fakeApply := newFakeApply()
+	handler := &sessionHandler{
+		apply: fakeApply,
+		log:   logrus.NewEntry(logrus.New()),
+	}
+
+	timeout := metav1.Duration{Duration: 45 * time.Second}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat",
+			Namespace: "models",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "hash",
+			Queue: &v1.SessionQueueSpec{
+				BacklogSubject:      "sessions.backlog",
+				AssignmentsBucket:   "sessions.assign",
+				DllamaSubjectPrefix: "sessions.dl",
+				StateStream:         "sessions.state",
+				AckTimeout:          &timeout,
+			},
+			NATS: &v1.SessionNATSConfig{
+				URL: "nats://demo:4222",
+			},
+			DispatcherImage: "dispatcher:latest",
+			RootImage:       "root:latest",
+		},
+	}
+
+	err := handler.ensureDispatcher(sess)
+	require.NoError(t, err)
+	require.Len(t, fakeApply.appliedObjects, 1)
+
+	deployment, ok := fakeApply.appliedObjects[0].(*appsv1.Deployment)
+	require.True(t, ok, "expected dispatcher deployment to be applied")
+	require.NotEmpty(t, deployment.Spec.Template.Spec.Containers)
+	args := deployment.Spec.Template.Spec.Containers[0].Args
+	require.Contains(t, args, "--dispatcher-ack-wait=45s")
+}
+
+func TestSessionEnsureDispatcherUsesStateStreamAndRootImageFallback(t *testing.T) {
+	t.Parallel()
+
+	fakeApply := newFakeApply()
+	handler := &sessionHandler{
+		apply: fakeApply,
+		log:   logrus.NewEntry(logrus.New()),
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat",
+			Namespace: "models",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "hash",
+			Queue: &v1.SessionQueueSpec{
+				BacklogSubject:      "sessions.backlog",
+				AssignmentsBucket:   "sessions.assign",
+				DllamaSubjectPrefix: "sessions",
+				StateStream:         "streams.state",
+			},
+			NATS: &v1.SessionNATSConfig{
+				URL: "nats://demo:4222",
+			},
+			DispatcherImage: "",
+			RootImage:       "root:latest",
+		},
+	}
+
+	err := handler.ensureDispatcher(sess)
+	require.NoError(t, err)
+	require.Len(t, fakeApply.appliedObjects, 1)
+
+	deployment, ok := fakeApply.appliedObjects[0].(*appsv1.Deployment)
+	require.True(t, ok, "dispatcher deployment should be applied")
+	require.NotEmpty(t, deployment.Spec.Template.Spec.Containers)
+	container := deployment.Spec.Template.Spec.Containers[0]
+	require.Equal(t, "root:latest", container.Image, "root image should be used as fallback")
+	require.Contains(t, container.Args, "--dispatcher-dllama-prefix=sessions.", "dllama prefix should gain trailing dot")
+	require.Contains(t, container.Args, "--dispatcher-state-prefix=streams.state.", "state stream should override state prefix when it contains dots")
+}
+
 func sessionScaleDownFixtures() (*v1.Session, []*v1.Dllama) {
 	now := time.Now()
 
@@ -1192,4 +1504,26 @@ func sessionScaleDownFixtures() (*v1.Session, []*v1.Dllama) {
 	}
 
 	return session, []*v1.Dllama{idleDllama, busyDllama}
+}
+
+func TestSessionDeleteDllamaPropagatesError(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	handler := &sessionHandler{dllamas: dllamas}
+
+	target := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-dllama-1",
+			Namespace: "models",
+		},
+	}
+
+	dllamas.EXPECT().Delete("models", "chat-dllama-1", gomock.Any()).Return(errors.New("delete failure"))
+
+	err := handler.deleteDllama(&v1.Session{}, target)
+	require.EqualError(t, err, "delete failure")
 }
