@@ -373,6 +373,8 @@ type fakeMemoryKV struct {
 	deleteCalls []string
 	putErr      error
 	deleteErr   error
+	keysErr     error
+	getErrors   map[string]error
 	mu          sync.Mutex
 }
 
@@ -416,6 +418,9 @@ func (kv *fakeMemoryKV) Get(key string) (nats.KeyValueEntry, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	kv.ensure()
+	if err := kv.lookupGetError(key); err != nil {
+		return nil, err
+	}
 	record, ok := kv.records[key]
 	if !ok {
 		var exists bool
@@ -544,6 +549,9 @@ func (kv *fakeMemoryKV) Keys(...nats.WatchOpt) ([]string, error) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	kv.ensure()
+	if kv.keysErr != nil {
+		return nil, kv.keysErr
+	}
 	keys := make([]string, 0, len(kv.payload))
 	for key := range kv.payload {
 		keys = append(keys, key)
@@ -553,6 +561,16 @@ func (kv *fakeMemoryKV) Keys(...nats.WatchOpt) ([]string, error) {
 		return nil, nats.ErrNoKeysFound
 	}
 	return keys, nil
+}
+
+func (kv *fakeMemoryKV) lookupGetError(key string) error {
+	if kv.getErrors == nil {
+		return nil
+	}
+	if err, ok := kv.getErrors[key]; ok {
+		return err
+	}
+	return nil
 }
 
 func (kv *fakeMemoryKV) ListKeys(...nats.WatchOpt) (nats.KeyLister, error) {

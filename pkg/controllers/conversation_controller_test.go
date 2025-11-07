@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -10,8 +13,12 @@ import (
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
@@ -158,6 +165,104 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 	require.Equal(t, truncateName(record.Hash, validation.LabelValueMaxLength), value)
 }
 
+func TestStartConversationReconcilerSkipsWithoutNATSURL(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, StartConversationReconciler(context.Background(), nil, ConversationConfig{}))
+}
+
+func TestStartConversationReconcilerRequiresBucket(t *testing.T) {
+	t.Parallel()
+
+	err := StartConversationReconciler(context.Background(), nil, ConversationConfig{
+		NATSURL: "nats://example:4222",
+	})
+	require.EqualError(t, err, "conversation reconciler requires operator-kv-bucket")
+}
+
+func TestStartConversationReconcilerDialError(t *testing.T) {
+	t.Parallel()
+
+	err := StartConversationReconciler(context.Background(), &Manager{}, ConversationConfig{
+		NATSURL:  "nats://example:4222",
+		KVBucket: "conversations",
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			return nil, fmt.Errorf("dial boom")
+		},
+	})
+	require.EqualError(t, err, "connect NATS: dial boom")
+}
+
+func TestStartConversationReconcilerJetStreamErrorClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	conn := &failingConn{jetStreamErr: fmt.Errorf("js boom")}
+	cfg := ConversationConfig{
+		NATSURL:  "nats://example:4222",
+		KVBucket: "bucket",
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			return conn, nil
+		},
+	}
+
+	err := StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	require.EqualError(t, err, "jetstream context: js boom")
+	require.True(t, conn.closed.Load(), "connection should be closed on JetStream error")
+}
+
+func TestStartConversationReconcilerStartsLoopAndDrainsConnection(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	fakeApply := newFakeApply()
+	manager := &Manager{
+		apply: fakeApply,
+		Kold: &fakeKoldInterface{
+			session: sessions,
+		},
+	}
+
+	srv := runJetStreamServer(t)
+	var tracked atomic.Pointer[trackingConn]
+
+	cfg := ConversationConfig{
+		NATSURL:  srv.ClientURL(),
+		KVBucket: "conversations",
+		dialer: func(url string, opts ...nats.Option) (natsConnection, error) {
+			nc, err := nats.Connect(url, opts...)
+			if err != nil {
+				return nil, err
+			}
+			conn := newTrackingConn(nc)
+			tracked.Store(conn)
+			return conn, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, StartConversationReconciler(ctx, manager, cfg))
+
+	require.Eventually(t, func() bool {
+		return tracked.Load() != nil
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		conn := tracked.Load()
+		return conn != nil && conn.Drained()
+	}, time.Second, 10*time.Millisecond)
+}
+
 func runJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
 
@@ -181,6 +286,60 @@ func runJetStreamServer(t *testing.T) *server.Server {
 	})
 
 	return serverInstance
+}
+
+func TestEnsureConversationBucketRequiresName(t *testing.T) {
+	t.Parallel()
+
+	kv, err := ensureConversationBucket(nil, " ")
+	require.Nil(t, kv)
+	require.EqualError(t, err, "bucket name cannot be empty")
+}
+
+func TestEnsureConversationBucketReturnsExistingBucket(t *testing.T) {
+	t.Parallel()
+
+	srv := runJetStreamServer(t)
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, nc.Drain())
+	})
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	const bucket = "existing"
+	created, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: bucket})
+	require.NoError(t, err)
+	require.NotNil(t, created)
+
+	found, err := ensureConversationBucket(js, bucket)
+	require.NoError(t, err)
+	require.Equal(t, created.Bucket(), found.Bucket())
+}
+
+func TestEnsureConversationBucketCreatesBucketWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	srv := runJetStreamServer(t)
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, nc.Drain())
+	})
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	const bucket = "new-conversations"
+	kv, err := ensureConversationBucket(js, bucket)
+	require.NoError(t, err)
+	require.Equal(t, bucket, kv.Bucket())
+
+	status, err := kv.Status()
+	require.NoError(t, err)
+	require.Equal(t, bucket, status.Bucket())
 }
 
 type trackingConn struct {
@@ -217,4 +376,341 @@ func (t *trackingConn) Drain() error {
 
 func (t *trackingConn) Drained() bool {
 	return t.drained.Load()
+}
+
+func TestConversationReconcilerSyncCreatesAndDeletesSessions(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+
+	stale := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stale",
+			Namespace: "tenant-a",
+			Labels: map[string]string{
+				labelConversationHash: "other-hash",
+			},
+		},
+		Spec: v1.SessionSpec{
+			Hash: "other-hash",
+		},
+	}
+	existing := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "active",
+			Namespace: "tenant-a",
+			Labels: map[string]string{
+				labelConversationHash: "hash-123",
+			},
+		},
+		Spec: v1.SessionSpec{
+			Hash: "hash-123",
+		},
+	}
+
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return([]*v1.Session{stale, existing}, nil)
+
+	sessions.EXPECT().
+		Delete("tenant-a", "stale", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).
+		Return(nil)
+
+	kv := &fakeMemoryKV{bucket: "conversations"}
+	record := conversation.Record{
+		Hash:        "hash-123",
+		Session:     "active",
+		Namespace:   "tenant-a",
+		Model:       "model-a",
+		RootImage:   "ghcr.io/root:v1",
+		WorkerImage: "ghcr.io/worker:v1",
+	}
+	payload, err := record.Marshal()
+	require.NoError(t, err)
+	_, err = kv.Put("nats_ttl_hash-123", payload)
+	require.NoError(t, err)
+
+	fakeApply := newFakeApply()
+	logger := logrus.New().WithField("test", t.Name())
+
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			TTLPrefix: "nats_ttl_",
+		},
+		log:      logger,
+		sessions: sessions,
+		apply:    fakeApply,
+		kv:       kv,
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Len(t, fakeApply.appliedObjects, 1)
+	session, ok := fakeApply.appliedObjects[0].(*v1.Session)
+	require.True(t, ok)
+	require.Equal(t, "tenant-a", session.Namespace)
+	require.Equal(t, "active", session.Name)
+	require.Equal(t, "hash-123", session.Spec.Hash)
+}
+
+func TestConversationReconcilerSyncHandlesKeyListingError(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	sessions.EXPECT().Cache().Times(0)
+
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: errors.New("keys failure"),
+		},
+	}
+
+	reconciler.sync(context.Background())
+}
+
+func TestConversationReconcilerSyncDeletesStaleSessionsWhenNoKVRecords(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache)
+
+	stale := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stale",
+			Namespace: "tenant-a",
+		},
+		Spec: v1.SessionSpec{Hash: "hash-stale"},
+	}
+	noHash := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "noop",
+			Namespace: "tenant-a",
+		},
+	}
+
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return([]*v1.Session{stale, noHash}, nil)
+
+	sessions.EXPECT().
+		Delete("tenant-a", "stale", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).
+		Return(nil)
+
+	fakeApply := newFakeApply()
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    fakeApply,
+		kv:       &fakeMemoryKV{bucket: "conversations"},
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Empty(t, fakeApply.appliedObjects)
+}
+
+func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache)
+
+	matching := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "envtest-session",
+			Namespace: "tenant-b",
+			Labels: map[string]string{
+				labelConversationHash: "hash-valid",
+			},
+		},
+	}
+	stale := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stale-session",
+			Namespace: "tenant-b",
+		},
+		Spec: v1.SessionSpec{Hash: "hash-stale"},
+	}
+	noHash := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "no-hash",
+			Namespace: "tenant-b",
+		},
+	}
+
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return([]*v1.Session{matching, stale, noHash}, nil)
+
+	sessions.EXPECT().
+		Delete("tenant-b", "stale-session", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).
+		Return(errors.New("delete failed"))
+
+	kv := &fakeMemoryKV{
+		bucket: "conversations",
+		getErrors: map[string]error{
+			"nats_ttl_error":   errors.New("kv boom"),
+			"nats_ttl_missing": nats.ErrKeyNotFound,
+		},
+	}
+	// Non-prefixed key should be ignored.
+	_, err := kv.Put("noise", []byte("{}"))
+	require.NoError(t, err)
+
+	_, err = kv.Put("nats_ttl_error", []byte("{}"))
+	require.NoError(t, err)
+	_, err = kv.Put("nats_ttl_parsefail", []byte("not-json"))
+	require.NoError(t, err)
+
+	missing := &conversation.Record{
+		Hash:        "missing",
+		Session:     "missing-session",
+		Namespace:   "tenant-b",
+		Model:       "tenant-b/missing-model",
+		RootImage:   "root:v1",
+		WorkerImage: "worker:v1",
+	}
+	missingPayload, err := missing.Marshal()
+	require.NoError(t, err)
+	_, err = kv.Put("nats_ttl_missing", missingPayload)
+	require.NoError(t, err)
+
+	valid := &conversation.Record{
+		Hash:        "hash-valid",
+		Session:     "envtest-session",
+		Namespace:   "tenant-b",
+		Model:       "tenant-b/model-a",
+		RootImage:   "root:stable",
+		WorkerImage: "worker:stable",
+	}
+	validPayload, err := valid.Marshal()
+	require.NoError(t, err)
+	_, err = kv.Put("nats_ttl_hash-valid", validPayload)
+	require.NoError(t, err)
+
+	innerApply := newFakeApply()
+	applyErr := errors.New("apply failed")
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    &failingApply{fakeApply: innerApply, err: applyErr},
+		kv:       kv,
+	}
+
+	reconciler.sync(context.Background())
+
+	require.Len(t, innerApply.appliedObjects, 1)
+	created, ok := innerApply.appliedObjects[0].(*v1.Session)
+	require.True(t, ok)
+	require.Equal(t, valid.Namespace, created.Namespace)
+	require.Equal(t, valid.SessionName(), created.Name)
+	require.Equal(t, valid.Hash, created.Spec.Hash)
+}
+
+func TestConversationReconcilerRunDrainsConnectionOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	fakeApply := newFakeApply()
+	logger := logrus.New().WithField("test", t.Name())
+
+	kv := newSpyingKeyValue("conversations")
+	conn := newTrackingConn(nil)
+
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			PollInterval: 2 * time.Millisecond,
+		},
+		log:      logger,
+		sessions: sessions,
+		apply:    fakeApply,
+		conn:     conn,
+		kv:       kv,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+
+	go func() {
+		reconciler.run(ctx)
+		close(done)
+	}()
+
+	require.Eventually(t, func() bool {
+		return kv.keysCalls.Load() > 0
+	}, time.Second, 5*time.Millisecond)
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run did not exit after context cancellation")
+	}
+
+	require.True(t, conn.Drained())
+}
+
+type failingConn struct {
+	jetStreamErr error
+	closed       atomic.Bool
+}
+
+func (f *failingConn) JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error) {
+	return nil, f.jetStreamErr
+}
+
+func (f *failingConn) Close() {
+	f.closed.Store(true)
+}
+
+func (f *failingConn) Drain() error {
+	f.closed.Store(true)
+	return nil
+}
+
+type spyingKeyValue struct {
+	*fakeMemoryKV
+	keysCalls atomic.Int32
+}
+
+func newSpyingKeyValue(bucket string) *spyingKeyValue {
+	return &spyingKeyValue{
+		fakeMemoryKV: &fakeMemoryKV{bucket: bucket},
+	}
+}
+
+func (s *spyingKeyValue) Keys(opts ...nats.WatchOpt) ([]string, error) {
+	s.keysCalls.Add(1)
+	return s.fakeMemoryKV.Keys(opts...)
 }
