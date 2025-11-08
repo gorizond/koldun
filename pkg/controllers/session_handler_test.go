@@ -274,7 +274,6 @@ func TestSessionEnsureTopologyListError(t *testing.T) {
 }
 
 func TestSessionEnsureTopologyReconcileError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -325,7 +324,6 @@ func TestSessionEnsureTopologyReconcileError(t *testing.T) {
 }
 
 func TestSessionEnsureTopologyScalesUpWhenBacklogHasNoIdleSets(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -428,7 +426,6 @@ func TestSessionEnsureTopologyScalesUpWhenBacklogHasNoIdleSets(t *testing.T) {
 }
 
 func TestSessionEnsureTopologyScalesDownAndDeletesIdleDllama(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -455,7 +452,6 @@ func TestSessionEnsureTopologyScalesDownAndDeletesIdleDllama(t *testing.T) {
 }
 
 func TestSessionEnsureTopologyScaleDownDeleteError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -482,7 +478,6 @@ func TestSessionEnsureTopologyScaleDownDeleteError(t *testing.T) {
 }
 
 func TestSessionEnsureTopologyCreateDllamaError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -531,7 +526,6 @@ func TestSessionEnsureTopologyCreateDllamaError(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherSkipsWithoutQueue(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -873,7 +867,6 @@ func TestSessionEnsureStatusMarksWorkerUnhealthyWhenHealthChecksFail(t *testing.
 }
 
 func TestSessionCreateDllamaForSessionCreateError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -906,7 +899,6 @@ func TestSessionCreateDllamaForSessionCreateError(t *testing.T) {
 }
 
 func TestSessionCreateDllamaForSessionCreateErrorRequeuesEachAttempt(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -942,7 +934,6 @@ func TestSessionCreateDllamaForSessionCreateErrorRequeuesEachAttempt(t *testing.
 }
 
 func TestSessionCreateDllamaForSessionCreateAlreadyExists(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -976,7 +967,6 @@ func TestSessionCreateDllamaForSessionCreateAlreadyExists(t *testing.T) {
 }
 
 func TestSessionCreateDllamaForSessionUpdateError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1022,7 +1012,6 @@ func TestSessionCreateDllamaForSessionUpdateError(t *testing.T) {
 }
 
 func TestSessionCreateDllamaForSessionUpdateNotFoundIgnored(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1066,7 +1055,6 @@ func TestSessionCreateDllamaForSessionUpdateNotFoundIgnored(t *testing.T) {
 }
 
 func TestSessionReconcileDllamaUpdateNotFoundIgnored(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1118,7 +1106,6 @@ func TestSessionReconcileDllamaUpdateNotFoundIgnored(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherMissingImage(t *testing.T) {
-	t.Parallel()
 
 	handler := &sessionHandler{
 		apply: newFakeApply(),
@@ -1151,7 +1138,6 @@ func TestSessionEnsureDispatcherMissingImage(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherSkipsWithoutNATS(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -1182,7 +1168,6 @@ func TestSessionEnsureDispatcherSkipsWithoutNATS(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherSkipsWithBlankNATSURL(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -1216,7 +1201,6 @@ func TestSessionEnsureDispatcherSkipsWithBlankNATSURL(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherSkipsWithIncompleteQueue(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -1250,7 +1234,6 @@ func TestSessionEnsureDispatcherSkipsWithIncompleteQueue(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherApplyError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1292,7 +1275,6 @@ func TestSessionEnsureDispatcherApplyError(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherApplyErrorRequeuesEachAttempt(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1337,7 +1319,6 @@ func TestSessionEnsureDispatcherApplyErrorRequeuesEachAttempt(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherHonorsAckTimeout(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -1381,7 +1362,6 @@ func TestSessionEnsureDispatcherHonorsAckTimeout(t *testing.T) {
 }
 
 func TestSessionEnsureDispatcherUsesStateStreamAndRootImageFallback(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &sessionHandler{
@@ -1507,7 +1487,6 @@ func sessionScaleDownFixtures() (*v1.Session, []*v1.Dllama) {
 }
 
 func TestSessionDeleteDllamaPropagatesError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)

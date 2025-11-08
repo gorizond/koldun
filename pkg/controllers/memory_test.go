@@ -114,7 +114,6 @@ func TestRootMemoryOverheadRatio(t *testing.T) {
 }
 
 func TestRootMemoryOverheadRatioDecayCurve(t *testing.T) {
-	t.Parallel()
 
 	ratioTwo := rootMemoryOverheadRatio(2, nil)
 	ratioFive := rootMemoryOverheadRatio(5, nil)
@@ -360,7 +359,6 @@ func TestCalculateMemoryRequests_Format(t *testing.T) {
 }
 
 func TestFormatFloatPtr(t *testing.T) {
-	t.Parallel()
 
 	if got := formatFloatPtr(nil); got != "nil" {
 		t.Errorf("formatFloatPtr(nil) = %q, want %q", got, "nil")

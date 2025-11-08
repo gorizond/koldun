@@ -24,7 +24,6 @@ import (
 )
 
 func TestEnsureSessionValidatesRecord(t *testing.T) {
-	t.Parallel()
 
 	base := conversation.Record{
 		Hash:        "hash",
@@ -166,13 +165,11 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 }
 
 func TestStartConversationReconcilerSkipsWithoutNATSURL(t *testing.T) {
-	t.Parallel()
 
 	require.NoError(t, StartConversationReconciler(context.Background(), nil, ConversationConfig{}))
 }
 
 func TestStartConversationReconcilerRequiresBucket(t *testing.T) {
-	t.Parallel()
 
 	err := StartConversationReconciler(context.Background(), nil, ConversationConfig{
 		NATSURL: "nats://example:4222",
@@ -181,7 +178,6 @@ func TestStartConversationReconcilerRequiresBucket(t *testing.T) {
 }
 
 func TestStartConversationReconcilerDialError(t *testing.T) {
-	t.Parallel()
 
 	err := StartConversationReconciler(context.Background(), &Manager{}, ConversationConfig{
 		NATSURL:  "nats://example:4222",
@@ -194,7 +190,6 @@ func TestStartConversationReconcilerDialError(t *testing.T) {
 }
 
 func TestStartConversationReconcilerJetStreamErrorClosesConnection(t *testing.T) {
-	t.Parallel()
 
 	conn := &failingConn{jetStreamErr: fmt.Errorf("js boom")}
 	cfg := ConversationConfig{
@@ -211,7 +206,6 @@ func TestStartConversationReconcilerJetStreamErrorClosesConnection(t *testing.T)
 }
 
 func TestStartConversationReconcilerStartsLoopAndDrainsConnection(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -289,7 +283,6 @@ func runJetStreamServer(t *testing.T) *server.Server {
 }
 
 func TestEnsureConversationBucketRequiresName(t *testing.T) {
-	t.Parallel()
 
 	kv, err := ensureConversationBucket(nil, " ")
 	require.Nil(t, kv)
@@ -297,7 +290,6 @@ func TestEnsureConversationBucketRequiresName(t *testing.T) {
 }
 
 func TestEnsureConversationBucketReturnsExistingBucket(t *testing.T) {
-	t.Parallel()
 
 	srv := runJetStreamServer(t)
 	nc, err := nats.Connect(srv.ClientURL())
@@ -320,7 +312,6 @@ func TestEnsureConversationBucketReturnsExistingBucket(t *testing.T) {
 }
 
 func TestEnsureConversationBucketCreatesBucketWhenMissing(t *testing.T) {
-	t.Parallel()
 
 	srv := runJetStreamServer(t)
 	nc, err := nats.Connect(srv.ClientURL())
@@ -379,7 +370,6 @@ func (t *trackingConn) Drained() bool {
 }
 
 func TestConversationReconcilerSyncCreatesAndDeletesSessions(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -459,7 +449,6 @@ func TestConversationReconcilerSyncCreatesAndDeletesSessions(t *testing.T) {
 }
 
 func TestConversationReconcilerSyncHandlesKeyListingError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -482,7 +471,6 @@ func TestConversationReconcilerSyncHandlesKeyListingError(t *testing.T) {
 }
 
 func TestConversationReconcilerSyncDeletesStaleSessionsWhenNoKVRecords(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -528,7 +516,6 @@ func TestConversationReconcilerSyncDeletesStaleSessionsWhenNoKVRecords(t *testin
 }
 
 func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -631,7 +618,6 @@ func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *
 }
 
 func TestConversationReconcilerRunDrainsConnectionOnContextCancel(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)

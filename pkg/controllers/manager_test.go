@@ -19,7 +19,6 @@ import (
 )
 
 func TestManagerHelpers(t *testing.T) {
-	t.Parallel()
 
 	fake := newFakeApply()
 	manager := &Manager{

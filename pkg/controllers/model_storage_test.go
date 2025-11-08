@@ -364,7 +364,6 @@ func TestConversionPaths(t *testing.T) {
 }
 
 func TestModelObjectKeyHandlesBucketOnlyURI(t *testing.T) {
-	t.Parallel()
 
 	model := &v1.Model{
 		Spec: v1.ModelSpec{
@@ -376,7 +375,6 @@ func TestModelObjectKeyHandlesBucketOnlyURI(t *testing.T) {
 }
 
 func TestConversionPathsWithoutObjectStorageDefaults(t *testing.T) {
-	t.Parallel()
 
 	model := &v1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: "tiny-llm"},
@@ -395,7 +393,6 @@ func TestConversionPathsWithoutObjectStorageDefaults(t *testing.T) {
 }
 
 func TestSplitKeyEdgeCases(t *testing.T) {
-	t.Parallel()
 
 	tests := []struct {
 		name  string
@@ -461,7 +458,6 @@ func (f *fakeMinioClient) MakeBucket(ctx context.Context, bucket string, opts mi
 }
 
 func TestEnsureObjectStorageBuckets_EarlyExit(t *testing.T) {
-	t.Parallel()
 
 	model := &v1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
@@ -511,7 +507,6 @@ func TestEnsureObjectStorageBuckets_EarlyExit(t *testing.T) {
 }
 
 func TestEnsureObjectStorageBuckets_SecretErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -557,7 +552,6 @@ func TestEnsureObjectStorageBuckets_SecretErrors(t *testing.T) {
 }
 
 func TestEnsureObjectStorageBuckets_SecretNamespaceFallbackAndInsecureEndpoint(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -602,7 +596,6 @@ func TestEnsureObjectStorageBuckets_SecretNamespaceFallbackAndInsecureEndpoint(t
 }
 
 func TestEnsureObjectStorageBuckets_RegionPropagatedToClient(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -649,7 +642,6 @@ func TestEnsureObjectStorageBuckets_RegionPropagatedToClient(t *testing.T) {
 }
 
 func TestEnsureObjectStorageBuckets_ClientInteractions(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -769,7 +761,6 @@ func TestEnsureObjectStorageBuckets_ClientInteractions(t *testing.T) {
 }
 
 func TestEnsureObjectStorageBuckets_EndpointErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -826,7 +817,6 @@ func TestEnsureObjectStorageBuckets_EndpointErrors(t *testing.T) {
 }
 
 func TestDefaultMinioFactory(t *testing.T) {
-	t.Parallel()
 
 	client, err := defaultMinioFactory("play.min.io", &minio.Options{Secure: true})
 	require.NoError(t, err)

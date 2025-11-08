@@ -12,7 +12,6 @@ import (
 )
 
 func TestDesiredWorkersFallsBackToIngressNATS(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -56,7 +55,6 @@ func TestDesiredWorkersFallsBackToIngressNATS(t *testing.T) {
 }
 
 func TestDesiredWorkersUsesExistingNATSConfigWhenURLPresent(t *testing.T) {
-	t.Parallel()
 
 	dllama := &v1.Dllama{
 		ObjectMeta: metav1.ObjectMeta{
@@ -83,7 +81,6 @@ func TestDesiredWorkersUsesExistingNATSConfigWhenURLPresent(t *testing.T) {
 }
 
 func TestDesiredWorkersPopulatesAnnotationsFromIngressWhenAnnotationsEmpty(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)

@@ -14,7 +14,6 @@ import (
 )
 
 func TestControllerStubTriggerChange(t *testing.T) {
-	t.Parallel()
 
 	stub := newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{Group: v1.GroupName, Version: v1.Version, Kind: "Model"})
 	model := &v1.Model{}
@@ -32,7 +31,6 @@ func TestControllerStubTriggerChange(t *testing.T) {
 }
 
 func TestControllerStubTriggerChangeWithoutHandler(t *testing.T) {
-	t.Parallel()
 
 	stub := newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{})
 	result, err := stub.triggerChange("models/mistral", &v1.Model{})
@@ -41,7 +39,6 @@ func TestControllerStubTriggerChangeWithoutHandler(t *testing.T) {
 }
 
 func TestControllerStubTriggerRemove(t *testing.T) {
-	t.Parallel()
 
 	stub := newControllerStub[*v1.Model, *v1.ModelList](schema.GroupVersionKind{})
 	var removed bool
@@ -63,7 +60,6 @@ func TestControllerStubTriggerRemove(t *testing.T) {
 }
 
 func TestControllerStubNoopMethods(t *testing.T) {
-	t.Parallel()
 
 	gvk := schema.GroupVersionKind{Group: v1.GroupName, Version: v1.Version, Kind: "Model"}
 	stub := newControllerStub[*v1.Model, *v1.ModelList](gvk)
