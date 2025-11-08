@@ -19,7 +19,6 @@ import (
 )
 
 func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -147,7 +146,6 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusInitializesNilConditions(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -200,7 +198,6 @@ func TestWorkerHandlerEnsureStatusInitializesNilConditions(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusStatefulSetNotFound(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -246,7 +243,6 @@ func TestWorkerHandlerEnsureStatusStatefulSetNotFound(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusPartiallyReadyReplicas(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -297,7 +293,6 @@ func TestWorkerHandlerEnsureStatusPartiallyReadyReplicas(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusNilReplicas(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -348,7 +343,6 @@ func TestWorkerHandlerEnsureStatusNilReplicas(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetUsesModelMemoryPlan(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -434,7 +428,6 @@ func TestWorkerHandlerEnsureStatefulSetUsesModelMemoryPlan(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetPropagatesDllamaErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -468,7 +461,6 @@ func TestWorkerHandlerEnsureStatefulSetPropagatesDllamaErrors(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusMarksReady(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -521,7 +513,6 @@ func TestWorkerHandlerEnsureStatusMarksReady(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusNoopWhenUnchanged(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -572,7 +563,6 @@ func TestWorkerHandlerEnsureStatusNoopWhenUnchanged(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatusPropagatesUpdateErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -652,7 +642,6 @@ func requireCondition(t *testing.T, conditions []metav1.Condition, expected meta
 }
 
 func TestWorkerHandlerOnChangeSuccess(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -720,7 +709,6 @@ func TestWorkerHandlerOnChangeSuccess(t *testing.T) {
 }
 
 func TestWorkerHandlerOnChangeNilWorker(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -733,7 +721,6 @@ func TestWorkerHandlerOnChangeNilWorker(t *testing.T) {
 }
 
 func TestWorkerHandlerOnChangeDeletionTimestamp(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -755,7 +742,6 @@ func TestWorkerHandlerOnChangeDeletionTimestamp(t *testing.T) {
 }
 
 func TestWorkerHandlerOnChangeEnsureStatefulSetError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -799,7 +785,6 @@ func TestWorkerHandlerOnChangeEnsureStatefulSetError(t *testing.T) {
 }
 
 func TestWorkerHandlerOnChangeEnsureStatusError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -862,7 +847,6 @@ func TestWorkerHandlerOnChangeEnsureStatusError(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetWithConversationHash(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -915,7 +899,6 @@ func TestWorkerHandlerEnsureStatefulSetWithConversationHash(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetWithoutDllamaLabel(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -959,7 +942,6 @@ func TestWorkerHandlerEnsureStatefulSetWithoutDllamaLabel(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetReplicasZeroOrNegative(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1014,7 +996,6 @@ func TestWorkerHandlerEnsureStatefulSetReplicasZeroOrNegative(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetThreadsZeroOrNegative(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1068,7 +1049,6 @@ func TestWorkerHandlerEnsureStatefulSetThreadsZeroOrNegative(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetModelCacheError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1124,7 +1104,6 @@ func TestWorkerHandlerEnsureStatefulSetModelCacheError(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetEmptyModelName(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1186,7 +1165,6 @@ func TestWorkerHandlerEnsureStatefulSetEmptyModelName(t *testing.T) {
 }
 
 func TestWorkerHandlerEnsureStatefulSetEmptyConversionSizeHuman(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1262,7 +1240,6 @@ func TestWorkerHandlerEnsureStatefulSetEmptyConversionSizeHuman(t *testing.T) {
 
 // TestWorkerContainer tests the workerContainer function
 func TestWorkerContainer(t *testing.T) {
-	t.Parallel()
 
 	tests := []struct {
 		name      string
@@ -1647,7 +1624,6 @@ func TestWorkerContainer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 
 			handler := &workerHandler{}
 			container := handler.workerContainer(tt.worker, tt.threads, tt.resources)

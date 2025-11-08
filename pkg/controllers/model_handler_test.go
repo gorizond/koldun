@@ -25,7 +25,6 @@ import (
 )
 
 func TestModelHandlerOnRelatedJobDeletion(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -41,7 +40,6 @@ func TestModelHandlerOnRelatedJobDeletion(t *testing.T) {
 }
 
 func TestModelHandlerOnRelatedJobStatusChange(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -69,7 +67,6 @@ func TestModelHandlerOnRelatedJobStatusChange(t *testing.T) {
 }
 
 func TestModelHandlerOnRelatedJobIgnoresNonModel(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -102,7 +99,6 @@ func TestModelHandlerOnRelatedJobIgnoresNonModel(t *testing.T) {
 }
 
 func TestModelHandlerShouldEnqueueModelForJob(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	job := &batchv1.Job{
@@ -134,7 +130,6 @@ func TestModelHandlerShouldEnqueueModelForJob(t *testing.T) {
 }
 
 func TestModelHandlerEnsureMetadataUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -153,7 +148,6 @@ func TestModelHandlerEnsureMetadataUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureMetadataFallsBackToConfigMap(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &modelHandler{
@@ -179,7 +173,6 @@ func TestModelHandlerEnsureMetadataFallsBackToConfigMap(t *testing.T) {
 }
 
 func TestModelHandlerEnsureScriptUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -198,7 +191,6 @@ func TestModelHandlerEnsureScriptUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureScriptFallsBackToConfigMap(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	handler := &modelHandler{
@@ -224,7 +216,6 @@ func TestModelHandlerEnsureScriptFallsBackToConfigMap(t *testing.T) {
 }
 
 func TestModelHandlerEnsureDownloadUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -243,7 +234,6 @@ func TestModelHandlerEnsureDownloadUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureDownloadFallsBackGracefully(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{
 		ensureDownloadJobFn: nil,
@@ -255,7 +245,6 @@ func TestModelHandlerEnsureDownloadFallsBackGracefully(t *testing.T) {
 }
 
 func TestModelHandlerEnsureConversionUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -274,7 +263,6 @@ func TestModelHandlerEnsureConversionUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureConversionFallbackQuickly(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{
 		ensureConversionFn: nil,
@@ -286,7 +274,6 @@ func TestModelHandlerEnsureConversionFallbackQuickly(t *testing.T) {
 }
 
 func TestModelHandlerEnsureDownloadFallbackPropagatesApplyError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -329,7 +316,6 @@ func TestModelHandlerEnsureDownloadFallbackPropagatesApplyError(t *testing.T) {
 }
 
 func TestModelHandlerEnsureConversionFallbackPropagatesApplyError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -377,7 +363,6 @@ func TestModelHandlerEnsureConversionFallbackPropagatesApplyError(t *testing.T) 
 }
 
 func TestModelHandlerEnsureBucketsUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -396,7 +381,6 @@ func TestModelHandlerEnsureBucketsUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureBucketsFallbackPropagatesSecretError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -434,7 +418,6 @@ func TestModelHandlerEnsureBucketsFallbackPropagatesSecretError(t *testing.T) {
 }
 
 func TestModelHandlerEnsureSizingUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -450,7 +433,6 @@ func TestModelHandlerEnsureSizingUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureSizingFallbackPropagatesApplyError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -495,7 +477,6 @@ func TestModelHandlerEnsureSizingFallbackPropagatesApplyError(t *testing.T) {
 }
 
 func TestModelHandlerEnsureStatusUpdateUsesOverride(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	model := &v1.Model{}
@@ -514,7 +495,6 @@ func TestModelHandlerEnsureStatusUpdateUsesOverride(t *testing.T) {
 }
 
 func TestModelHandlerEnsureStatusUpdateFallsBackToEnsureStatus(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -549,7 +529,6 @@ func TestModelHandlerEnsureStatusUpdateFallsBackToEnsureStatus(t *testing.T) {
 }
 
 func TestModelHandlerOnChangeRunsEnsureSequence(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	obj := &v1.Model{ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"}}
@@ -582,7 +561,6 @@ func TestModelHandlerOnChangeRunsEnsureSequence(t *testing.T) {
 }
 
 func TestModelHandlerOnChangeHandlesNilAndDeletion(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	result, err := handler.onChange("", nil)
@@ -600,7 +578,6 @@ func TestModelHandlerOnChangeHandlesNilAndDeletion(t *testing.T) {
 }
 
 func TestModelHandlerOnChangeHandlesEnsureScriptError(t *testing.T) {
-	t.Parallel()
 
 	sentinel := errors.New("script ensure failed")
 	handler := &modelHandler{}
@@ -631,7 +608,6 @@ func TestModelHandlerOnChangeHandlesEnsureScriptError(t *testing.T) {
 }
 
 func TestModelHandlerOnChangePropagatesErrors(t *testing.T) {
-	t.Parallel()
 
 	sentinel := errors.New("ensure failure")
 	handler := &modelHandler{}
@@ -644,7 +620,6 @@ func TestModelHandlerOnChangePropagatesErrors(t *testing.T) {
 }
 
 func TestModelHandlerOnChangeLogsFailuresPerStage(t *testing.T) {
-	t.Parallel()
 
 	testCases := []struct {
 		name  string
@@ -704,7 +679,6 @@ func TestModelHandlerOnChangeLogsFailuresPerStage(t *testing.T) {
 }
 
 func TestModelHandlerOnRemoveDeletesVolumes(t *testing.T) {
-	t.Parallel()
 
 	pvcs := newTrackingPVCController()
 	pvs := newTrackingPVController()
@@ -719,7 +693,6 @@ func TestModelHandlerOnRemoveDeletesVolumes(t *testing.T) {
 }
 
 func TestModelHandlerOnRemoveHandlesNilObject(t *testing.T) {
-	t.Parallel()
 
 	handler := &modelHandler{}
 	result, err := handler.onRemove("models/mistral", nil)
@@ -728,7 +701,6 @@ func TestModelHandlerOnRemoveHandlesNilObject(t *testing.T) {
 }
 
 func TestModelHandlerOnRemoveIgnoresDeleteErrors(t *testing.T) {
-	t.Parallel()
 
 	pvcs := newTrackingPVCController()
 	pvcs.deleteErr = assert.AnError

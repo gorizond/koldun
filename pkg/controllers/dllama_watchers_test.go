@@ -13,7 +13,6 @@ import (
 )
 
 func TestDllamaHandlerOnRelatedRoot(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -38,7 +37,6 @@ func TestDllamaHandlerOnRelatedRoot(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedRootNil(t *testing.T) {
-	t.Parallel()
 
 	handler := &dllamaHandler{}
 	result, err := handler.onRelatedRoot("models/mistral-root", nil)
@@ -47,7 +45,6 @@ func TestDllamaHandlerOnRelatedRootNil(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedWorker(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -72,7 +69,6 @@ func TestDllamaHandlerOnRelatedWorker(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedWorkerNil(t *testing.T) {
-	t.Parallel()
 
 	handler := &dllamaHandler{}
 	result, err := handler.onRelatedWorker("models/mistral-worker", nil)
@@ -81,7 +77,6 @@ func TestDllamaHandlerOnRelatedWorkerNil(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedStatefulSet(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -106,7 +101,6 @@ func TestDllamaHandlerOnRelatedStatefulSet(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedStatefulSetMissingLabel(t *testing.T) {
-	t.Parallel()
 
 	handler := &dllamaHandler{}
 	sts := &appsv1.StatefulSet{
@@ -121,7 +115,6 @@ func TestDllamaHandlerOnRelatedStatefulSetMissingLabel(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedStatefulSetNil(t *testing.T) {
-	t.Parallel()
 
 	handler := &dllamaHandler{}
 	result, err := handler.onRelatedStatefulSet("models/mistral", nil)
@@ -130,10 +123,8 @@ func TestDllamaHandlerOnRelatedStatefulSetNil(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedModel(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues referenced dllamas", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -172,7 +163,6 @@ func TestDllamaHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("handles nil object via key when list fails", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -191,7 +181,6 @@ func TestDllamaHandlerOnRelatedModel(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedModelIgnoresInvalidKey(t *testing.T) {
-	t.Parallel()
 
 	handler := &dllamaHandler{}
 	result, err := handler.onRelatedModel("garbage-key", nil)
@@ -200,7 +189,6 @@ func TestDllamaHandlerOnRelatedModelIgnoresInvalidKey(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedIngress(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -225,7 +213,6 @@ func TestDllamaHandlerOnRelatedIngress(t *testing.T) {
 }
 
 func TestDllamaHandlerOnRelatedIngressError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)

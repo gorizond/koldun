@@ -331,7 +331,6 @@ func TestModelHandler_ConversionArgs(t *testing.T) {
 }
 
 func TestModelHandlerBuildDownloadContainerWithSecrets(t *testing.T) {
-	t.Parallel()
 
 	h := &modelHandler{}
 	model := &v1.Model{
@@ -378,7 +377,6 @@ func TestModelHandlerBuildDownloadContainerWithSecrets(t *testing.T) {
 }
 
 func TestModelHandlerBuildDownloadContainerSkipsCrossNamespaceSecrets(t *testing.T) {
-	t.Parallel()
 
 	h := &modelHandler{}
 	model := &v1.Model{
@@ -411,7 +409,6 @@ func TestModelHandlerBuildDownloadContainerSkipsCrossNamespaceSecrets(t *testing
 }
 
 func TestModelHandlerBuildConversionContainerDefaults(t *testing.T) {
-	t.Parallel()
 
 	h := &modelHandler{}
 	model := &v1.Model{
@@ -455,7 +452,6 @@ func TestModelHandlerBuildConversionContainerDefaults(t *testing.T) {
 }
 
 func TestModelHandlerBuildConversionContainerCustomCommand(t *testing.T) {
-	t.Parallel()
 
 	h := &modelHandler{}
 	model := &v1.Model{

@@ -19,8 +19,6 @@ import (
 )
 
 func TestEnsureLabels(t *testing.T) {
-	t.Parallel()
-
 	meta := &metav1.ObjectMeta{}
 
 	require.False(t, ensureLabels(meta, nil))
@@ -38,8 +36,6 @@ func TestEnsureLabels(t *testing.T) {
 }
 
 func TestEnsureAnnotations(t *testing.T) {
-	t.Parallel()
-
 	meta := &metav1.ObjectMeta{}
 
 	require.False(t, ensureAnnotations(meta, nil))
@@ -55,16 +51,12 @@ func TestEnsureAnnotations(t *testing.T) {
 }
 
 func TestEnsureTrailingDotHelper(t *testing.T) {
-	t.Parallel()
-
 	require.Equal(t, "", ensureTrailingDot(""))
 	require.Equal(t, "prefix.", ensureTrailingDot("prefix"))
 	require.Equal(t, "subject.", ensureTrailingDot("subject."))
 }
 
 func TestSanitizeIdentifier(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		name string
 		in   string
@@ -86,16 +78,12 @@ func TestSanitizeIdentifier(t *testing.T) {
 }
 
 func TestResourceSessionKey(t *testing.T) {
-	t.Parallel()
-
 	require.Equal(t, "", resourceSessionKey("", "ns", "name"))
 	require.Equal(t, "", resourceSessionKey(resourceDllama, "ns", ""))
 	require.Equal(t, "dllama/ns/name", resourceSessionKey(resourceDllama, "ns", "name"))
 }
 
 func TestTrackAndPopResourceSession(t *testing.T) {
-	t.Parallel()
-
 	handler := &sessionHandler{resourceSessions: map[string]string{}}
 
 	handler.trackResourceSession(resourceDllama, "ns", "name", "session")
@@ -108,7 +96,6 @@ func TestTrackAndPopResourceSession(t *testing.T) {
 }
 
 func TestSplitNamespaceName(t *testing.T) {
-	t.Parallel()
 
 	ns, name := splitNamespaceName("sessions/demo")
 	require.Equal(t, "sessions", ns)
@@ -124,7 +111,6 @@ func TestSplitNamespaceName(t *testing.T) {
 }
 
 func TestGuessSessionNameHelpers(t *testing.T) {
-	t.Parallel()
 
 	require.Equal(t, "demo", guessSessionFromDllamaName("demo-dllama-0"))
 	require.Equal(t, "", guessSessionFromDllamaName("dllama-only"))
@@ -135,7 +121,6 @@ func TestGuessSessionNameHelpers(t *testing.T) {
 }
 
 func TestEnsureOwnerReference(t *testing.T) {
-	t.Parallel()
 
 	sess := &v1.Session{
 		ObjectMeta: metav1.ObjectMeta{
@@ -182,7 +167,6 @@ func TestEnsureOwnerReference(t *testing.T) {
 }
 
 func TestSessionHandlerEnqueueSession(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -208,7 +192,6 @@ func TestSessionHandlerEnqueueSession(t *testing.T) {
 }
 
 func TestDeleteDllama(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -245,7 +228,6 @@ func TestDeleteDllama(t *testing.T) {
 }
 
 func TestSessionHandlerOnRelatedDllama(t *testing.T) {
-	t.Parallel()
 
 	t.Run("delete uses tracked session", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -310,7 +292,6 @@ func TestSessionHandlerOnRelatedDllama(t *testing.T) {
 }
 
 func TestSessionHandlerOnRelatedRoot(t *testing.T) {
-	t.Parallel()
 
 	t.Run("delete guesses session from name", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -375,7 +356,6 @@ func TestSessionHandlerOnRelatedRoot(t *testing.T) {
 }
 
 func TestSessionHandlerOnRelatedWorker(t *testing.T) {
-	t.Parallel()
 
 	t.Run("delete guesses session from name", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -440,7 +420,6 @@ func TestSessionHandlerOnRelatedWorker(t *testing.T) {
 }
 
 func TestSessionHandlerLookupRootEndpoint(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -461,7 +440,6 @@ func TestSessionHandlerLookupRootEndpoint(t *testing.T) {
 }
 
 func TestSessionHandlerCheckHealth(t *testing.T) {
-	t.Parallel()
 
 	handler := &sessionHandler{
 		ctx: context.Background(),

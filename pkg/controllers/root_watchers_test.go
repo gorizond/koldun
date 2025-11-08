@@ -14,10 +14,8 @@ import (
 )
 
 func TestRootHandlerOnRelatedService(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues root service", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -43,7 +41,6 @@ func TestRootHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("ignores unrelated service", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -68,7 +65,6 @@ func TestRootHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("nil service returns nil", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -84,7 +80,6 @@ func TestRootHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("root component without name label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -110,10 +105,8 @@ func TestRootHandlerOnRelatedService(t *testing.T) {
 }
 
 func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
-	t.Parallel()
 
 	t.Run("root statefulset enqueues by root label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -139,7 +132,6 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("worker statefulset enqueues derived root", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -165,7 +157,6 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("root statefulset falls back to object name", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -191,7 +182,6 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("worker statefulset without dllama label ignored", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -216,7 +206,6 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("ignores unrelated component", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -241,7 +230,6 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("nil object returns nil", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -258,10 +246,8 @@ func TestRootHandlerOnRelatedStatefulSet(t *testing.T) {
 }
 
 func TestRootHandlerOnRelatedWorker(t *testing.T) {
-	t.Parallel()
 
 	t.Run("prefers explicit root reference", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -286,7 +272,6 @@ func TestRootHandlerOnRelatedWorker(t *testing.T) {
 	})
 
 	t.Run("falls back to dllama label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -311,7 +296,6 @@ func TestRootHandlerOnRelatedWorker(t *testing.T) {
 	})
 
 	t.Run("ignores worker without references", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -333,7 +317,6 @@ func TestRootHandlerOnRelatedWorker(t *testing.T) {
 	})
 
 	t.Run("nil worker returns nil", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -350,10 +333,8 @@ func TestRootHandlerOnRelatedWorker(t *testing.T) {
 }
 
 func TestRootHandlerOnRelatedDllama(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues derived root name", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -376,7 +357,6 @@ func TestRootHandlerOnRelatedDllama(t *testing.T) {
 	})
 
 	t.Run("falls back to key when object nil", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -392,7 +372,6 @@ func TestRootHandlerOnRelatedDllama(t *testing.T) {
 	})
 
 	t.Run("ignores invalid key", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -409,10 +388,8 @@ func TestRootHandlerOnRelatedDllama(t *testing.T) {
 }
 
 func TestRootHandlerOnRelatedModel(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues roots for referencing dllamas", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -469,7 +446,6 @@ func TestRootHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("returns error when listing dllamas fails", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -492,7 +468,6 @@ func TestRootHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("ignores invalid keys", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)

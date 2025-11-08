@@ -18,7 +18,6 @@ import (
 )
 
 func TestModelKey(t *testing.T) {
-	t.Parallel()
 
 	require.Equal(t, "default/model", modelKey(" ", "model"))
 	require.Equal(t, "ns/demo", modelKey("ns", " demo "))
@@ -76,7 +75,6 @@ func TestEnsureBucketCreatesAndReuses(t *testing.T) {
 }
 
 func TestIgnoreNotFound(t *testing.T) {
-	t.Parallel()
 
 	require.NoError(t, ignoreNotFound(nil))
 	require.NoError(t, ignoreNotFound(nats.ErrKeyNotFound))
@@ -86,7 +84,6 @@ func TestIgnoreNotFound(t *testing.T) {
 }
 
 func TestModelReady(t *testing.T) {
-	t.Parallel()
 
 	readyCondition := metav1.Condition{Type: conditionReady, Status: metav1.ConditionTrue}
 
@@ -157,14 +154,12 @@ func TestModelReady(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
 			require.Equal(t, tt.ready, modelReady(tt.model))
 		})
 	}
 }
 
 func TestRegistrySyncPutModelAndDelete(t *testing.T) {
-	t.Parallel()
 
 	kv := &fakeMemoryKV{
 		payload: make(map[string][]byte),
@@ -200,7 +195,6 @@ func TestRegistrySyncPutModelAndDelete(t *testing.T) {
 }
 
 func TestRegistrySyncPutModelHandlesKVErrors(t *testing.T) {
-	t.Parallel()
 
 	kv := &fakeMemoryKV{putErr: errors.New("kv failure")}
 
@@ -227,7 +221,6 @@ func TestRegistrySyncPutModelHandlesMarshalErrors(t *testing.T) {
 }
 
 func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
-	t.Parallel()
 
 	kv := &fakeMemoryKV{
 		payload: make(map[string][]byte),
@@ -256,7 +249,6 @@ func TestRegistrySyncPutTokenAndDelete(t *testing.T) {
 }
 
 func TestRegistrySyncPutTokenHandlesKVErrors(t *testing.T) {
-	t.Parallel()
 
 	kv := &fakeMemoryKV{putErr: errors.New("kv failure")}
 
@@ -284,7 +276,6 @@ func TestRegistrySyncPutTokenHandlesMarshalErrors(t *testing.T) {
 }
 
 func TestRegistrySyncPutTokenRejectsInvalidHash(t *testing.T) {
-	t.Parallel()
 
 	sync := &registrySync{
 		cfg:      RegistryConfig{TokenPrefix: "token/"},
@@ -301,7 +292,6 @@ func TestRegistrySyncPutTokenRejectsInvalidHash(t *testing.T) {
 }
 
 func TestRegistrySyncDeleteTokenSkipsInvalidHash(t *testing.T) {
-	t.Parallel()
 
 	kv := &fakeMemoryKV{
 		payload: make(map[string][]byte),
@@ -318,7 +308,6 @@ func TestRegistrySyncDeleteTokenSkipsInvalidHash(t *testing.T) {
 }
 
 func TestRegistrySyncOnModelChange(t *testing.T) {
-	t.Parallel()
 
 	t.Run("nil model ignored", func(t *testing.T) {
 		sync := &registrySync{}
@@ -448,7 +437,6 @@ func TestRegistrySyncOnModelChange(t *testing.T) {
 }
 
 func TestRegistrySyncOnModelRemove(t *testing.T) {
-	t.Parallel()
 
 	sync := &registrySync{
 		cfg: RegistryConfig{ModelPrefix: "model/"},
@@ -498,7 +486,6 @@ func TestRegistrySyncOnModelRemoveHandlesDeleteErrors(t *testing.T) {
 }
 
 func TestRegistrySyncOnSecretChange(t *testing.T) {
-	t.Parallel()
 
 	t.Run("non token secret removes hash", func(t *testing.T) {
 		kv := &fakeMemoryKV{

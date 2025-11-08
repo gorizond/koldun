@@ -156,7 +156,6 @@ func TestHasCondition(t *testing.T) {
 }
 
 func TestCollectSizeMeasurement(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1086,7 +1085,6 @@ func TestEnsureStatusConversionJobMissingAwaitingJob(t *testing.T) {
 }
 
 func TestEnsureStatusSizingHistoricalStateHandling(t *testing.T) {
-	t.Parallel()
 
 	cases := []struct {
 		name            string
@@ -1223,7 +1221,6 @@ func TestEnsureStatusSizingHistoricalStateHandling(t *testing.T) {
 }
 
 func TestEnsureStatusSizingMeasurementFallbacks(t *testing.T) {
-	t.Parallel()
 
 	type expectation struct {
 		reason string

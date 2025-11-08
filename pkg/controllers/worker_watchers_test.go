@@ -14,10 +14,8 @@ import (
 )
 
 func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues worker by label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -43,7 +41,6 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("ignores non-worker statefulset", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -66,7 +63,6 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("ignores worker statefulset without name label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -91,7 +87,6 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 	})
 
 	t.Run("returns nil for nil object", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -108,10 +103,8 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 }
 
 func TestWorkerHandlerOnRelatedService(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues worker by label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -137,7 +130,6 @@ func TestWorkerHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("ignores non-worker service", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -160,7 +152,6 @@ func TestWorkerHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("ignores worker service without name label", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -185,7 +176,6 @@ func TestWorkerHandlerOnRelatedService(t *testing.T) {
 	})
 
 	t.Run("returns nil for nil object", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -202,10 +192,8 @@ func TestWorkerHandlerOnRelatedService(t *testing.T) {
 }
 
 func TestWorkerHandlerOnRelatedDllama(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues all workers sorted by name", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -239,7 +227,6 @@ func TestWorkerHandlerOnRelatedDllama(t *testing.T) {
 	})
 
 	t.Run("propagates list error", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -265,7 +252,6 @@ func TestWorkerHandlerOnRelatedDllama(t *testing.T) {
 	})
 
 	t.Run("returns nil when object missing", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -282,10 +268,8 @@ func TestWorkerHandlerOnRelatedDllama(t *testing.T) {
 }
 
 func TestWorkerHandlerOnRelatedModel(t *testing.T) {
-	t.Parallel()
 
 	t.Run("enqueues workers for referencing dllamas", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -342,7 +326,6 @@ func TestWorkerHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("propagates listing errors", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -365,7 +348,6 @@ func TestWorkerHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("enqueues via key when object missing", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -403,7 +385,6 @@ func TestWorkerHandlerOnRelatedModel(t *testing.T) {
 	})
 
 	t.Run("ignores invalid key", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)

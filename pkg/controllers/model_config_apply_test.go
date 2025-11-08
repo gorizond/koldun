@@ -70,7 +70,6 @@ func TestEnsureScriptConfigMapCreatesDownloadScript(t *testing.T) {
 }
 
 func TestEnsureMetadataConfigMapApplyError(t *testing.T) {
-	t.Parallel()
 
 	applyErr := errors.New("apply metadata failed")
 	handler := &modelHandler{
@@ -89,7 +88,6 @@ func TestEnsureMetadataConfigMapApplyError(t *testing.T) {
 }
 
 func TestEnsureScriptConfigMapApplyError(t *testing.T) {
-	t.Parallel()
 
 	applyErr := errors.New("apply script failed")
 	handler := &modelHandler{

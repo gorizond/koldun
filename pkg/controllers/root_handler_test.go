@@ -20,7 +20,6 @@ import (
 )
 
 func TestRootStatefulSetName(t *testing.T) {
-	t.Parallel()
 
 	require.Equal(t, "demo-root", rootStatefulSetName("demo-root"))
 
@@ -42,7 +41,6 @@ func TestRootStatefulSetName(t *testing.T) {
 }
 
 func TestBuildLLMNATSEnv(t *testing.T) {
-	t.Parallel()
 
 	require.Nil(t, buildLLMNATSEnv(nil))
 
@@ -64,7 +62,6 @@ func TestBuildLLMNATSEnv(t *testing.T) {
 }
 
 func TestRootContainerBuildsExpectedValues(t *testing.T) {
-	t.Parallel()
 
 	h := &rootHandler{}
 	root := &v1.Root{
@@ -118,7 +115,6 @@ func TestRootContainerBuildsExpectedValues(t *testing.T) {
 }
 
 func TestLLMSidecarContainer(t *testing.T) {
-	t.Parallel()
 
 	h := &rootHandler{}
 	root := &v1.Root{
@@ -169,10 +165,8 @@ func TestLLMSidecarContainer(t *testing.T) {
 }
 
 func TestRootHandlerWorkerStatus(t *testing.T) {
-	t.Parallel()
 
 	t.Run("nil root returns defaults", func(t *testing.T) {
-		t.Parallel()
 
 		h := &rootHandler{}
 		ready, count, endpoints, err := h.workerStatus(nil)
@@ -183,7 +177,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("missing selector short circuits", func(t *testing.T) {
-		t.Parallel()
 
 		h := &rootHandler{}
 		ready, count, endpoints, err := h.workerStatus(&v1.Root{})
@@ -194,7 +187,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("dllama not found", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -219,7 +211,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("dllama lookup error bubbles up", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -242,7 +233,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("worker missing", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -274,7 +264,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("statefulset missing returns endpoints", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -313,7 +302,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 
 	t.Run("statefulset lookup error bubbles up", func(t *testing.T) {
-		t.Parallel()
 
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -350,7 +338,6 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 }
 
 func TestRootHandlerEnsureServiceAppliesHeadlessService(t *testing.T) {
-	t.Parallel()
 
 	fakeApply := newFakeApply()
 	h := &rootHandler{apply: fakeApply}
@@ -382,7 +369,6 @@ func TestRootHandlerEnsureServiceAppliesHeadlessService(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetWaitsForWorkers(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -417,7 +403,6 @@ func TestRootHandlerEnsureStatefulSetWaitsForWorkers(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -499,7 +484,6 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetRequiresConversionWeights(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -552,7 +536,6 @@ func TestRootHandlerEnsureStatefulSetRequiresConversionWeights(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetRequiresModelRef(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -609,7 +592,6 @@ func TestRootHandlerEnsureStatefulSetRequiresModelRef(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -696,7 +678,6 @@ func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetDeletesLegacyDeployment(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -763,7 +744,6 @@ func TestRootHandlerEnsureStatefulSetDeletesLegacyDeployment(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetHandlesDeploymentErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -828,7 +808,6 @@ func TestRootHandlerEnsureStatefulSetHandlesDeploymentErrors(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatefulSetHandlesDeploymentLookupErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -892,7 +871,6 @@ func TestRootHandlerEnsureStatefulSetHandlesDeploymentLookupErrors(t *testing.T)
 }
 
 func TestRootHandlerEnsureStatusUpdatesReadyCondition(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -966,7 +944,6 @@ func TestRootHandlerEnsureStatusUpdatesReadyCondition(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatusHandlesWorkerErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1030,7 +1007,6 @@ func TestRootHandlerEnsureStatusHandlesWorkerErrors(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatusWaitsForWorkers(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1094,7 +1070,6 @@ func TestRootHandlerEnsureStatusWaitsForWorkers(t *testing.T) {
 }
 
 func TestRootHandlerEnsureStatusHandlesRootStatefulSetLookupErrors(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1161,7 +1136,6 @@ func TestRootHandlerEnsureStatusHandlesRootStatefulSetLookupErrors(t *testing.T)
 }
 
 func TestRootHandlerOnChangeReconcilesResources(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1253,7 +1227,6 @@ func TestRootHandlerOnChangeReconcilesResources(t *testing.T) {
 }
 
 func TestRootHandlerOnChangeHandlesNilAndDeletion(t *testing.T) {
-	t.Parallel()
 
 	h := &rootHandler{}
 	result, err := h.onChange("", nil)
@@ -1267,7 +1240,6 @@ func TestRootHandlerOnChangeHandlesNilAndDeletion(t *testing.T) {
 }
 
 func TestRootHandlerOnChangePropagatesEnsureServiceError(t *testing.T) {
-	t.Parallel()
 
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -1284,7 +1256,6 @@ func TestRootHandlerOnChangePropagatesEnsureServiceError(t *testing.T) {
 }
 
 func TestRootHandlerResolveDllamaRequiresLabel(t *testing.T) {
-	t.Parallel()
 
 	h := &rootHandler{}
 	_, err := h.resolveDllama(&v1.Root{ObjectMeta: metav1.ObjectMeta{Name: "demo"}})
@@ -1292,7 +1263,6 @@ func TestRootHandlerResolveDllamaRequiresLabel(t *testing.T) {
 }
 
 func TestRootHandlerResolveModelValidatesName(t *testing.T) {
-	t.Parallel()
 
 	h := &rootHandler{}
 	_, err := h.resolveModel(nil)
