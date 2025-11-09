@@ -895,6 +895,9 @@ func ensureAnnotations(meta *metav1.ObjectMeta, values map[string]string) bool {
 }
 
 func ensureOwnerReference(meta *metav1.ObjectMeta, sess *v1.Session) bool {
+	if sess == nil {
+		return false
+	}
 	ref := metav1.NewControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))
 	if ref == nil {
 		return false
