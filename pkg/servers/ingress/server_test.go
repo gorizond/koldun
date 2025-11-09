@@ -1715,8 +1715,9 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 
 type keyValueStub struct {
 	nats.KeyValue
-	keysFn func() ([]string, error)
-	getFn  func(string) (nats.KeyValueEntry, error)
+	keysFn   func() ([]string, error)
+	getFn    func(string) (nats.KeyValueEntry, error)
+	updateFn func(key string, value []byte, revision uint64) (uint64, error)
 }
 
 func (kv keyValueStub) Keys(opts ...nats.WatchOpt) ([]string, error) {
@@ -1739,13 +1740,28 @@ func (kv keyValueStub) Get(key string) (nats.KeyValueEntry, error) {
 	return nil, errors.New("get not implemented")
 }
 
+func (kv keyValueStub) Update(key string, value []byte, revision uint64) (uint64, error) {
+	if kv.updateFn != nil {
+		return kv.updateFn(key, value, revision)
+	}
+	if kv.KeyValue != nil {
+		return kv.KeyValue.Update(key, value, revision)
+	}
+	return 0, errors.New("update not implemented")
+}
+
 type kvEntryStub struct {
 	nats.KeyValueEntry
-	value []byte
+	value    []byte
+	revision uint64
 }
 
 func (e *kvEntryStub) Value() []byte {
 	return e.value
+}
+
+func (e *kvEntryStub) Revision() uint64 {
+	return e.revision
 }
 
 func startIngressJetStream(t *testing.T) *server.Server {
@@ -1783,4 +1799,126 @@ func connectIngressJetStream(t *testing.T, ns *server.Server) (nats.JetStreamCon
 	})
 
 	return js, nc
+}
+
+func TestRefreshConversationTTLDisabledWhenTTLZero(t *testing.T) {
+	srv := &Server{
+		cfg: Config{ConversationTTL: 0},
+		log: logrus.New().WithField("component", "test"),
+	}
+	// Should return early without panicking
+	srv.refreshConversationTTL("test-hash")
+}
+
+func TestRefreshConversationTTLDisabledWhenTTLNegative(t *testing.T) {
+	srv := &Server{
+		cfg: Config{ConversationTTL: -1},
+		log: logrus.New().WithField("component", "test"),
+	}
+	// Should return early without panicking
+	srv.refreshConversationTTL("test-hash")
+}
+
+func TestRefreshConversationTTLDisabledWhenKVNil(t *testing.T) {
+	srv := &Server{
+		cfg:    Config{ConversationTTL: 3600},
+		log:    logrus.New().WithField("component", "test"),
+		convKV: nil,
+	}
+	// Should return early without panicking
+	srv.refreshConversationTTL("test-hash")
+}
+
+func TestRefreshConversationTTLIgnoresNotFound(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			ConversationTTL: 3600,
+			TTLPrefix:       "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+	// Should return without logging warning for NotFound
+	srv.refreshConversationTTL("test-hash")
+}
+
+func TestRefreshConversationTTLLogsOtherGetErrors(t *testing.T) {
+	expectedErr := errors.New("kv unavailable")
+	srv := &Server{
+		cfg: Config{
+			ConversationTTL: 3600,
+			TTLPrefix:       "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, expectedErr
+			},
+		},
+	}
+	// Should log warning but not panic
+	srv.refreshConversationTTL("test-hash")
+}
+
+func TestRefreshConversationTTLSuccessfulUpdate(t *testing.T) {
+	var updatedKey string
+	var updatedValue []byte
+	var updatedRevision uint64
+
+	srv := &Server{
+		cfg: Config{
+			ConversationTTL: 3600,
+			TTLPrefix:       "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{
+					value:    []byte("test-value"),
+					revision: 42,
+				}, nil
+			},
+			updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+				updatedKey = key
+				updatedValue = value
+				updatedRevision = revision
+				return revision + 1, nil
+			},
+		},
+	}
+
+	srv.refreshConversationTTL("test-hash")
+
+	// Verify Update was called with correct parameters
+	assert.Equal(t, "conv:test-hash", updatedKey)
+	assert.Equal(t, []byte("test-value"), updatedValue)
+	assert.Equal(t, uint64(42), updatedRevision)
+}
+
+func TestRefreshConversationTTLLogsUpdateErrors(t *testing.T) {
+	updateErr := errors.New("update failed")
+	srv := &Server{
+		cfg: Config{
+			ConversationTTL: 3600,
+			TTLPrefix:       "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{
+					value:    []byte("test-value"),
+					revision: 42,
+				}, nil
+			},
+			updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+				return 0, updateErr
+			},
+		},
+	}
+	// Should log warning but not panic
+	srv.refreshConversationTTL("test-hash")
 }
