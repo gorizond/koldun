@@ -690,6 +690,255 @@ func TestHandleBacklogNoIdleWorkersRequeues(t *testing.T) {
 	require.Equal(t, 0, count)
 }
 
+func TestHandleStateNilMessage(t *testing.T) {
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	// Should not panic with nil message
+	dispatcher.handleState(nil)
+
+	// Verify no workers registered
+	dispatcher.mu.Lock()
+	count := len(dispatcher.workers)
+	dispatcher.mu.Unlock()
+	require.Equal(t, 0, count)
+}
+
+func TestHandleStateInvalidJSON(t *testing.T) {
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    []byte(`{invalid json`),
+	}
+
+	// Should handle gracefully without panicking
+	dispatcher.handleState(msg)
+
+	// Verify no workers registered
+	dispatcher.mu.Lock()
+	count := len(dispatcher.workers)
+	dispatcher.mu.Unlock()
+	require.Equal(t, 0, count)
+}
+
+func TestHandleStateEmptyWorkerName(t *testing.T) {
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	event := conversation.WorkerStateEvent{
+		Dllama: "", // Empty worker name
+		State:  "idle",
+		Active: 0,
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    data,
+	}
+
+	dispatcher.handleState(msg)
+
+	// Verify no workers registered for empty name
+	dispatcher.mu.Lock()
+	count := len(dispatcher.workers)
+	dispatcher.mu.Unlock()
+	require.Equal(t, 0, count)
+}
+
+func TestHandleStateRegistersNewWorker(t *testing.T) {
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	event := conversation.WorkerStateEvent{
+		Dllama: "worker-1",
+		State:  "idle",
+		Active: 0,
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    data,
+	}
+
+	dispatcher.handleState(msg)
+
+	// Verify worker was registered
+	dispatcher.mu.Lock()
+	worker, exists := dispatcher.workers["worker-1"]
+	dispatcher.mu.Unlock()
+
+	require.True(t, exists)
+	require.Equal(t, "idle", worker.state)
+	require.Equal(t, int32(0), worker.active)
+	require.Equal(t, "worker-1", worker.name)
+}
+
+func TestHandleStateUpdatesExistingWorker(t *testing.T) {
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	// Register initial worker
+	dispatcher.workers = map[string]*workerState{
+		"worker-1": {
+			name:          "worker-1",
+			state:         "busy",
+			active:        2,
+			lastHeartbeat: time.Now().Add(-1 * time.Minute),
+		},
+	}
+
+	event := conversation.WorkerStateEvent{
+		Dllama: "worker-1",
+		State:  "idle",
+		Active: 0,
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    data,
+	}
+
+	beforeUpdate := dispatcher.workers["worker-1"].lastHeartbeat
+	dispatcher.handleState(msg)
+
+	// Verify worker was updated
+	dispatcher.mu.Lock()
+	worker := dispatcher.workers["worker-1"]
+	dispatcher.mu.Unlock()
+
+	require.Equal(t, "idle", worker.state)
+	require.Equal(t, int32(0), worker.active)
+	require.True(t, worker.lastHeartbeat.After(beforeUpdate))
+}
+
+func TestHandleStateIdleTriggersFinish(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping NATS dependent test in short mode")
+	}
+
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	// Setup inflight assignment
+	assignment := &assignment{
+		assignmentID: "assign-123",
+		requestID:    "req-123",
+		payload:      []byte(`{"test":"data"}`),
+	}
+	dispatcher.inflight[assignment.assignmentID] = assignment
+
+	// Store in KV
+	env := conversation.AssignmentEnvelope{
+		AssignmentID: assignment.assignmentID,
+		RequestID:    assignment.requestID,
+		Payload:      assignment.payload,
+	}
+	envData, err := json.Marshal(env)
+	require.NoError(t, err)
+	_, err = dispatcher.assignments.Put(assignment.requestID, envData)
+	require.NoError(t, err)
+
+	// Send idle state with assignment ID
+	event := conversation.WorkerStateEvent{
+		Dllama:       "worker-1",
+		State:        "idle",
+		Active:       0,
+		AssignmentID: assignment.assignmentID,
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    data,
+	}
+
+	dispatcher.handleState(msg)
+
+	// Verify assignment was finished (removed from inflight)
+	dispatcher.mu.Lock()
+	_, exists := dispatcher.inflight[assignment.assignmentID]
+	dispatcher.mu.Unlock()
+
+	require.False(t, exists, "assignment should be removed from inflight")
+
+	// Verify KV was cleaned up
+	_, err = dispatcher.assignments.Get(assignment.requestID)
+	require.Error(t, err)
+	require.ErrorIs(t, err, nats.ErrKeyNotFound)
+}
+
+func TestHandleStateErrorTriggersRequeue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping NATS dependent test in short mode")
+	}
+
+	ns := startTestNATSServer(t)
+	dispatcher := newTestDispatcher(t, ns.ClientURL())
+
+	// Setup inflight assignment
+	assignment := &assignment{
+		assignmentID: "assign-456",
+		requestID:    "req-456",
+		payload:      []byte(`{"test":"error"}`),
+	}
+	dispatcher.inflight[assignment.assignmentID] = assignment
+
+	// Subscribe to backlog to catch requeue
+	requeueCh := make(chan conversation.BacklogMessage, 1)
+	sub, err := dispatcher.nc.Subscribe(dispatcher.cfg.BacklogSubject, func(msg *nats.Msg) {
+		var backlog conversation.BacklogMessage
+		if err := json.Unmarshal(msg.Data, &backlog); err == nil {
+			requeueCh <- backlog
+		}
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sub.Unsubscribe()
+	})
+
+	// Send error state with assignment ID
+	event := conversation.WorkerStateEvent{
+		Dllama:       "worker-1",
+		State:        "error",
+		Active:       0,
+		AssignmentID: assignment.assignmentID,
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	msg := &nats.Msg{
+		Subject: "test.state",
+		Data:    data,
+	}
+
+	dispatcher.handleState(msg)
+	require.NoError(t, dispatcher.nc.Flush())
+
+	// Verify message was requeued
+	select {
+	case backlog := <-requeueCh:
+		require.Equal(t, assignment.requestID, backlog.ID)
+		require.NotEmpty(t, backlog.Payload)
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected backlog message to be requeued after error state")
+	}
+
+	// Verify assignment was removed from inflight
+	dispatcher.mu.Lock()
+	_, exists := dispatcher.inflight[assignment.assignmentID]
+	dispatcher.mu.Unlock()
+	require.False(t, exists)
+}
+
 func TestUpdateMetricsReflectsState(t *testing.T) {
 	srv := &Server{
 		workers: map[string]*workerState{
