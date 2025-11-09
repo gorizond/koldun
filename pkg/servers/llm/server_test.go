@@ -18,6 +18,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
 )
 
 type staticResponseTransport struct {
@@ -962,6 +969,136 @@ func TestEvictDllamaWithoutNamespace(t *testing.T) {
 
 	err := srv.evictDllama(context.Background())
 	require.ErrorIs(t, err, errEvictionDisabled)
+}
+
+// dynamicClientStub mocks dynamic.Interface for testing evictDllama
+type dynamicClientStub struct {
+	deleteErr error
+}
+
+type dynamicResourceStub struct {
+	deleteErr error
+}
+
+type dynamicNamespacedResourceStub struct {
+	deleteErr error
+}
+
+func (d *dynamicClientStub) Resource(resource schema.GroupVersionResource) dynamic.NamespaceableResourceInterface {
+	return &dynamicResourceStub{deleteErr: d.deleteErr}
+}
+
+func (d *dynamicResourceStub) Namespace(ns string) dynamic.ResourceInterface {
+	return &dynamicNamespacedResourceStub{deleteErr: d.deleteErr}
+}
+
+func (d *dynamicNamespacedResourceStub) Delete(ctx context.Context, name string, opts metav1.DeleteOptions, subresources ...string) error {
+	return d.deleteErr
+}
+
+// Unused methods to satisfy interface
+func (d *dynamicResourceStub) Create(ctx context.Context, obj *unstructured.Unstructured, options metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) Update(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) UpdateStatus(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) Delete(ctx context.Context, name string, options metav1.DeleteOptions, subresources ...string) error {
+	return nil
+}
+func (d *dynamicResourceStub) DeleteCollection(ctx context.Context, options metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	return nil
+}
+func (d *dynamicResourceStub) Get(ctx context.Context, name string, options metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, options metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) Apply(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicResourceStub) ApplyStatus(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) Create(ctx context.Context, obj *unstructured.Unstructured, options metav1.CreateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) Update(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) UpdateStatus(ctx context.Context, obj *unstructured.Unstructured, options metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) DeleteCollection(ctx context.Context, options metav1.DeleteOptions, listOptions metav1.ListOptions) error {
+	return nil
+}
+func (d *dynamicNamespacedResourceStub) Get(ctx context.Context, name string, options metav1.GetOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) List(ctx context.Context, opts metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, options metav1.PatchOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) Apply(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions, subresources ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (d *dynamicNamespacedResourceStub) ApplyStatus(ctx context.Context, name string, obj *unstructured.Unstructured, options metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+
+func TestEvictDllamaSuccessfulDeletion(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "test-dllama",
+		},
+		namespace: "default",
+		kube:      &dynamicClientStub{deleteErr: nil},
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.NoError(t, err)
+}
+
+func TestEvictDllamaNotFoundReturnsNil(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "test-dllama",
+		},
+		namespace: "default",
+		kube:      &dynamicClientStub{deleteErr: apierrors.NewNotFound(schema.GroupResource{}, "test-dllama")},
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.NoError(t, err)
+}
+
+func TestEvictDllamaOtherErrorPropagates(t *testing.T) {
+	expectedErr := errors.New("api server connection failed")
+	srv := &Server{
+		cfg: Config{
+			DllamaName: "test-dllama",
+		},
+		namespace: "default",
+		kube:      &dynamicClientStub{deleteErr: expectedErr},
+	}
+
+	err := srv.evictDllama(context.Background())
+	require.ErrorIs(t, err, expectedErr)
 }
 
 func TestTriggerEvictionSetsShutdownError(t *testing.T) {
