@@ -1350,6 +1350,172 @@ func TestListModelsPropagatesKeyErrors(t *testing.T) {
 	require.ErrorIs(t, err, expected)
 }
 
+func TestHandleModelsMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	methods := []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch}
+	for _, method := range methods {
+		t.Run(method, func(t *testing.T) {
+			req := httptest.NewRequest(method, "/v1/models", nil)
+			w := httptest.NewRecorder()
+
+			srv.handleModels(w, req)
+
+			assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+			assert.Contains(t, w.Header().Get("Allow"), "GET")
+		})
+	}
+}
+
+func TestHandleModelsListError(t *testing.T) {
+	t.Parallel()
+
+	expectedErr := errors.New("kv connection failed")
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return nil, expectedErr
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleModels(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.Contains(t, w.Body.String(), "failed to list models")
+}
+
+func TestHandleModelsEmptyList(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{}, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleModels(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
+
+	var result map[string]interface{}
+	err := json.NewDecoder(w.Body).Decode(&result)
+	assert.NoError(t, err)
+	assert.Equal(t, "list", result["object"])
+
+	data := result["data"].([]interface{})
+	assert.Equal(t, 0, len(data))
+}
+
+func TestHandleModelsFiltersNotReady(t *testing.T) {
+	t.Parallel()
+
+	readyModel := `{"namespace":"ns1","name":"ready-model","displayName":"Ready Model","conversionStatus":"completed","conversionSizeBytes":1000,"conversionSizeHuman":"1KB","outputPVCName":"ready-pvc"}`
+	notReadyModel := `{"namespace":"ns1","name":"pending-model","displayName":"Pending Model","conversionStatus":"pending"}`
+
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{"model/ns1/ready-model", "model/ns1/pending-model"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				if key == "model/ns1/ready-model" {
+					return &kvEntryStub{value: []byte(readyModel)}, nil
+				}
+				return &kvEntryStub{value: []byte(notReadyModel)}, nil
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleModels(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.NewDecoder(w.Body).Decode(&result)
+	assert.NoError(t, err)
+
+	data := result["data"].([]interface{})
+	assert.Equal(t, 1, len(data), "should only include ready models")
+
+	model := data[0].(map[string]interface{})
+	assert.Equal(t, "ns1/ready-model", model["id"])
+	assert.Equal(t, "Ready Model", model["name"])
+}
+
+func TestHandleModelsSortsById(t *testing.T) {
+	t.Parallel()
+
+	modelA := `{"namespace":"ns1","name":"alpha","displayName":"Alpha","conversionStatus":"completed","conversionSizeBytes":1000,"conversionSizeHuman":"1KB","outputPVCName":"alpha-pvc"}`
+	modelZ := `{"namespace":"ns1","name":"zulu","displayName":"Zulu","conversionStatus":"completed","conversionSizeBytes":2000,"conversionSizeHuman":"2KB","outputPVCName":"zulu-pvc"}`
+	modelM := `{"namespace":"ns1","name":"mike","displayName":"Mike","conversionStatus":"completed","conversionSizeBytes":1500,"conversionSizeHuman":"1.5KB","outputPVCName":"mike-pvc"}`
+
+	srv := &Server{
+		cfg: Config{ModelPrefix: registry.DefaultModelPrefix},
+		log: logrus.New().WithField("component", "ingress-test"),
+		modelsKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				// Return in non-sorted order
+				return []string{"model/ns1/zulu", "model/ns1/alpha", "model/ns1/mike"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				switch key {
+				case "model/ns1/alpha":
+					return &kvEntryStub{value: []byte(modelA)}, nil
+				case "model/ns1/zulu":
+					return &kvEntryStub{value: []byte(modelZ)}, nil
+				case "model/ns1/mike":
+					return &kvEntryStub{value: []byte(modelM)}, nil
+				}
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleModels(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var result map[string]interface{}
+	err := json.NewDecoder(w.Body).Decode(&result)
+	assert.NoError(t, err)
+
+	data := result["data"].([]interface{})
+	assert.Equal(t, 3, len(data))
+
+	// Verify sorted by ID
+	ids := make([]string, 3)
+	for i, item := range data {
+		ids[i] = item.(map[string]interface{})["id"].(string)
+	}
+	assert.Equal(t, []string{"ns1/alpha", "ns1/mike", "ns1/zulu"}, ids)
+}
+
 func TestHandleChatCompletionsRequiresToken(t *testing.T) {
 	t.Parallel()
 
@@ -1571,6 +1737,15 @@ func (kv keyValueStub) Get(key string) (nats.KeyValueEntry, error) {
 		return kv.KeyValue.Get(key)
 	}
 	return nil, errors.New("get not implemented")
+}
+
+type kvEntryStub struct {
+	nats.KeyValueEntry
+	value []byte
+}
+
+func (e *kvEntryStub) Value() []byte {
+	return e.value
 }
 
 func startIngressJetStream(t *testing.T) *server.Server {
