@@ -1864,6 +1864,338 @@ func TestRefreshConversationTTLLogsOtherGetErrors(t *testing.T) {
 	srv.refreshConversationTTL("test-hash")
 }
 
+// Tests for ensureConversation
+
+func TestEnsureConversationCreatesNewRecord(t *testing.T) {
+	var putKey string
+	var putValue []byte
+
+	srv := &Server{
+		cfg: Config{
+			Namespace:                   "test-ns",
+			RootImage:                   "root:v1",
+			WorkerImage:                 "worker:v1",
+			SessionDispatcherImage:      "dispatcher:v1",
+			NATSURL:                     "nats://test:4222",
+			TTLPrefix:                   "conv:",
+			OutPrefix:                   "out.",
+			SessionMinDllamas:           1,
+			SessionMaxDllamas:           5,
+			SessionScaleUpBacklog:       10,
+			SessionScaleDownIdleSeconds: 300,
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					putKey = key
+					putValue = value
+					return 1, nil
+				},
+			},
+		},
+	}
+
+	model := &registry.Model{
+		Name:      "test-model",
+		Namespace: "model-ns",
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "abc123", model, 2)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, record)
+	assert.Equal(t, "abc123", record.Hash)
+	assert.Equal(t, "test-ns", record.Namespace)
+	assert.Equal(t, "model-ns/test-model", record.Model)
+	assert.Equal(t, int32(2), record.Scaling.ActiveRequests)
+	assert.Equal(t, int32(2), record.Scaling.DesiredDllamas)
+	assert.Equal(t, "conv:abc123", putKey)
+	assert.NotNil(t, putValue)
+}
+
+func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
+	oldRecord := &conversation.Record{
+		Hash:            "hash123",
+		Session:         "session-hash123",
+		Namespace:       "test-ns",
+		Model:           "old-ns/old-model",
+		CreatedAt:       1234567890,
+		ReplicaPower:    1,
+		RootImage:       "root:old",
+		WorkerImage:     "worker:old",
+		DispatcherImage: "dispatcher:old",
+		NATS:            conversation.NATSConfig{URL: "nats://old:4222"},
+		Queue: &conversation.QueueConfig{
+			BacklogSubject:        "old.backlog",
+			ResponseSubjectPrefix: "old.response.",
+			AssignmentsBucket:     "old-assignments",
+			DllamaSubjectPrefix:   "old.dllama.",
+			StateStream:           "old-state",
+		},
+		Scaling: &conversation.SessionScalingConfig{
+			MinDllamas:           0,
+			MaxDllamas:           3,
+			ScaleUpBacklog:       5,
+			ScaleDownIdleSeconds: 100,
+			DesiredDllamas:       1,
+			ActiveRequests:       1,
+		},
+	}
+
+	oldData, _ := oldRecord.Marshal()
+
+	var updatedKey string
+	var updatedValue []byte
+	var updatedRevision uint64
+
+	srv := &Server{
+		cfg: Config{
+			Namespace:                   "test-ns",
+			RootImage:                   "root:new",
+			WorkerImage:                 "worker:new",
+			SessionDispatcherImage:      "dispatcher:new",
+			NATSURL:                     "nats://new:4222",
+			TTLPrefix:                   "conv:",
+			OutPrefix:                   "out.",
+			SessionMinDllamas:           2,
+			SessionMaxDllamas:           10,
+			SessionScaleUpBacklog:       20,
+			SessionScaleDownIdleSeconds: 600,
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{
+					value:    oldData,
+					revision: 5,
+				}, nil
+			},
+			updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+				updatedKey = key
+				updatedValue = value
+				updatedRevision = revision
+				return revision + 1, nil
+			},
+		},
+	}
+
+	model := &registry.Model{
+		Name:      "test-model",
+		Namespace: "model-ns",
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "hash123", model, 3)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, record)
+
+	// Verify all fields were updated
+	assert.Equal(t, "root:new", record.RootImage)
+	assert.Equal(t, "worker:new", record.WorkerImage)
+	assert.Equal(t, "dispatcher:new", record.DispatcherImage)
+	assert.Equal(t, "nats://new:4222", record.NATS.URL)
+	assert.Equal(t, int32(2), record.Scaling.MinDllamas)
+	assert.Equal(t, int32(10), record.Scaling.MaxDllamas)
+	assert.Equal(t, int32(20), record.Scaling.ScaleUpBacklog)
+	assert.Equal(t, int32(600), record.Scaling.ScaleDownIdleSeconds)
+	assert.Equal(t, int32(3), record.Scaling.ActiveRequests)
+	assert.Equal(t, int32(3), record.Scaling.DesiredDllamas)
+
+	// Verify Update was called
+	assert.Equal(t, "conv:hash123", updatedKey)
+	assert.Equal(t, uint64(5), updatedRevision)
+	assert.NotNil(t, updatedValue)
+}
+
+func TestEnsureConversationHandlesCorruptedRecordByCreatingNew(t *testing.T) {
+	var putKey string
+
+	srv := &Server{
+		cfg: Config{
+			Namespace:                   "test-ns",
+			RootImage:                   "root:v1",
+			WorkerImage:                 "worker:v1",
+			SessionDispatcherImage:      "dispatcher:v1",
+			NATSURL:                     "nats://test:4222",
+			TTLPrefix:                   "conv:",
+			OutPrefix:                   "out.",
+			SessionMinDllamas:           1,
+			SessionMaxDllamas:           5,
+			SessionScaleUpBacklog:       10,
+			SessionScaleDownIdleSeconds: 300,
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				// Return corrupted JSON
+				return &kvEntryStub{
+					value:    []byte("{invalid json}"),
+					revision: 1,
+				}, nil
+			},
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					putKey = key
+					return 2, nil
+				},
+			},
+		},
+	}
+
+	model := &registry.Model{
+		Name:      "test-model",
+		Namespace: "model-ns",
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "hash456", model, 1)
+
+	// Should fallthrough to create new record
+	assert.NoError(t, err)
+	assert.NotNil(t, record)
+	assert.Equal(t, "hash456", record.Hash)
+	assert.Equal(t, "conv:hash456", putKey)
+}
+
+func TestEnsureConversationReturnsErrorOnKVGetFailure(t *testing.T) {
+	expectedErr := errors.New("kv connection failed")
+
+	srv := &Server{
+		cfg: Config{
+			Namespace: "test-ns",
+			TTLPrefix: "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, expectedErr
+			},
+		},
+	}
+
+	model := &registry.Model{Name: "test-model", Namespace: "ns"}
+
+	record, err := srv.ensureConversation(context.Background(), "hash789", model, 1)
+
+	assert.Error(t, err)
+	assert.Nil(t, record)
+	assert.Equal(t, expectedErr, err)
+}
+
+func TestEnsureConversationLogsUpdateError(t *testing.T) {
+	oldRecord := &conversation.Record{
+		Hash:         "hash-update-fail",
+		Session:      "session-hash-update-fail",
+		Namespace:    "test-ns",
+		Model:        "ns/model",
+		CreatedAt:    1234567890,
+		ReplicaPower: 1,
+		RootImage:    "root:old",
+		WorkerImage:  "worker:old",
+		NATS:         conversation.NATSConfig{URL: "nats://old:4222"},
+		Queue:        &conversation.QueueConfig{},
+		Scaling:      &conversation.SessionScalingConfig{},
+	}
+
+	oldData, _ := oldRecord.Marshal()
+	updateErr := errors.New("update failed")
+
+	var updateCalled bool
+
+	srv := &Server{
+		cfg: Config{
+			Namespace:              "test-ns",
+			RootImage:              "root:new",
+			WorkerImage:            "worker:new",
+			SessionDispatcherImage: "dispatcher:new",
+			NATSURL:                "nats://new:4222",
+			TTLPrefix:              "conv:",
+			OutPrefix:              "out.",
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{
+					value:    oldData,
+					revision: 10,
+				}, nil
+			},
+			updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+				updateCalled = true
+				return 0, updateErr
+			},
+		},
+	}
+
+	model := &registry.Model{Name: "test-model", Namespace: "ns"}
+
+	// Should still return the updated record even if Update fails
+	record, err := srv.ensureConversation(context.Background(), "hash-update-fail", model, 2)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, record)
+	assert.Equal(t, "root:new", record.RootImage)
+	assert.True(t, updateCalled)
+}
+
+func TestEnsureConversationUsesDefaultNamespaceWhenModelNamespaceEmpty(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			Namespace:                   "default-ns",
+			RootImage:                   "root:v1",
+			WorkerImage:                 "worker:v1",
+			SessionDispatcherImage:      "dispatcher:v1",
+			NATSURL:                     "nats://test:4222",
+			TTLPrefix:                   "conv:",
+			OutPrefix:                   "out.",
+			SessionMinDllamas:           1,
+			SessionMaxDllamas:           5,
+			SessionScaleUpBacklog:       10,
+			SessionScaleDownIdleSeconds: 300,
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 1, nil
+				},
+			},
+		},
+	}
+
+	// Model with empty namespace
+	model := &registry.Model{
+		Name:      "test-model",
+		Namespace: "   ",
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "hash-empty-ns", model, 1)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, record)
+	// Should use default-ns/test-model
+	assert.Equal(t, "default-ns/test-model", record.Model)
+}
+
+// Helper mock for KV Put operations
+type mockKV struct {
+	nats.KeyValue
+	putFn func(key string, value []byte) (uint64, error)
+}
+
+func (m *mockKV) Put(key string, value []byte) (uint64, error) {
+	if m.putFn != nil {
+		return m.putFn(key, value)
+	}
+	return 0, errors.New("put not implemented")
+}
+
 func TestRefreshConversationTTLSuccessfulUpdate(t *testing.T) {
 	var updatedKey string
 	var updatedValue []byte
@@ -1921,4 +2253,183 @@ func TestRefreshConversationTTLLogsUpdateErrors(t *testing.T) {
 	}
 	// Should log warning but not panic
 	srv.refreshConversationTTL("test-hash")
+}
+
+// Tests for handleChatCompletions error paths
+
+func TestHandleChatCompletionsRejectsNonPostMethod(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, w.Code)
+	assert.Equal(t, "POST, OPTIONS", w.Header().Get("Allow"))
+}
+
+func TestHandleChatCompletionsRejectsInvalidJSON(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	body := strings.NewReader(`{invalid json`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Contains(t, strings.ToLower(errResp.Error.Message), "invalid chat completion payload")
+}
+
+func TestHandleChatCompletionsRejectsEmptyModel(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	body := strings.NewReader(`{"model":"","messages":[{"role":"user","content":"test"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Contains(t, strings.ToLower(errResp.Error.Message), "model is required")
+}
+
+func TestHandleChatCompletionsRejectsInvalidConversationHash(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+			HashSecret:      []byte("test-secret"),
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	body := strings.NewReader(`{"model":"test/model","messages":[{"role":"user","content":"test"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	// Missing required headers for hash computation
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Contains(t, strings.ToLower(errResp.Error.Message), "conversation id")
+}
+
+func TestHandleChatCompletionsRejectsUnknownModel(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+			Namespace:       "test-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 0, errors.New("not used")
+				},
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+
+	body := strings.NewReader(`{"model":"test-ns/unknown-model","messages":[{"role":"user","content":"test"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "test-client")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Contains(t, strings.ToLower(errResp.Error.Message), "model")
+}
+
+func TestHandleChatCompletionsHandlesEnsureConversationFailure(t *testing.T) {
+	t.Parallel()
+
+	ensureErr := errors.New("kv store unavailable")
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+			Namespace:       "test-ns",
+			TTLPrefix:       "conv:",
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 0, errors.New("not used")
+				},
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				model := &registry.Model{
+					Namespace:           "test-ns",
+					Name:                "test-model",
+					OutputPVCName:       "pvc",
+					ConversionSizeHuman: "1Gi",
+				}
+				data, _ := json.Marshal(model)
+				return &kvEntryStub{value: data}, nil
+			},
+		},
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, ensureErr
+			},
+		},
+	}
+
+	body := strings.NewReader(`{"model":"test-ns/test-model","messages":[{"role":"user","content":"test"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "test-client")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Contains(t, strings.ToLower(errResp.Error.Message), "conversation")
 }
