@@ -2,6 +2,8 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,6 +110,22 @@ func TestStartRegistrySyncConnectError(t *testing.T) {
 	require.Contains(t, err.Error(), "connect NATS for registry")
 }
 
+func TestStartRegistrySyncJetStreamErrorClosesConnection(t *testing.T) {
+	ctx := context.Background()
+	mgr := &Manager{}
+
+	failing := &stubRegistryConn{jetStreamErr: errors.New("js boom")}
+	orig := registryConnectFn
+	t.Cleanup(func() { registryConnectFn = orig })
+	registryConnectFn = func(string, ...nats.Option) (registryConnection, error) {
+		return failing, nil
+	}
+
+	err := StartRegistrySync(ctx, mgr, RegistryConfig{NATSURL: "nats://example"})
+	require.EqualError(t, err, "jetstream context: js boom")
+	require.True(t, failing.closed.Load(), "connection should close on JetStream error")
+}
+
 func TestStartRegistrySyncBucketErrors(t *testing.T) {
 	ns := startRegistryJetStreamServer(t)
 
@@ -171,4 +189,22 @@ func TestStartRegistrySyncDrainsConnectionOnCancel(t *testing.T) {
 		require.NoError(t, err)
 		return connz.Total == 0
 	}, time.Second, 10*time.Millisecond)
+}
+
+type stubRegistryConn struct {
+	jetStreamErr error
+	closed       atomic.Bool
+}
+
+func (s *stubRegistryConn) JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error) {
+	return nil, s.jetStreamErr
+}
+
+func (s *stubRegistryConn) Close() {
+	s.closed.Store(true)
+}
+
+func (s *stubRegistryConn) Drain() error {
+	s.closed.Store(true)
+	return nil
 }

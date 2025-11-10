@@ -32,20 +32,30 @@ var (
 	registerSessionControllerFn = registerSessionController
 	registerDllamaControllerFn  = registerDllamaController
 	addSchemesFn                = schemes.AddToScheme
-	newFactoryFromConfigFn      = func(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
-		return generic.NewFactoryFromConfigWithOptions(cfg, opts)
-	}
-	newApplyForConfigFn = apply.NewForConfig
-	factoryOptionsFn    = func(health *Health) *generic.FactoryOptions {
+	factoryCreatorFn            = defaultFactoryCreator
+	newFactoryFromConfigFn      = defaultFactoryFromConfig
+	newApplyForConfigFn         = apply.NewForConfig
+	factoryOptionsFn            = func(health *Health) *generic.FactoryOptions {
 		return &generic.FactoryOptions{
 			HealthCallback: health.SetAPIHealthy,
 		}
 	}
-	newCoreControllersFn  = corev1.New
-	newAppsControllersFn  = appsv1.New
-	newBatchControllersFn = batchv1.New
-	newKoldControllersFn  = koldv1.New
+	newCoreControllersFn         = corev1.New
+	newAppsControllersFn         = appsv1.New
+	newBatchControllersFn        = batchv1.New
+	newKoldControllersFn         = koldv1.New
+	newGenericFactoryWithOptions = func(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+		return generic.NewFactoryFromConfigWithOptions(cfg, opts)
+	}
 )
+
+func defaultFactoryCreator(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+	return newGenericFactoryWithOptions(cfg, opts)
+}
+
+func defaultFactoryFromConfig(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+	return factoryCreatorFn(cfg, opts)
+}
 
 // Manager wires together Wrangler factories, controllers, and reconcilers for the operator.
 type Manager struct {

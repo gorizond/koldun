@@ -182,23 +182,9 @@ go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -cou
 - `.envrc` now exports `KUBEBUILDER_ASSETS=$PWD/bin/envtest/kubebuilder/bin`; run `direnv allow` (or copy the line into your shell profile) so controller tests discover the assets automatically.
 - Capture the `KUBEBUILDER_ASSETS` path printed by `setup-envtest use` (typically `./bin/envtest/kubebuilder/bin`) for local shells and CI pipelines.
 - Cache the `./bin/envtest` directory in CI runners to avoid downloading the binaries on every job; re-run `setup-envtest use` only when bumping controller-runtime.
+- GitHub Actions runs these smoke tests in `.github/workflows/ci-build.yaml` via the `controllers-envtest` job. The job restores the `bin/envtest` cache, installs `setup-envtest`, executes `make envtest-preflight`, and blocks the Docker build job until `go test ./pkg/controllers -count=1 -cover -timeout=5m` passes.
 - Add the `export KUBEBUILDER_ASSETS=…` line to your shell profile (e.g. `.envrc`, `.zshrc`) so `go test` picks it up without re-running `setup-envtest`.
 - The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
-- CI draft step:
-
-  ```yaml
-  - name: warm envtest assets
-    run: |
-      make envtest-preflight
-      direnv allow || true
-  - name: cache envtest toolchain
-    uses: actions/cache@v4
-    with:
-      path: bin/envtest
-      key: ${{ runner.os }}-envtest-${{ hashFiles('go.mod') }}
-      restore-keys: |
-        ${{ runner.os }}-envtest-
-  ```
 
 ### Controller Coverage Snapshot
 - Generate a focused profile: `go test ./pkg/controllers -coverprofile=controllers.cover`

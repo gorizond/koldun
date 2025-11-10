@@ -11,8 +11,41 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  controllers-envtest:
+    name: Controllers Envtest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Restore envtest cache
+        uses: actions/cache@v4
+        with:
+          path: bin/envtest
+          key: ${{ runner.os }}-envtest-${{ hashFiles('go.mod', 'pkg/controllers/envtest_suite_test.go') }}
+          restore-keys: |
+            ${{ runner.os }}-envtest-
+
+      - name: Install setup-envtest tool
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+
+      - name: Warm envtest assets
+        run: make envtest-preflight
+
+      - name: Run controller envtests
+        run: go test ./pkg/controllers -count=1 -cover -timeout=5m
+
   build:
     name: Build and Push Image
+    needs:
+      - controllers-envtest
     runs-on: ubuntu-latest
     permissions:
       contents: read

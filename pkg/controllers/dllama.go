@@ -395,8 +395,10 @@ func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
 	}
 
 	condition := metav1.Condition{
-		Type:   conditionReady,
-		Status: metav1.ConditionFalse,
+		Type:    conditionReady,
+		Status:  metav1.ConditionFalse,
+		Reason:  "ModelNotReady",
+		Message: "Referenced model is not ready",
 	}
 
 	modelReady := false
@@ -463,9 +465,6 @@ func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
 			condition.Reason = "TopologyNotReady"
 			condition.Message = "Root and worker resources are not ready"
 		}
-	} else if condition.Reason == "" {
-		condition.Reason = "ModelNotReady"
-		condition.Message = "Referenced model is not ready"
 	}
 
 	updated.Status.ObservedGeneration = updated.Generation

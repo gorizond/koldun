@@ -128,3 +128,43 @@ func TestNewManagerInitializesClients(t *testing.T) {
 	require.Same(t, fakeApply, manager.apply)
 	require.NotNil(t, manager.Apply(context.Background()))
 }
+
+func TestDefaultFactoryFromConfigUsesCreator(t *testing.T) {
+	orig := factoryCreatorFn
+	t.Cleanup(func() { factoryCreatorFn = orig })
+
+	called := false
+	stub := &managerFactoryStub{ctrl: &controllerFactoryStub{}}
+	factoryCreatorFn = func(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+		called = true
+		return stub, nil
+	}
+
+	result, err := defaultFactoryFromConfig(nil, nil)
+	require.NoError(t, err)
+	require.True(t, called)
+	require.Same(t, stub, result)
+}
+
+func TestDefaultFactoryCreatorDelegates(t *testing.T) {
+	orig := newGenericFactoryWithOptions
+	t.Cleanup(func() { newGenericFactoryWithOptions = orig })
+
+	called := false
+	stub := &managerFactoryStub{ctrl: &controllerFactoryStub{}}
+	newGenericFactoryWithOptions = func(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
+		called = true
+		return stub, nil
+	}
+
+	result, err := defaultFactoryCreator(nil, nil)
+	require.NoError(t, err)
+	require.True(t, called)
+	require.Same(t, stub, result)
+}
+
+func TestDefaultFactoryCreatorDefaultPath(t *testing.T) {
+	factory, err := defaultFactoryCreator(&rest.Config{}, &generic.FactoryOptions{})
+	require.NoError(t, err)
+	require.NotNil(t, factory)
+}

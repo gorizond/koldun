@@ -42,12 +42,19 @@ type sessionHandler struct {
 	ensureStatusFn       func(*v1.Session) (*v1.Session, error)
 	lookupRootEndpointFn func(string, string) string
 	checkHealthFn        func(string) bool
+	createDllamaFn       func(*v1.Session) error
+	deleteDllamaFn       func(*v1.Session, *v1.Dllama) error
+	ensureDispatcherFn   func(*v1.Session) error
 }
 
 const (
 	resourceDllama = "dllama"
 	resourceRoot   = "root"
 	resourceWorker = "worker"
+)
+
+var (
+	newControllerRef = metav1.NewControllerRef
 )
 
 func registerSessionController(ctx context.Context, m *Manager) error {
@@ -282,9 +289,6 @@ func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
 	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
 
 	available := readySets - busySets
-	if available < 0 {
-		available = 0
-	}
 
 	updated.Status.ObservedGeneration = updated.Generation
 	updated.Status.ReadyWorkers = readyWorkers
@@ -407,9 +411,6 @@ func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 		}
 	}
 
-	if params.min <= 0 {
-		params.min = 1
-	}
 	if params.max > 0 && params.max < params.min {
 		params.max = params.min
 	}
@@ -605,6 +606,9 @@ func (h *sessionHandler) enqueueSession(sess *v1.Session) {
 }
 
 func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
+	if hook := h.createDllamaFn; hook != nil {
+		return hook(sess)
+	}
 	spec := desiredDllamaSpecForSession(sess)
 	hash := strings.TrimSpace(sess.Spec.Hash)
 	hashLabel := sanitizeLabelValue(hash)
@@ -653,6 +657,9 @@ func (h *sessionHandler) createDllamaForSession(sess *v1.Session) error {
 }
 
 func (h *sessionHandler) deleteDllama(sess *v1.Session, dllama *v1.Dllama) error {
+	if hook := h.deleteDllamaFn; hook != nil {
+		return hook(sess, dllama)
+	}
 	if dllama == nil {
 		return nil
 	}
@@ -663,6 +670,9 @@ func (h *sessionHandler) deleteDllama(sess *v1.Session, dllama *v1.Dllama) error
 }
 
 func (h *sessionHandler) ensureDispatcher(sess *v1.Session) error {
+	if hook := h.ensureDispatcherFn; hook != nil {
+		return hook(sess)
+	}
 	queue := sess.Spec.Queue
 	if queue == nil {
 		return nil
@@ -898,7 +908,7 @@ func ensureOwnerReference(meta *metav1.ObjectMeta, sess *v1.Session) bool {
 	if sess == nil {
 		return false
 	}
-	ref := metav1.NewControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))
+	ref := newControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))
 	if ref == nil {
 		return false
 	}

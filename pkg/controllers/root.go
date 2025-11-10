@@ -25,6 +25,10 @@ const (
 	statefulSetRevisionSuffixLength = 11 // "-" + 10 char hash
 )
 
+var (
+	labelValueMaxFn = func() int { return validation.LabelValueMaxLength }
+)
+
 type rootHandler struct {
 	ctx          context.Context
 	apply        apply.Apply
@@ -35,6 +39,10 @@ type rootHandler struct {
 	services     generic.ControllerInterface[*corev1.Service, *corev1.ServiceList]
 	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
 	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
+
+	workerStatusHook  func(*v1.Root) (bool, int32, []string, error)
+	resolveDllamaHook func(*v1.Root) (*v1.Dllama, error)
+	resolveModelHook  func(*v1.Dllama) (*v1.Model, error)
 }
 
 func registerRootController(ctx context.Context, m *Manager) error {
@@ -66,7 +74,7 @@ func registerRootController(ctx context.Context, m *Manager) error {
 
 func rootStatefulSetName(name string) string {
 	suffix := "-root"
-	max := validation.LabelValueMaxLength - statefulSetRevisionSuffixLength
+	max := labelValueMaxFn() - statefulSetRevisionSuffixLength
 	baseMax := max - len(suffix)
 	if baseMax < 1 {
 		baseMax = 1
@@ -363,6 +371,9 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 }
 
 func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int32, endpoints []string, err error) {
+	if hook := h.workerStatusHook; hook != nil {
+		return hook(root)
+	}
 	if root == nil {
 		return false, 0, nil, nil
 	}
@@ -567,6 +578,9 @@ func buildLLMNATSEnv(cfg *v1.RootNATSConfig) []corev1.EnvVar {
 }
 
 func (h *rootHandler) resolveDllama(root *v1.Root) (*v1.Dllama, error) {
+	if hook := h.resolveDllamaHook; hook != nil {
+		return hook(root)
+	}
 	dllamaName := labelValue(root.Labels, labelDllamaName)
 	if dllamaName == "" {
 		return nil, fmt.Errorf("root %s/%s missing dllama label", root.Namespace, root.Name)
@@ -575,6 +589,9 @@ func (h *rootHandler) resolveDllama(root *v1.Root) (*v1.Dllama, error) {
 }
 
 func (h *rootHandler) resolveModel(dllama *v1.Dllama) (*v1.Model, error) {
+	if hook := h.resolveModelHook; hook != nil {
+		return hook(dllama)
+	}
 	if dllama == nil {
 		return nil, fmt.Errorf("dllama not provided")
 	}

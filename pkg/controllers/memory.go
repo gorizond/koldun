@@ -29,10 +29,7 @@ func rootMemoryOverheadRatio(workerReplicas int32, override *float64) float64 {
 		decayWorkers = 1
 	}
 	ratio := rootOverheadMaxRatio - (rootOverheadMaxRatio-rootOverheadMinRatio)*decayWorkers
-	if ratio < rootOverheadMinRatio {
-		ratio = rootOverheadMinRatio
-	}
-	return ratio
+	return math.Max(ratio, rootOverheadMinRatio)
 }
 
 func calculateMemoryRequests(conversionSizeBytes int64, workerReplicas int32, override *float64) (root resource.Quantity, worker resource.Quantity, ok bool) {
@@ -48,14 +45,7 @@ func calculateMemoryRequests(conversionSizeBytes int64, workerReplicas int32, ov
 	perNodeMi := (float64(conversionSizeBytes) / (1024 * 1024)) / float64(totalNodes)
 
 	workerMi := int64(math.Ceil(perNodeMi * workerMemoryOverheadRatio))
-	if workerMi < 1 {
-		workerMi = 1
-	}
-
 	rootMi := int64(math.Ceil(perNodeMi * rootMemoryOverheadRatio(workerReplicas, override)))
-	if rootMi < workerMi {
-		rootMi = workerMi
-	}
 
 	return resource.MustParse(fmt.Sprintf("%dMi", rootMi)), resource.MustParse(fmt.Sprintf("%dMi", workerMi)), true
 }

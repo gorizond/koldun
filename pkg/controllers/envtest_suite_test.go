@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/rest"
@@ -62,14 +63,29 @@ func TestMain(m *testing.M) {
 		CRDDirectoryPaths: []string{crdPath},
 	}
 
-	// TEMPORARY: Skip envtest.Start() to avoid hanging with coverage
-	// TODO: Fix envtest.Stop() deadlock with coverage enabled
-	envtestSkipReason = "envtest temporarily disabled due to coverage deadlock"
-	fmt.Fprintf(os.Stderr, "envtest disabled: %s\n", envtestSkipReason)
-	testEnv = nil
-	testEnvConfig = nil
+	cfg, err := testEnv.Start()
+	if err != nil {
+		if shouldSkipEnvtest(err) {
+			envtestSkipReason = fmt.Sprintf("envtest unavailable: %v", err)
+			fmt.Fprintf(os.Stderr, "envtest disabled: %s\n", envtestSkipReason)
+			testEnv = nil
+			testEnvConfig = nil
+		} else {
+			fmt.Fprintf(os.Stderr, "failed to start envtest: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		testEnvConfig = cfg
+	}
 
 	code := m.Run()
+
+	if testEnv != nil {
+		if stopErr := stopEnvtestWithTimeout(testEnv, 15*time.Second); stopErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: envtest shutdown incomplete: %v\n", stopErr)
+		}
+	}
+
 	os.Exit(code)
 }
 
@@ -340,5 +356,21 @@ func projectRoot() string {
 			return dir
 		}
 		dir = parent
+	}
+}
+
+func stopEnvtestWithTimeout(env *envtest.Environment, timeout time.Duration) error {
+	if env == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- env.Stop()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("envtest.Stop() timed out after %s", timeout)
 	}
 }

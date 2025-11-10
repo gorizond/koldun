@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -192,6 +193,54 @@ func TestSessionCheckHealthScenarios(t *testing.T) {
 	})
 }
 
+func TestSessionEnsureTopologyScalesUp(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	createCalls := 0
+	dispatchCalls := 0
+
+	h := &sessionHandler{
+		dllamas: dllamas,
+		createDllamaFn: func(*v1.Session) error {
+			createCalls++
+			return nil
+		},
+		ensureDispatcherFn: func(*v1.Session) error {
+			dispatchCalls++
+			return nil
+		},
+		log: logrus.NewEntry(logrus.New()),
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("ns", gomock.Any()).Return(nil, nil)
+
+	sess := &v1.Session{ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "ns"}, Spec: v1.SessionSpec{MinIdle: 2}}
+	require.NoError(t, h.ensureTopology(sess))
+	require.Equal(t, 1, createCalls)
+	require.Equal(t, 1, dispatchCalls)
+}
+
+func TestSessionCheckHealthInvalidURL(t *testing.T) {
+	h := &sessionHandler{ctx: context.Background(), httpClient: &http.Client{Timeout: time.Second}}
+	require.False(t, h.checkHealth("bad\x00host"))
+}
+
+func TestScalingParamsClampMax(t *testing.T) {
+	sess := &v1.Session{Spec: v1.SessionSpec{MinIdle: 5, MaxWorkers: 2}}
+	params := scalingParamsFromSession(sess)
+	require.Equal(t, int32(5), params.max)
+}
+
+func TestScalingParamsDefaultMin(t *testing.T) {
+	sess := &v1.Session{Spec: v1.SessionSpec{MinIdle: 0}}
+	params := scalingParamsFromSession(sess)
+	require.Equal(t, int32(1), params.min)
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -251,6 +300,82 @@ func TestSessionEnsureTopologyCreatesResources(t *testing.T) {
 	require.Len(t, fakeApply.appliedObjects, 1, "dispatcher deployment should be applied")
 }
 
+func TestSessionEnsureTopologyScalesUpWhenBelowDesired(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &sessionHandler{
+		ctx:     context.Background(),
+		dllamas: dllamas,
+		log:     logrus.NewEntry(logrus.New()),
+	}
+
+	createCalls := 0
+	dispatchCalls := 0
+	handler.createDllamaFn = func(*v1.Session) error {
+		createCalls++
+		return nil
+	}
+	handler.ensureDispatcherFn = func(*v1.Session) error {
+		dispatchCalls++
+		return nil
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "models"},
+		Spec: v1.SessionSpec{
+			ModelRef:    v1.ModelReference{Name: "model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+			Scaling: &v1.SessionScalingSpec{
+				MinDllamas:     1,
+				DesiredDllamas: 2,
+			},
+		},
+		Status: v1.SessionStatus{
+			Workers: []v1.SessionWorker{{Name: "chat-dllama-0"}},
+		},
+	}
+	sess.UID = "sess-uid"
+
+	desired := desiredDllamaSpecForSession(sess)
+	readyDllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-dllama-0",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelSessionName:      sanitizeLabelValue(sess.Name),
+				labelConversationHash: sanitizeLabelValue(sess.Spec.Hash),
+				labelModelName:        sanitizeLabelValue(sess.Spec.ModelRef.Name),
+				labelDllamaName:       sanitizeLabelValue("chat-dllama-0"),
+			},
+			Annotations: map[string]string{
+				labelConversationHash: strings.TrimSpace(sess.Spec.Hash),
+			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))},
+		},
+		Spec: desired,
+		Status: v1.DllamaStatus{
+			ReadyRoot: true,
+			Conditions: []metav1.Condition{{
+				Type:   conditionReady,
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("models", gomock.Any()).Return([]*v1.Dllama{readyDllama}, nil)
+
+	require.NoError(t, handler.ensureTopology(sess))
+	require.Equal(t, 1, createCalls, "create hook should run when below desired replicas")
+	require.Equal(t, 1, dispatchCalls, "dispatcher should run after scale up")
+}
+
 func TestSessionEnsureTopologyListError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -271,6 +396,79 @@ func TestSessionEnsureTopologyListError(t *testing.T) {
 
 	err := handler.ensureTopology(sess)
 	require.EqualError(t, err, "list failure")
+}
+
+func TestSessionEnsureTopologyPropagatesScaleUpError(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &sessionHandler{
+		ctx:     context.Background(),
+		dllamas: dllamas,
+		log:     logrus.NewEntry(logrus.New()),
+	}
+
+	createErr := errors.New("create failure")
+	handler.createDllamaFn = func(*v1.Session) error {
+		return createErr
+	}
+	handler.ensureDispatcherFn = func(*v1.Session) error {
+		t.Fatal("dispatcher should not run when create fails")
+		return nil
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "models"},
+		Spec: v1.SessionSpec{
+			ModelRef:    v1.ModelReference{Name: "model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+			Scaling: &v1.SessionScalingSpec{
+				MinDllamas:     1,
+				DesiredDllamas: 2,
+			},
+		},
+		Status: v1.SessionStatus{
+			Workers: []v1.SessionWorker{{Name: "chat-dllama-0"}},
+		},
+	}
+	sess.UID = "sess-uid"
+
+	desired := desiredDllamaSpecForSession(sess)
+	readyDllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-dllama-0",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelSessionName:      sanitizeLabelValue(sess.Name),
+				labelConversationHash: sanitizeLabelValue(sess.Spec.Hash),
+				labelModelName:        sanitizeLabelValue(sess.Spec.ModelRef.Name),
+				labelDllamaName:       sanitizeLabelValue("chat-dllama-0"),
+			},
+			Annotations: map[string]string{
+				labelConversationHash: strings.TrimSpace(sess.Spec.Hash),
+			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))},
+		},
+		Spec: desired,
+		Status: v1.DllamaStatus{
+			ReadyRoot: true,
+			Conditions: []metav1.Condition{{
+				Type:   conditionReady,
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("models", gomock.Any()).Return([]*v1.Dllama{readyDllama}, nil)
+
+	err := handler.ensureTopology(sess)
+	require.ErrorIs(t, err, createErr)
 }
 
 func TestSessionEnsureTopologyReconcileError(t *testing.T) {
@@ -475,6 +673,86 @@ func TestSessionEnsureTopologyScaleDownDeleteError(t *testing.T) {
 	err := handler.ensureTopology(session)
 	require.EqualError(t, err, "delete failure")
 	require.Len(t, handler.apply.(*fakeApply).appliedObjects, 0, "dispatcher should not apply when delete fails")
+}
+
+func TestSessionEnsureTopologyNoScaleRunsDispatcher(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &sessionHandler{
+		ctx:     context.Background(),
+		dllamas: dllamas,
+		log:     logrus.NewEntry(logrus.New()),
+	}
+
+	handler.createDllamaFn = func(*v1.Session) error {
+		t.Fatal("create hook should not run when pool size is steady")
+		return nil
+	}
+	handler.deleteDllamaFn = func(*v1.Session, *v1.Dllama) error {
+		t.Fatal("delete hook should not run when pool size is steady")
+		return nil
+	}
+
+	dispatchCalls := 0
+	handler.ensureDispatcherFn = func(*v1.Session) error {
+		dispatchCalls++
+		return nil
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "models"},
+		Spec: v1.SessionSpec{
+			ModelRef:    v1.ModelReference{Name: "model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+			Scaling: &v1.SessionScalingSpec{
+				MinDllamas:     1,
+				MaxDllamas:     3,
+				DesiredDllamas: 1,
+			},
+		},
+		Status: v1.SessionStatus{
+			Workers: []v1.SessionWorker{{Name: "chat-dllama-0"}},
+		},
+	}
+	sess.UID = "sess-uid"
+
+	desired := desiredDllamaSpecForSession(sess)
+	readyDllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat-dllama-0",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelSessionName:      sanitizeLabelValue(sess.Name),
+				labelConversationHash: sanitizeLabelValue(sess.Spec.Hash),
+				labelModelName:        sanitizeLabelValue(sess.Spec.ModelRef.Name),
+				labelDllamaName:       sanitizeLabelValue("chat-dllama-0"),
+			},
+			Annotations: map[string]string{
+				labelConversationHash: strings.TrimSpace(sess.Spec.Hash),
+			},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(sess, v1.SchemeGroupVersion.WithKind("Session"))},
+		},
+		Spec: desired,
+		Status: v1.DllamaStatus{
+			ReadyRoot: true,
+			Conditions: []metav1.Condition{{
+				Type:   conditionReady,
+				Status: metav1.ConditionTrue,
+			}},
+		},
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("models", gomock.Any()).Return([]*v1.Dllama{readyDllama}, nil)
+
+	require.NoError(t, handler.ensureTopology(sess))
+	require.Equal(t, 1, dispatchCalls, "dispatcher should still run when no scaling occurs")
 }
 
 func TestSessionEnsureTopologyCreateDllamaError(t *testing.T) {
@@ -1505,4 +1783,22 @@ func TestSessionDeleteDllamaPropagatesError(t *testing.T) {
 
 	err := handler.deleteDllama(&v1.Session{}, target)
 	require.EqualError(t, err, "delete failure")
+}
+
+func TestSessionDeleteDllamaUsesHook(t *testing.T) {
+	called := 0
+	handler := &sessionHandler{
+		deleteDllamaFn: func(sess *v1.Session, dllama *v1.Dllama) error {
+			require.Equal(t, "chat", sess.Name)
+			require.Equal(t, "chat-dllama-0", dllama.Name)
+			called++
+			return nil
+		},
+	}
+
+	sess := &v1.Session{ObjectMeta: metav1.ObjectMeta{Name: "chat"}}
+	target := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Name: "chat-dllama-0"}}
+
+	require.NoError(t, handler.deleteDllama(sess, target))
+	require.Equal(t, 1, called, "hook should be invoked exactly once")
 }

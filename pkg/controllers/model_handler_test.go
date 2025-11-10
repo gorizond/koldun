@@ -39,6 +39,32 @@ func TestModelHandlerOnRelatedJobDeletion(t *testing.T) {
 	require.Nil(t, result)
 }
 
+func TestModelHandlerOnRelatedJobDeletionSkipsInvalidKey(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	models.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+	handler := &modelHandler{models: models}
+
+	result, err := handler.onRelatedJob("malformed", nil)
+	require.NoError(t, err)
+	require.Nil(t, result)
+}
+
+func TestModelHandlerOnRelatedJobDeletionSkipsUnknownSuffix(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	models.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+	handler := &modelHandler{models: models}
+
+	result, err := handler.onRelatedJob("models/mistral", nil)
+	require.NoError(t, err)
+	require.Nil(t, result)
+}
+
 func TestModelHandlerOnRelatedJobStatusChange(t *testing.T) {
 
 	ctrl := gomock.NewController(t)

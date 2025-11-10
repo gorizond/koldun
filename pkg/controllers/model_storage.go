@@ -25,6 +25,8 @@ func defaultMinioFactory(host string, opts *minio.Options) (minioClient, error) 
 	return minio.New(host, opts)
 }
 
+var fallbackMinioFactory = defaultMinioFactory
+
 // Object Storage functions
 //
 // This file contains functions for interacting with S3/MinIO object storage:
@@ -99,7 +101,7 @@ func (h *modelHandler) ensureObjectStorageBuckets(obj *v1.Model) error {
 
 	factory := h.minioFactory
 	if factory == nil {
-		factory = defaultMinioFactory
+		factory = fallbackMinioFactory
 	}
 
 	client, err := factory(host, &minio.Options{

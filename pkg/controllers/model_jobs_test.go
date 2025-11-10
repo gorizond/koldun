@@ -543,6 +543,128 @@ func TestEnsureConversionJobCreatesJob(t *testing.T) {
 	}
 }
 
+func TestEnsureConversionJobSkipsWhenAlreadySucceeded(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ConversionState:    "Succeeded",
+			ObservedGeneration: 5,
+		},
+	}
+	model.Generation = 5
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+	if applySpy.Count != 0 {
+		t.Fatalf("expected no apply calls, got %d", applySpy.Count)
+	}
+}
+
+func TestEnsureConversionJobSkipsOutdatedJobWhileRunning(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+
+	handler := &modelHandler{jobs: jobs}
+	jobs.EXPECT().Cache().Return(jobsCache)
+	running := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "1"},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(running, nil)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 2,
+			ConversionState:    "Running",
+		},
+	}
+	model.Generation = 2
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+}
+
+func TestEnsureConversionJobPropagatesDllamaLabel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral",
+			Namespace: "models",
+			Labels: map[string]string{
+				labelDllamaName: "dllama-a",
+			},
+		},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 3,
+		},
+	}
+	model.Generation = 3
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+
+	var job *batchv1.Job
+	for _, set := range applySpy.Objects {
+		for _, obj := range set.All() {
+			if converted, ok := obj.(*batchv1.Job); ok {
+				job = converted
+			}
+		}
+	}
+	if job == nil {
+		t.Fatal("expected job to be applied")
+	}
+	if job.Labels[labelDllamaName] != "dllama-a" {
+		t.Fatalf("job label %s = %q, want dllama-a", labelDllamaName, job.Labels[labelDllamaName])
+	}
+}
+
 func TestEnsureConversionJobSkipsWithoutBuckets(t *testing.T) {
 	handler := &modelHandler{}
 	model := &v1.Model{
@@ -1016,6 +1138,66 @@ func TestEnsureConversionJobRespectsPVOverrides(t *testing.T) {
 	}
 	if !foundOutputEnv {
 		t.Fatalf("expected CONVERSION_OUTPUT_PATH env var to be set")
+	}
+}
+
+func TestEnsureConversionJobAccessModesIncludeReadWriteMany(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		apply: applySpy,
+		jobs:  jobs,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-convert"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+			PV: &v1.ModelPVSpec{
+				PVCAccessModes: []string{"ReadWriteMany"},
+			},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ObservedGeneration: 1,
+		},
+	}
+	model.Generation = 1
+
+	if err := handler.ensureConversionJob(model); err != nil {
+		t.Fatalf("ensureConversionJob returned error: %v", err)
+	}
+
+	var inputPVC, outputPVC *corev1.PersistentVolumeClaim
+	for _, set := range applySpy.Objects {
+		for _, obj := range set.All() {
+			switch pvc := obj.(type) {
+			case *corev1.PersistentVolumeClaim:
+				if strings.Contains(pvc.Name, "-output-") {
+					outputPVC = pvc
+				} else {
+					inputPVC = pvc
+				}
+			}
+		}
+	}
+	if inputPVC == nil || outputPVC == nil {
+		t.Fatal("expected both input and output PVCs")
+	}
+	if len(inputPVC.Spec.AccessModes) != 1 || inputPVC.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("input PVC access modes = %v, want [ReadWriteMany]", inputPVC.Spec.AccessModes)
+	}
+	if len(outputPVC.Spec.AccessModes) != 1 || outputPVC.Spec.AccessModes[0] != corev1.ReadWriteMany {
+		t.Fatalf("output PVC access modes = %v, want [ReadWriteMany]", outputPVC.Spec.AccessModes)
 	}
 }
 
@@ -2635,6 +2817,61 @@ func TestEnsureSizingJobCreatesJob(t *testing.T) {
 	}
 	if job.Annotations[annotationModelGeneration] != "2" {
 		t.Fatalf("expected annotationModelGeneration=2, got %s", job.Annotations[annotationModelGeneration])
+	}
+}
+
+func TestEnsureSizingJobAddsForceTokenAnnotation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+
+	handler := &modelHandler{
+		jobs:  jobs,
+		apply: applySpy,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache)
+	jobsCache.EXPECT().Get("models", "mistral-size").Return((*batchv1.Job)(nil), apierrors.NewNotFound(schema.GroupResource{Group: "batch", Resource: "jobs"}, "mistral-size"))
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "mistral",
+			Namespace:       "models",
+			Annotations:     map[string]string{annotationForceSizeRerun: "  rerun-now  "},
+			ResourceVersion: "7",
+		},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:      "Succeeded",
+			ConversionState:    "Succeeded",
+			ObservedGeneration: 4,
+			OutputPVCName:      "mistral-s3-output-pvc",
+		},
+	}
+	model.Generation = 4
+
+	if err := handler.ensureSizingJob(model); err != nil {
+		t.Fatalf("ensureSizingJob returned error: %v", err)
+	}
+
+	var job *batchv1.Job
+	for _, set := range applySpy.Objects {
+		for _, obj := range set.All() {
+			if created, ok := obj.(*batchv1.Job); ok {
+				job = created
+			}
+		}
+	}
+	if job == nil {
+		t.Fatal("expected sizing job to be applied")
+	}
+	if got := job.Annotations[annotationForceSizeRerun]; got != "rerun-now" {
+		t.Fatalf("force token annotation = %q, want rerun-now", got)
 	}
 }
 

@@ -38,6 +38,11 @@ type natsConnection interface {
 
 type natsDialer func(url string, opts ...nats.Option) (natsConnection, error)
 
+type keyValueProvider interface {
+	KeyValue(bucket string) (nats.KeyValue, error)
+	CreateKeyValue(cfg *nats.KeyValueConfig) (nats.KeyValue, error)
+}
+
 type conversationReconciler struct {
 	cfg ConversationConfig
 
@@ -106,7 +111,7 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 	return nil
 }
 
-func ensureConversationBucket(js nats.JetStreamContext, bucket string) (nats.KeyValue, error) {
+func ensureConversationBucket(js keyValueProvider, bucket string) (nats.KeyValue, error) {
 	bucket = strings.TrimSpace(bucket)
 	if bucket == "" {
 		return nil, fmt.Errorf("bucket name cannot be empty")

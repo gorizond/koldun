@@ -83,9 +83,6 @@ func effectiveConversionSpec(spec *v1.ModelConversionSpec) *v1.ModelConversionSp
 	if out.Image == "" {
 		out.Image = defaultConversionImage
 	}
-	if out.WeightsFloatType == "" {
-		out.WeightsFloatType = defaultWeightsType
-	}
 	if out.Memory == "" {
 		out.Memory = "2Gi"
 	}
@@ -98,6 +95,9 @@ func effectiveConversionSpec(spec *v1.ModelConversionSpec) *v1.ModelConversionSp
 		} else {
 			out.ConvertWeights = defaultWeightsType
 		}
+	}
+	if out.WeightsFloatType == "" {
+		out.WeightsFloatType = defaultWeightsType
 	}
 	return out
 }

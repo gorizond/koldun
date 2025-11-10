@@ -314,21 +314,6 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		changed = true
 	}
 
-	if obj.Annotations != nil && updated.Annotations == nil {
-		updated.Annotations = make(map[string]string)
-	}
-	if obj.Annotations != nil {
-		for k, v := range obj.Annotations {
-			if updated.Annotations[k] != v {
-				if updated.Annotations == nil {
-					updated.Annotations = make(map[string]string)
-				}
-				updated.Annotations[k] = v
-				changed = true
-			}
-		}
-	}
-
 	if !changed {
 		return obj, nil
 	}

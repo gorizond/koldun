@@ -32,13 +32,23 @@ type registrySync struct {
 	models  generic.ControllerInterface[*v1.Model, *v1.ModelList]
 	secrets corecontrollers.SecretController
 
-	conn     *nats.Conn
+	conn     registryConnection
 	js       nats.JetStreamContext
 	modelsKV nats.KeyValue
 	tokensKV nats.KeyValue
 }
 
 var jsonMarshal = json.Marshal
+
+type registryConnection interface {
+	JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error)
+	Close()
+	Drain() error
+}
+
+var registryConnectFn = func(url string, opts ...nats.Option) (registryConnection, error) {
+	return nats.Connect(url, opts...)
+}
 
 func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) error {
 	if strings.TrimSpace(cfg.NATSURL) == "" {
@@ -58,7 +68,7 @@ func StartRegistrySync(ctx context.Context, m *Manager, cfg RegistryConfig) erro
 		cfg.TokenPrefix = registry.DefaultTokenPrefix
 	}
 
-	conn, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-registry"))
+	conn, err := registryConnectFn(cfg.NATSURL, nats.Name("koldun-registry"))
 	if err != nil {
 		return fmt.Errorf("connect NATS for registry: %w", err)
 	}

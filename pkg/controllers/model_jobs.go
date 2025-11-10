@@ -148,11 +148,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	if existing, err := h.jobs.Cache().Get(obj.Namespace, jobName); err == nil && existing != nil {
 		klog.V(1).Infof("Model %s/%s: final safety check - found existing job %s", obj.Namespace, obj.Name, jobName)
 		if !isJobFinished(existing) {
-			if existing.DeletionTimestamp == nil {
-				klog.V(1).Infof("Model %s/%s: job %s already exists and is not finished, skipping creation", obj.Namespace, obj.Name, jobName)
-			} else {
-				klog.V(1).Infof("Model %s/%s: job %s is deleting and not finished, skipping recreation", obj.Namespace, obj.Name, jobName)
-			}
+			klog.V(1).Infof("Model %s/%s: job %s already exists and is not finished, skipping creation", obj.Namespace, obj.Name, jobName)
 			return nil
 		}
 	}
@@ -353,11 +349,8 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	if inputKey == "" {
 		inputKey = fmt.Sprintf("models/%s", obj.Name)
 	}
-	workDir, convBucket, convKey, convURI := conversionPaths(obj, spec, inputKey)
+	_, convBucket, convKey, convURI := conversionPaths(obj, spec, inputKey)
 	weightsType := spec.WeightsFloatType
-	if weightsType == "" {
-		weightsType = defaultWeightsType
-	}
 
 	labels := map[string]string{
 		labelComponent: componentModel,
@@ -629,8 +622,6 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 			return fmt.Errorf("failed to apply output PVC: %w", err)
 		}
 
-		// When using a dedicated output PVC, stage work directly on that mount
-		workDir = outputMountPath
 	}
 
 	volumes := []corev1.Volume{
@@ -658,13 +649,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	}
 
 	workspaceMount := corev1.VolumeMount{Name: "workspace", MountPath: "/workspace"}
-	// If workDir is outside of /workspace, also mount the same volume at workDir (only needed when not using dedicated output PVC)
-	useAdditionalMount := outputPVCName == "" && !strings.HasPrefix(workDir, "/workspace")
-	additionalMount := corev1.VolumeMount{Name: "workspace", MountPath: workDir}
 	mountsForWorkdir := []corev1.VolumeMount{workspaceMount}
-	if useAdditionalMount {
-		mountsForWorkdir = append(mountsForWorkdir, additionalMount)
-	}
 
 	// Init container: fetch converter scripts from GitHub
 	converterVersion := spec.ConverterVersion
@@ -692,9 +677,6 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	// Use S3 mounted path as working directory for reading inputs
 	s3WorkDir := filepath.Join("/mnt/s3", inputKey)
 	mainContainer := h.buildConversionContainer(obj, spec, s3WorkDir, inputKey, convBucket, convKey, convURI, weightsType, expectedGeneration)
-	if useAdditionalMount {
-		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, additionalMount)
-	}
 	// mount S3 PVC into main with read-only access
 	mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3", MountPath: "/mnt/s3"})
 	if outputPVCName != "" {
