@@ -192,7 +192,7 @@ func KVDeleteWithRetry(kv NATSKeyValue, key string, cfg RetryConfig, log *logrus
 
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 		start := time.Now()
-		err := kv.Delete(key)
+		err := kv.Delete(key) // No opts needed for our use case
 		metrics.NATSKVOperationDuration.WithLabelValues("delete", bucketName).Observe(time.Since(start).Seconds())
 
 		if err == nil || errors.Is(err, nats.ErrKeyNotFound) {

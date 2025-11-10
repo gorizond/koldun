@@ -198,17 +198,22 @@ func (mr *MockNATSKeyValueMockRecorder) Create(key, value any) *gomock.Call {
 }
 
 // Delete mocks base method.
-func (m *MockNATSKeyValue) Delete(key string) error {
+func (m *MockNATSKeyValue) Delete(key string, opts ...nats.DeleteOpt) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Delete", key)
+	varargs := []any{key}
+	for _, a := range opts {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "Delete", varargs...)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // Delete indicates an expected call of Delete.
-func (mr *MockNATSKeyValueMockRecorder) Delete(key any) *gomock.Call {
+func (mr *MockNATSKeyValueMockRecorder) Delete(key any, opts ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockNATSKeyValue)(nil).Delete), key)
+	varargs := append([]any{key}, opts...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Delete", reflect.TypeOf((*MockNATSKeyValue)(nil).Delete), varargs...)
 }
 
 // Get mocks base method.

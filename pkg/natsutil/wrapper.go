@@ -64,8 +64,8 @@ func (w *NATSKeyValueWrapper) Put(key string, value []byte) (uint64, error) {
 	return w.kv.Put(key, value)
 }
 
-func (w *NATSKeyValueWrapper) Delete(key string) error {
-	return w.kv.Delete(key)
+func (w *NATSKeyValueWrapper) Delete(key string, opts ...nats.DeleteOpt) error {
+	return w.kv.Delete(key, opts...)
 }
 
 func (w *NATSKeyValueWrapper) Keys(opts ...nats.WatchOpt) ([]string, error) {
