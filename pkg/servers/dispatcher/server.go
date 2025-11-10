@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/metrics"
+	"github.com/gorizond/koldun/pkg/natsutil"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 )
@@ -35,19 +36,18 @@ type Server struct {
 	cfg Config
 	log *logrus.Entry
 
-	nc *nats.Conn
-	js nats.JetStreamContext
-
+	nc          natsutil.NATSConn
+	js          nats.JetStreamContext
 	backlogSub  *nats.Subscription
 	stateSub    *nats.Subscription
-	assignments nats.KeyValue
+	assignments natsutil.NATSKeyValue
 
 	mu            sync.Mutex
 	workers       map[string]*workerState
 	inflight      map[string]*assignment
 	lastNoIdleLog time.Time
 
-	retryConfig   RetryConfig
+	retryConfig   natsutil.RetryConfig
 	metricsServer *http.Server
 }
 
@@ -100,26 +100,30 @@ func New(cfg Config) (*Server, error) {
 		logger = logrus.StandardLogger().WithField("component", "dispatcher")
 	}
 
-	nc, err := nats.Connect(cfg.NATSURL, nats.Name(fmt.Sprintf("dispatcher-%s", cfg.Hash)))
+	natsConn, err := nats.Connect(cfg.NATSURL, nats.Name(fmt.Sprintf("dispatcher-%s", cfg.Hash)))
 	if err != nil {
 		return nil, fmt.Errorf("connect nats: %w", err)
 	}
-	js, err := nc.JetStream()
+	js, err := natsConn.JetStream()
 	if err != nil {
-		nc.Close()
+		natsConn.Close()
 		return nil, fmt.Errorf("jetstream: %w", err)
 	}
 
-	kv, err := js.KeyValue(cfg.AssignmentsBucket)
+	kvRaw, err := js.KeyValue(cfg.AssignmentsBucket)
 	if err != nil {
 		if errors.Is(err, nats.ErrBucketNotFound) {
-			kv, err = js.CreateKeyValue(&nats.KeyValueConfig{Bucket: cfg.AssignmentsBucket, History: 1})
+			kvRaw, err = js.CreateKeyValue(&nats.KeyValueConfig{Bucket: cfg.AssignmentsBucket, History: 1})
 		}
 		if err != nil {
-			nc.Close()
+			natsConn.Close()
 			return nil, fmt.Errorf("assignments bucket %s: %w", cfg.AssignmentsBucket, err)
 		}
 	}
+
+	// Wrap NATS objects in interfaces for testability
+	nc := natsutil.NewNATSConnWrapper(natsConn)
+	kv := natsutil.NewNATSKeyValueWrapper(kvRaw)
 
 	srv := &Server{
 		cfg:         cfg,
@@ -129,7 +133,7 @@ func New(cfg Config) (*Server, error) {
 		assignments: kv,
 		workers:     make(map[string]*workerState),
 		inflight:    make(map[string]*assignment),
-		retryConfig: DefaultRetryConfig(),
+		retryConfig: natsutil.DefaultRetryConfig(),
 	}
 	return srv, nil
 }

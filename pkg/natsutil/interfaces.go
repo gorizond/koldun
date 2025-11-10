@@ -46,7 +46,7 @@ type NATSKeyValue interface {
 	Put(key string, value []byte) (uint64, error)
 
 	// Delete deletes a key.
-	Delete(key string) error
+	Delete(key string, opts ...nats.DeleteOpt) error
 
 	// Keys returns all keys in the bucket.
 	Keys(opts ...nats.WatchOpt) ([]string, error)
