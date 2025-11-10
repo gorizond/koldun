@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
@@ -703,6 +704,86 @@ func TestEnsureStatusConversionAndSizingSuccessClearsForceAnnotation(t *testing.
 	}
 	if result.Status.ConversionSizeForceToken != "annotation-rv-13" {
 		t.Fatalf("final ConversionSizeForceToken = %q, want annotation-rv-13", result.Status.ConversionSizeForceToken)
+	}
+}
+
+func TestEnsureStatusForceAnnotationUpdateError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	podsCache := genericfake.NewMockCacheInterface[*corev1.Pod](ctrl)
+	pods := genericfake.NewMockControllerInterface[*corev1.Pod, *corev1.PodList](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+
+	handler := &modelHandler{
+		models: models,
+		jobs:   jobs,
+		pods:   pods,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	gomock.InOrder(
+		jobsCache.EXPECT().Get("models", "alpha-download").Return(&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "alpha-download", Namespace: "models"},
+			Status:     batchv1.JobStatus{Succeeded: 1},
+		}, nil),
+		jobsCache.EXPECT().Get("models", "alpha-convert").Return(&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "alpha-convert", Namespace: "models"},
+			Status:     batchv1.JobStatus{Succeeded: 1},
+		}, nil),
+		jobsCache.EXPECT().Get("models", "alpha-size").Return(&batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: "alpha-size", Namespace: "models"},
+			Status:     batchv1.JobStatus{Succeeded: 1},
+		}, nil),
+	)
+
+	pods.EXPECT().Cache().Return(podsCache)
+	podsCache.EXPECT().List("models", gomock.Any()).Return([]*corev1.Pod{
+		{
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: `{"bytes":1024,"human":"1 KiB"}`}},
+			}}},
+		},
+	}, nil)
+
+	models.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Model{})).DoAndReturn(func(updated *v1.Model) (*v1.Model, error) {
+		return updated, nil
+	})
+	updateErr := fmt.Errorf("clear annotation failed")
+	models.EXPECT().Update(gomock.AssignableToTypeOf(&v1.Model{})).Return(nil, updateErr)
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "alpha",
+			Namespace:       "models",
+			ResourceVersion: "42",
+		},
+		Spec: v1.ModelSpec{
+			SourceURL: "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "models-bucket",
+				BucketForConvert: "convert-bucket",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+		Status: v1.ModelStatus{
+			DownloadState:            "Running",
+			ConversionState:          "Running",
+			ConversionSizeState:      "Pending",
+			ConversionSizeForceToken: "",
+			ObservedGeneration:       2,
+		},
+	}
+	model.Generation = 2
+	model.Annotations = map[string]string{annotationForceSizeRerun: ""}
+
+	if _, err := handler.ensureStatus(model); err != updateErr {
+		if err == nil {
+			t.Fatal("expected error when Update fails")
+		}
+		t.Fatalf("expected %v, got %v", updateErr, err)
 	}
 }
 

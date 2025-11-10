@@ -50,6 +50,16 @@ func TestEnsureAnnotations(t *testing.T) {
 	require.Equal(t, map[string]string{"key": "value", "another": "entry"}, meta.Annotations)
 }
 
+func TestEnsureOwnerReferenceHandlesNilControllerRef(t *testing.T) {
+	orig := newControllerRef
+	t.Cleanup(func() { newControllerRef = orig })
+	newControllerRef = func(owner metav1.Object, gvk schema.GroupVersionKind) *metav1.OwnerReference {
+		return nil
+	}
+	meta := &metav1.ObjectMeta{}
+	require.False(t, ensureOwnerReference(meta, &v1.Session{}))
+}
+
 func TestEnsureTrailingDotHelper(t *testing.T) {
 	require.Equal(t, "", ensureTrailingDot(""))
 	require.Equal(t, "prefix.", ensureTrailingDot("prefix"))

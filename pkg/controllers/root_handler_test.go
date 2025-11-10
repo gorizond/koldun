@@ -40,6 +40,28 @@ func TestRootStatefulSetName(t *testing.T) {
 	require.NotContains(t, edgeResult, "--", "truncation should not introduce double dashes")
 }
 
+func TestRootStatefulSetNameBaseClamp(t *testing.T) {
+	orig := labelValueMaxFn
+	t.Cleanup(func() { labelValueMaxFn = orig })
+	labelValueMaxFn = func() int { return statefulSetRevisionSuffixLength + 2 }
+	result := rootStatefulSetName("demo-root")
+	require.Equal(t, "d-root", result)
+}
+
+func TestRootStatefulSetNameHandlesEmptyPrefix(t *testing.T) {
+	result := rootStatefulSetName("-root")
+	require.Equal(t, "-root", result)
+}
+
+func TestRootStatefulSetNameTrimsHyphenPrefix(t *testing.T) {
+	name := strings.Repeat("-", 60) + "-tail-root"
+	result := rootStatefulSetName(name)
+
+	expectedPrefix := validation.LabelValueMaxLength - statefulSetRevisionSuffixLength - len("-root")
+	require.Equal(t, strings.Repeat("-", expectedPrefix)+"-root", result)
+	require.LessOrEqual(t, len(result), validation.LabelValueMaxLength-statefulSetRevisionSuffixLength)
+}
+
 func TestBuildLLMNATSEnv(t *testing.T) {
 
 	require.Nil(t, buildLLMNATSEnv(nil))
@@ -337,6 +359,34 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 	})
 }
 
+func TestRootHandlerWorkerStatusWorkerCacheError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	workerCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+
+	h := &rootHandler{
+		workers: workers,
+		resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return &v1.Dllama{
+				ObjectMeta: metav1.ObjectMeta{Name: "dllama", Namespace: "ns"},
+				Spec:       v1.DllamaSpec{ReplicaPower: 1},
+			}, nil
+		},
+	}
+
+	workers.EXPECT().Cache().Return(workerCache)
+	workerCache.EXPECT().Get("ns", workerResourceName("dllama")).Return(nil, fmt.Errorf("cache failure"))
+
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"},
+		Spec:       v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}},
+	}
+	_, _, _, err := h.workerStatus(root)
+	require.EqualError(t, err, "cache failure")
+}
+
 func TestRootHandlerEnsureServiceAppliesHeadlessService(t *testing.T) {
 
 	fakeApply := newFakeApply()
@@ -366,6 +416,19 @@ func TestRootHandlerEnsureServiceAppliesHeadlessService(t *testing.T) {
 	}, svc.ObjectMeta.Labels)
 	require.Equal(t, sanitizeLabelValue(root.Name), svc.Spec.Selector[labelRootName])
 	require.Equal(t, "mistral", svc.Spec.Selector[labelDllamaName])
+}
+
+func TestRootHandlerOnChangePropagatesEnsureStatefulSetError(t *testing.T) {
+	h := &rootHandler{
+		apply: newFakeApply(),
+		workerStatusHook: func(*v1.Root) (bool, int32, []string, error) {
+			return false, 0, nil, fmt.Errorf("worker status boom")
+		},
+	}
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"}, Spec: v1.RootSpec{ModelRef: "model-pvc"}}
+	result, err := h.onChange("ns/demo", root)
+	require.EqualError(t, err, "worker status boom")
+	require.Same(t, root, result)
 }
 
 func TestRootHandlerEnsureStatefulSetWaitsForWorkers(t *testing.T) {
@@ -400,6 +463,109 @@ func TestRootHandlerEnsureStatefulSetWaitsForWorkers(t *testing.T) {
 
 	require.NoError(t, h.ensureStatefulSet(root))
 	require.Empty(t, fakeApply.appliedObjects, "statefulset should not be applied while workers converge")
+}
+
+func TestRootHandlerEnsureStatefulSetWorkerStatusError(t *testing.T) {
+	h := &rootHandler{
+		workerStatusHook: func(*v1.Root) (bool, int32, []string, error) {
+			return false, 0, nil, fmt.Errorf("status boom")
+		},
+	}
+	err := h.ensureStatefulSet(&v1.Root{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"}})
+	require.EqualError(t, err, "status boom")
+}
+
+func TestRootHandlerEnsureStatefulSetResolveDllamaError(t *testing.T) {
+	h := &rootHandler{
+		workerStatusHook: func(*v1.Root) (bool, int32, []string, error) {
+			return true, 1, []string{"endpoint"}, nil
+		},
+		resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return nil, fmt.Errorf("dllama boom")
+		},
+	}
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"}, Spec: v1.RootSpec{ModelRef: "model-pvc"}}
+	require.EqualError(t, h.ensureStatefulSet(root), "dllama boom")
+}
+
+func TestRootHandlerEnsureStatefulSetResolveModelError(t *testing.T) {
+	h := &rootHandler{
+		workerStatusHook: func(*v1.Root) (bool, int32, []string, error) {
+			return true, 1, []string{"endpoint"}, nil
+		},
+		resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return &v1.Dllama{
+				ObjectMeta: metav1.ObjectMeta{Name: "dllama", Namespace: "ns"},
+				Spec:       v1.DllamaSpec{ReplicaPower: 1, ModelRef: v1.ModelReference{Name: "model"}},
+			}, nil
+		},
+		resolveModelHook: func(*v1.Dllama) (*v1.Model, error) {
+			return nil, fmt.Errorf("model boom")
+		},
+	}
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "ns"}, Spec: v1.RootSpec{ModelRef: "model-pvc"}}
+	require.EqualError(t, h.ensureStatefulSet(root), "model boom")
+}
+
+func TestRootHandlerEnsureStatefulSetPropagatesApplyError(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	applyMock := newGomockApply(ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+
+	h := &rootHandler{
+		apply:        applyMock,
+		dllamas:      dllamas,
+		models:       models,
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	dllamas.EXPECT().Cache().Return(dllamaCache).AnyTimes()
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: 1,
+			ModelRef:     v1.ModelReference{Name: "mistral"},
+		},
+	}
+	dllamaCache.EXPECT().Get("models", "mistral").Return(dllama, nil).AnyTimes()
+
+	modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+	models.EXPECT().Cache().Return(modelCache).AnyTimes()
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec:       v1.ModelSpec{Conversion: &v1.ModelConversionSpec{WeightsFloatType: "fp16", ConvertWeights: "q4_0"}},
+		Status:     v1.ModelStatus{ConversionSizeBytes: 1 << 30},
+	}
+	modelCache.EXPECT().Get("models", "mistral").Return(model, nil).AnyTimes()
+
+	workerCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+	workers.EXPECT().Cache().Return(workerCache).AnyTimes()
+	workerName := workerResourceName("mistral")
+	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"}}
+	workerCache.EXPECT().Get("models", workerName).Return(worker, nil).AnyTimes()
+
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	statefulsets.EXPECT().Cache().Return(stsCache).AnyTimes()
+	stsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{Status: appsv1.StatefulSetStatus{ReadyReplicas: 1}}, nil)
+
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "mistral-root", Labels: map[string]string{labelDllamaName: "mistral"}},
+		Spec:       v1.RootSpec{ModelRef: "mistral", WorkerSelector: map[string]string{"app": "dllama"}},
+	}
+
+	applyErr := fmt.Errorf("apply failure")
+	applyMock.EXPECT().ApplyObjects(gomock.Any()).Return(applyErr)
+
+	err := h.ensureStatefulSet(root)
+	require.ErrorIs(t, err, applyErr)
 }
 
 func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
@@ -533,6 +699,80 @@ func TestRootHandlerEnsureStatefulSetRequiresConversionWeights(t *testing.T) {
 	err := h.ensureStatefulSet(root)
 	require.EqualError(t, err, "model models/mistral conversion.weightsFloatType is required")
 	require.Empty(t, fakeApply.appliedObjects)
+}
+
+func TestRootHandlerEnsureStatefulSetUsesWeightsFloatTypeFallback(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	fakeApply := newFakeApply()
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+
+	h := &rootHandler{
+		apply:        fakeApply,
+		dllamas:      dllamas,
+		models:       models,
+		workers:      workers,
+		statefulsets: statefulsets,
+	}
+
+	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+	dllamas.EXPECT().Cache().Return(dllamaCache).AnyTimes()
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.DllamaSpec{
+			ReplicaPower: 1,
+			ModelRef:     v1.ModelReference{Name: "mistral-model"},
+		},
+	}
+	dllamaCache.EXPECT().Get("models", "mistral").Return(dllama, nil).AnyTimes()
+
+	modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+	models.EXPECT().Cache().Return(modelCache).AnyTimes()
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral-model", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			Conversion: &v1.ModelConversionSpec{
+				WeightsFloatType: "fp16",
+				ConvertWeights:   "",
+			},
+		},
+		Status: v1.ModelStatus{ConversionSizeBytes: 1 << 30},
+	}
+	modelCache.EXPECT().Get("models", "mistral-model").Return(model, nil).AnyTimes()
+
+	workerCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+	workers.EXPECT().Cache().Return(workerCache).AnyTimes()
+	workerName := workerResourceName("mistral")
+	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"}}
+	workerCache.EXPECT().Get("models", workerName).Return(worker, nil).AnyTimes()
+
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	statefulsets.EXPECT().Cache().Return(stsCache).AnyTimes()
+	stsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{Status: appsv1.StatefulSetStatus{ReadyReplicas: 1}}, nil)
+
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "models",
+			Name:      "mistral-root",
+			Labels:    map[string]string{labelDllamaName: "mistral"},
+		},
+		Spec: v1.RootSpec{
+			ModelRef:       "mistral-model",
+			WorkerSelector: map[string]string{"app": "dllama"},
+		},
+	}
+
+	require.NoError(t, h.ensureStatefulSet(root))
+	require.Len(t, fakeApply.appliedObjects, 1)
+	sts, ok := fakeApply.appliedObjects[0].(*appsv1.StatefulSet)
+	require.True(t, ok)
+	rootContainer := sts.Spec.Template.Spec.Containers[0]
+	require.Contains(t, rootContainer.Args, "model/dllama_model_mistral-model_fp16.m", "quantType should fall back to weights float type")
 }
 
 func TestRootHandlerEnsureStatefulSetRequiresModelRef(t *testing.T) {
@@ -1133,6 +1373,51 @@ func TestRootHandlerEnsureStatusHandlesRootStatefulSetLookupErrors(t *testing.T)
 	require.Equal(t, "StatefulSetLookupFailed", cond.Reason)
 	require.Contains(t, cond.Message, expected.Error())
 	require.Equal(t, root.Generation, updated.Status.ObservedGeneration)
+}
+
+func TestRootHandlerEnsureStatusNoopWhenUnchanged(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	services := genericfake.NewMockControllerInterface[*corev1.Service, *corev1.ServiceList](ctrl)
+	roots := genericfake.NewMockControllerInterface[*v1.Root, *v1.RootList](ctrl)
+
+	h := &rootHandler{
+		workerStatusHook: func(*v1.Root) (bool, int32, []string, error) {
+			return false, 0, nil, nil
+		},
+		services: services,
+		roots:    roots,
+	}
+
+	serviceCache := genericfake.NewMockCacheInterface[*corev1.Service](ctrl)
+	services.EXPECT().Cache().Return(serviceCache).AnyTimes()
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral-root", Namespace: "models"},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 9999}}},
+	}
+	serviceCache.EXPECT().Get("models", "mistral-root").Return(svc, nil)
+	roots.EXPECT().UpdateStatus(gomock.Any()).Times(0)
+
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "mistral-root"},
+		Status: v1.RootStatus{
+			ObservedGeneration: 5,
+			Endpoint:           "mistral-root.models.svc.cluster.local:9999",
+			Conditions: []metav1.Condition{{
+				Type:    conditionReady,
+				Status:  metav1.ConditionFalse,
+				Reason:  "WorkersNotReady",
+				Message: "Waiting for worker pods to become ready",
+			}},
+		},
+	}
+	root.Generation = 5
+
+	result, err := h.ensureStatus(root)
+	require.NoError(t, err)
+	require.Same(t, root, result)
 }
 
 func TestRootHandlerOnChangeReconcilesResources(t *testing.T) {

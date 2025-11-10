@@ -164,6 +164,40 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 	require.Equal(t, truncateName(record.Hash, validation.LabelValueMaxLength), value)
 }
 
+func TestEnsureSessionDefaultsOptionalFields(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	applyMock := newGomockApply(ctrl)
+	reconciler := &conversationReconciler{apply: applyMock}
+
+	record := &conversation.Record{
+		Hash:        "hash",
+		Session:     "sess",
+		Namespace:   "tenant",
+		Model:       "tenant/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+	}
+
+	var applied *v1.Session
+	applyMock.EXPECT().ApplyObjects(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(func(objs ...runtime.Object) error {
+		require.Len(t, objs, 1)
+		var ok bool
+		applied, ok = objs[0].(*v1.Session)
+		require.True(t, ok)
+		return nil
+	})
+
+	require.NoError(t, reconciler.ensureSession(record))
+	require.NotNil(t, applied)
+	require.Equal(t, int32(1), applied.Spec.MinIdle, "MinIdle should default to 1")
+	require.Equal(t, int32(0), applied.Spec.MaxWorkers, "MaxWorkers should default to 0")
+	require.Nil(t, applied.Spec.Scaling, "Scaling should be nil when record lacks scaling")
+	require.Nil(t, applied.Spec.Queue, "Queue should be nil when record lacks queue")
+	require.Nil(t, applied.Spec.NATS, "NATS should be nil when URL empty")
+}
+
 func TestStartConversationReconcilerSkipsWithoutNATSURL(t *testing.T) {
 
 	require.NoError(t, StartConversationReconciler(context.Background(), nil, ConversationConfig{}))
@@ -257,6 +291,58 @@ func TestStartConversationReconcilerStartsLoopAndDrainsConnection(t *testing.T) 
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestStartConversationReconcilerUsesDefaultDialer(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	manager := &Manager{
+		apply: newFakeApply(),
+		Kold: &fakeKoldInterface{
+			session: sessions,
+		},
+	}
+
+	srv := runJetStreamServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	cfg := ConversationConfig{
+		NATSURL:  srv.ClientURL(),
+		KVBucket: "default-dialer",
+	}
+
+	require.NoError(t, StartConversationReconciler(ctx, manager, cfg))
+	cancel()
+}
+
+func TestStartConversationReconcilerClosesConnectionWhenBucketEnsureFails(t *testing.T) {
+	srv := runJetStreamServer(t)
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	tracking := newTrackingConn(nc)
+	failingConn := &failingKVConn{
+		trackingConn: tracking,
+		keyValueErr:  errors.New("kv boom"),
+	}
+
+	cfg := ConversationConfig{
+		NATSURL:  srv.ClientURL(),
+		KVBucket: "conversations",
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			return failingConn, nil
+		},
+	}
+
+	err = StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	require.EqualError(t, err, "kv bucket conversations: kv boom")
+	require.True(t, failingConn.Drained(), "connection should close when bucket ensure fails")
+}
+
 func runJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
 
@@ -331,6 +417,14 @@ func TestEnsureConversationBucketCreatesBucketWhenMissing(t *testing.T) {
 	status, err := kv.Status()
 	require.NoError(t, err)
 	require.Equal(t, bucket, status.Bucket())
+}
+
+func TestEnsureConversationBucketPropagatesUnexpectedErrors(t *testing.T) {
+	provider := &stubKeyValueProvider{keyValueErr: errors.New("kv unavailable")}
+	kv, err := ensureConversationBucket(provider, "broken")
+	require.Nil(t, kv)
+	require.EqualError(t, err, "kv unavailable")
+	require.False(t, provider.createCalled.Load(), "create should not be invoked on non-notfound errors")
 }
 
 type trackingConn struct {
@@ -465,6 +559,26 @@ func TestConversationReconcilerSyncHandlesKeyListingError(t *testing.T) {
 			bucket:  "conversations",
 			keysErr: errors.New("keys failure"),
 		},
+	}
+
+	reconciler.sync(context.Background())
+}
+
+func TestConversationReconcilerSyncHandlesSessionListError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("", gomock.AssignableToTypeOf(labels.Everything())).Return(nil, errors.New("list failure"))
+
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv:       &fakeMemoryKV{bucket: "conversations"},
 	}
 
 	reconciler.sync(context.Background())
@@ -699,4 +813,40 @@ func newSpyingKeyValue(bucket string) *spyingKeyValue {
 func (s *spyingKeyValue) Keys(opts ...nats.WatchOpt) ([]string, error) {
 	s.keysCalls.Add(1)
 	return s.fakeMemoryKV.Keys(opts...)
+}
+
+type failingKVConn struct {
+	*trackingConn
+	keyValueErr error
+}
+
+func (f *failingKVConn) JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error) {
+	js, err := f.trackingConn.JetStream(opts...)
+	if err != nil {
+		return nil, err
+	}
+	return failingKVJetStream{JetStreamContext: js, keyValueErr: f.keyValueErr}, nil
+}
+
+type failingKVJetStream struct {
+	nats.JetStreamContext
+	keyValueErr error
+}
+
+func (f failingKVJetStream) KeyValue(string) (nats.KeyValue, error) {
+	return nil, f.keyValueErr
+}
+
+type stubKeyValueProvider struct {
+	keyValueErr  error
+	createCalled atomic.Bool
+}
+
+func (s *stubKeyValueProvider) KeyValue(string) (nats.KeyValue, error) {
+	return nil, s.keyValueErr
+}
+
+func (s *stubKeyValueProvider) CreateKeyValue(*nats.KeyValueConfig) (nats.KeyValue, error) {
+	s.createCalled.Store(true)
+	return nil, errors.New("unexpected create call")
 }

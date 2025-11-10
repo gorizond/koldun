@@ -363,6 +363,47 @@ func TestConversionPaths(t *testing.T) {
 	}
 }
 
+func TestConversionPathsHandlesBucketWithoutKey(t *testing.T) {
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "src",
+				BucketForConvert: "converted",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+	}
+	spec := &v1.ModelConversionSpec{OutputPath: "s3://converted"}
+	workDir, bucket, key, uri := conversionPaths(model, spec, "downloads/mistral")
+	if workDir != "/workspace/hf" {
+		t.Fatalf("unexpected workDir %q", workDir)
+	}
+	if bucket != "converted" {
+		t.Fatalf("bucket = %q, want converted", bucket)
+	}
+	expectedKey := "downloads/mistral/converted/mistral"
+	if key != expectedKey {
+		t.Fatalf("key = %q, want %q", key, expectedKey)
+	}
+	if uri != "s3://converted/"+expectedKey {
+		t.Fatalf("uri = %q, want %q", uri, "s3://converted/"+expectedKey)
+	}
+}
+
+func TestConversionPathsBucketOnlyUriUsesBucketRoot(t *testing.T) {
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "/../"},
+	}
+	spec := &v1.ModelConversionSpec{OutputPath: "s3://converted"}
+
+	workDir, bucket, key, uri := conversionPaths(model, spec, "/../")
+	require.Equal(t, "/workspace/hf", workDir)
+	require.Equal(t, "converted", bucket)
+	require.Equal(t, "", key, "bucket-only URI should leave key empty")
+	require.Equal(t, "s3://converted", uri)
+}
+
 func TestModelObjectKeyHandlesBucketOnlyURI(t *testing.T) {
 
 	model := &v1.Model{
@@ -549,6 +590,56 @@ func TestEnsureObjectStorageBuckets_SecretErrors(t *testing.T) {
 		err := handler.ensureObjectStorageBuckets(model)
 		require.ErrorContains(t, err, "missing AWS credentials")
 	})
+}
+
+func TestEnsureObjectStorageBuckets_UsesFallbackFactoryForCustomScheme(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	secrets := genericfake.NewMockControllerInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secretCache := genericfake.NewMockCacheInterface[*corev1.Secret](ctrl)
+	secrets.EXPECT().Cache().Return(secretCache).AnyTimes()
+
+	secret := &corev1.Secret{
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("access"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secret"),
+		},
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				Endpoint:         "custom+tls://minio.internal",
+				BucketForSource:  "source",
+				BucketForConvert: "convert",
+				SecretRef:        &v1.SecretReference{Name: "storage"},
+			},
+		},
+	}
+
+	secretCache.EXPECT().Get("models", "storage").Return(secret, nil)
+	fake := &fakeMinioClient{}
+	origFactory := fallbackMinioFactory
+	t.Cleanup(func() { fallbackMinioFactory = origFactory })
+	var observedSecure bool
+	fallbackMinioFactory = func(host string, opts *minio.Options) (minioClient, error) {
+		observedSecure = opts.Secure
+		require.Equal(t, "minio.internal", host)
+		return fake, nil
+	}
+
+	handler := &modelHandler{
+		ctx:           context.Background(),
+		ensureBuckets: true,
+		secrets:       secrets,
+		minioFactory:  nil,
+	}
+
+	require.NoError(t, handler.ensureObjectStorageBuckets(model))
+	require.True(t, observedSecure, "custom scheme should default to TLS")
+	require.ElementsMatch(t, []string{"source", "convert"}, fake.made)
 }
 
 func TestEnsureObjectStorageBuckets_SecretNamespaceFallbackAndInsecureEndpoint(t *testing.T) {
