@@ -128,6 +128,20 @@ func (mr *MockNATSConnMockRecorder) QueueSubscribe(subject, queue, handler any) 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "QueueSubscribe", reflect.TypeOf((*MockNATSConn)(nil).QueueSubscribe), subject, queue, handler)
 }
 
+// Status mocks base method.
+func (m *MockNATSConn) Status() nats.Status {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Status")
+	ret0, _ := ret[0].(nats.Status)
+	return ret0
+}
+
+// Status indicates an expected call of Status.
+func (mr *MockNATSConnMockRecorder) Status() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Status", reflect.TypeOf((*MockNATSConn)(nil).Status))
+}
+
 // Subscribe mocks base method.
 func (m *MockNATSConn) Subscribe(subject string, handler nats.MsgHandler) (*nats.Subscription, error) {
 	m.ctrl.T.Helper()

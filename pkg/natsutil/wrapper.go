@@ -46,6 +46,10 @@ func (w *NATSConnWrapper) JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, 
 	return w.conn.JetStream(opts...)
 }
 
+func (w *NATSConnWrapper) Status() nats.Status {
+	return w.conn.Status()
+}
+
 // NATSKeyValueWrapper wraps a real nats.KeyValue to implement the NATSKeyValue interface.
 type NATSKeyValueWrapper struct {
 	kv nats.KeyValue
