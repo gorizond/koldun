@@ -19,6 +19,7 @@ import (
 	"github.com/gorizond/koldun/pkg/api/openai"
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/metrics"
+	"github.com/gorizond/koldun/pkg/natsutil"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -100,7 +101,7 @@ type Server struct {
 	cfg Config
 	log *logrus.Entry
 
-	nc *nats.Conn
+	nc natsutil.NATSConn
 	js nats.JetStreamContext
 
 	httpServer *http.Server
@@ -194,20 +195,22 @@ func New(cfg Config) (*Server, error) {
 		log = logrus.StandardLogger().WithField("component", "koldun-llm")
 	}
 
-	nc, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-llm"))
+	natsConn, err := nats.Connect(cfg.NATSURL, nats.Name("koldun-llm"))
 	if err != nil {
 		return nil, fmt.Errorf("connect NATS: %w", err)
 	}
 
-	js, err := nc.JetStream()
+	js, err := natsConn.JetStream()
 	if err != nil {
-		nc.Close()
+		natsConn.Close()
 		return nil, fmt.Errorf("jetstream context: %w", err)
 	}
 
+	nc := natsutil.NewNATSConnWrapper(natsConn)
+
 	streamName, err := ensureRequestStream(js, cfg.InPrefix)
 	if err != nil {
-		nc.Close()
+		natsConn.Close()
 		return nil, fmt.Errorf("request stream: %w", err)
 	}
 

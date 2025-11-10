@@ -34,6 +34,9 @@ type NATSConn interface {
 
 	// JetStream returns a JetStream context.
 	JetStream(opts ...nats.JSOpt) (nats.JetStreamContext, error)
+
+	// Status returns the current connection status.
+	Status() nats.Status
 }
 
 // NATSKeyValue is an interface that wraps NATS KV store operations
