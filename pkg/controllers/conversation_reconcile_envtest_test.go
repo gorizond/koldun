@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
@@ -135,6 +136,62 @@ func TestConversationReconcilerCreatesSessionFromKV(t *testing.T) {
 		_, err := sessionClient.Get(namespace, record.SessionName(), metav1.GetOptions{})
 		return apierrors.IsNotFound(err)
 	}, 20*time.Second, 200*time.Millisecond, "stale session was not deleted after KV entry removal")
+
+	writer.Close()
+
+	addr, ok := srv.Addr().(*net.TCPAddr)
+	require.True(t, ok, "nats server address must be TCP")
+	port := addr.Port
+
+	srv.Shutdown()
+	srv = runJetStreamServerOnPort(t, port)
+
+	writerRestart, err := nats.Connect(srv.ClientURL(), nats.Name("conversation-envtest-writer-restart"))
+	require.NoError(t, err)
+	t.Cleanup(writerRestart.Close)
+
+	jsRestart, err := writerRestart.JetStream()
+	require.NoError(t, err)
+
+	var kvRestart nats.KeyValue
+	require.Eventually(t, func() bool {
+		var err error
+		kvRestart, err = jsRestart.KeyValue(cfg.KVBucket)
+		return err == nil
+	}, 20*time.Second, 200*time.Millisecond, "kv bucket %s was not recreated after restart", cfg.KVBucket)
+
+	recordRestart := &conversation.Record{
+		Hash:            fmt.Sprintf("envtest-restart-%d", time.Now().UnixNano()),
+		Session:         "envtest-session-restart",
+		Namespace:       namespace,
+		Model:           fmt.Sprintf("%s/model", namespace),
+		RootImage:       "ghcr.io/envtest/root:latest",
+		WorkerImage:     "ghcr.io/envtest/worker:latest",
+		DispatcherImage: "ghcr.io/envtest/dispatcher:latest",
+		NATS: conversation.NATSConfig{
+			URL: "nats://demo:4222",
+		},
+	}
+	payloadRestart, err := recordRestart.Marshal()
+	require.NoError(t, err)
+
+	restartKey := fmt.Sprintf("nats_ttl_%s", recordRestart.Hash)
+	_, err = kvRestart.Put(restartKey, payloadRestart)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		session, err := sessionClient.Get(namespace, recordRestart.SessionName(), metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return session.Spec.Hash == recordRestart.Hash
+	}, 20*time.Second, 200*time.Millisecond, "session was not recreated after JetStream restart")
+
+	require.NoError(t, kvRestart.Delete(restartKey))
+	require.Eventually(t, func() bool {
+		_, err := sessionClient.Get(namespace, recordRestart.SessionName(), metav1.GetOptions{})
+		return apierrors.IsNotFound(err)
+	}, 20*time.Second, 200*time.Millisecond, "stale session was not deleted after restart KV entry removal")
 
 	cancel()
 	require.Eventually(t, func() bool {

@@ -45,10 +45,10 @@ const (
 
 	maxNonStreamResponseSize = 4 << 20 // 4 MiB cap for single-response payloads
 
-	consumerCleanupInterval  = 5 * time.Minute
-	inactiveConsumerGrace    = 10 * time.Minute
-	consumerListTimeout      = 5 * time.Second
-	defaultHeartbeatInterval = 30 * time.Second
+	consumerCleanupInterval      = 5 * time.Minute
+	defaultInactiveConsumerGrace = 10 * time.Minute
+	consumerListTimeout          = 5 * time.Second
+	defaultHeartbeatInterval     = 30 * time.Second
 )
 
 var (
@@ -57,7 +57,8 @@ var (
 		Version:  "v1",
 		Resource: "dllamas",
 	}
-	errEvictionDisabled = errors.New("dllama eviction disabled: missing namespace or permissions")
+	errEvictionDisabled   = errors.New("dllama eviction disabled: missing namespace or permissions")
+	inactiveConsumerGrace = defaultInactiveConsumerGrace
 )
 
 func ensureTrailingDot(prefix string) string {
@@ -428,7 +429,7 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		_ = msg.Term()
 		return
 	}
-	if len(envelope.Payload) == 0 {
+	if len(envelope.Payload) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Payload), []byte("null")) {
 		s.log.Warn("assignment missing payload")
 		_ = msg.Term()
 		return
@@ -911,7 +912,12 @@ func (s *Server) publishError(target, msg string) {
 	_ = s.nc.Publish(target, []byte("[DONE]"))
 }
 
-func cleanupInactiveConsumers(js nats.JetStreamContext, stream string, logger *logrus.Entry) {
+type consumerManager interface {
+	Consumers(stream string, opts ...nats.JSOpt) <-chan *nats.ConsumerInfo
+	DeleteConsumer(stream, consumer string, opts ...nats.JSOpt) error
+}
+
+func cleanupInactiveConsumers(js consumerManager, stream string, logger *logrus.Entry) {
 	if js == nil {
 		return
 	}

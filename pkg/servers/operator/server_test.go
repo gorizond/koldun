@@ -11,6 +11,7 @@ import (
 
 	"github.com/gorizond/koldun/pkg/controllers"
 	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
 
 func TestNew(t *testing.T) {
@@ -449,5 +450,116 @@ func TestServer_Run_ServerClosedError(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Error("Timeout waiting for error")
+	}
+}
+
+func TestServer_Run_ReturnsNilWhenServerClosed(t *testing.T) {
+	health := controllers.NewHealth()
+	server, err := New(Config{
+		ListenAddress: ":0",
+		Health:        health,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Run(ctx)
+	}()
+
+	waitForHTTPServer(t, server)
+
+	if err := server.httpServer.Close(); err != nil {
+		t.Fatalf("failed to close http server: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after server.Close()")
+	}
+}
+
+func TestServer_Run_LogsWarningWhenShutdownFails(t *testing.T) {
+	health := controllers.NewHealth()
+	logger, hook := logrustest.NewNullLogger()
+	server, err := New(Config{
+		ListenAddress: ":0",
+		Health:        health,
+		Logger:        logrus.NewEntry(logger),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create server: %v", err)
+	}
+
+	server.shutdownHook = func(ctx context.Context) error {
+		if server.httpServer != nil {
+			_ = server.httpServer.Shutdown(ctx)
+		}
+		return errors.New("forced shutdown failure")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Run(ctx)
+	}()
+
+	waitForHTTPServer(t, server)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run() returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run() did not return after context cancellation")
+	}
+
+	entry := hook.LastEntry()
+	if entry == nil {
+		t.Fatal("expected shutdown warning log entry, got nil")
+	}
+	if entry.Level != logrus.WarnLevel {
+		t.Fatalf("expected warn level log, got %s", entry.Level)
+	}
+	if entry.Message != "health server shutdown error" {
+		t.Fatalf("unexpected log message: %s", entry.Message)
+	}
+	errField, ok := entry.Data["error"].(error)
+	if !ok {
+		t.Fatalf("unexpected type for error field: %T", entry.Data["error"])
+	}
+	if errField.Error() != "forced shutdown failure" {
+		t.Fatalf("unexpected error field: %v", entry.Data["error"])
+	}
+}
+
+func waitForHTTPServer(t *testing.T, server *Server) {
+	t.Helper()
+
+	timeout := time.After(2 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			t.Fatal("server.httpServer was not initialized in time")
+		case <-ticker.C:
+			if server.httpServer != nil {
+				return
+			}
+		}
 	}
 }

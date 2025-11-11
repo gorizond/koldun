@@ -33,14 +33,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-envtest-
 
-      - name: Install setup-envtest tool
-        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
-
-      - name: Warm envtest assets
-        run: make envtest-preflight
-
-      - name: Run controller envtests
-        run: go test ./pkg/controllers -count=1 -cover -timeout=5m
+      - name: Run controllers envtest checklist
+        run: ./hack/ci-envtest.sh
 
   build:
     name: Build and Push Image
