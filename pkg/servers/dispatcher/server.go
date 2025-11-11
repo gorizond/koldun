@@ -38,7 +38,7 @@ type Server struct {
 
 	nc          natsutil.NATSConn
 	js          nats.JetStreamContext
-	backlogSub  *nats.Subscription
+	backlogSub  backlogSubscription
 	stateSub    *nats.Subscription
 	assignments natsutil.NATSKeyValue
 
@@ -49,6 +49,27 @@ type Server struct {
 
 	retryConfig   natsutil.RetryConfig
 	metricsServer *http.Server
+}
+
+type backlogSubscription interface {
+	Pending() (int, int, error)
+}
+
+type metricsTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type realTicker struct {
+	*time.Ticker
+}
+
+func (t *realTicker) C() <-chan time.Time {
+	return t.Ticker.C
+}
+
+var metricsTickerFactory = func(d time.Duration) metricsTicker {
+	return &realTicker{Ticker: time.NewTicker(d)}
 }
 
 type workerState struct {
@@ -484,14 +505,14 @@ func newAssignmentID() string {
 }
 
 func (s *Server) updateMetricsPeriodically(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := metricsTickerFactory(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.C():
 			s.updateMetrics()
 		}
 	}

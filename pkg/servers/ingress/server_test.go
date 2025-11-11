@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1189,6 +1190,213 @@ func TestStateSubjectParsing(t *testing.T) {
 
 	require.Equal(t, "worker", stateWorkerFromSubject("tenant.session.worker.state"))
 	require.Equal(t, "", stateWorkerFromSubject("tenant"))
+}
+
+func TestHandleHealthSuccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping NATS dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	srv.handleHealth(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "ok", w.Body.String())
+}
+
+func TestHandleHealthNATSDisconnected(t *testing.T) {
+	// Server with nil raw connection
+	srv := &Server{
+		raw: nil,
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	srv.handleHealth(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "nats not connected")
+}
+
+func TestHandleHealthNATSNotConnectedStatus(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping NATS dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	// Close connection to simulate disconnected state
+	nc.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	srv.handleHealth(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "nats not connected")
+}
+
+func TestHandleReadySuccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, nc := connectIngressJetStream(t, ns)
+
+	conv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_success_conv",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	models, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_success_models",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	tokens, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_success_tokens",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	srv := &Server{
+		raw:      nc,
+		cfg:      Config{AllowAnonymous: false},
+		log:      logrus.New().WithField("component", "ingress-test"),
+		convKV:   conv,
+		modelsKV: models,
+		tokensKV: tokens,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "ok", w.Body.String())
+}
+
+func TestHandleReadyAnonymousModeSkipsTokenCheck(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, nc := connectIngressJetStream(t, ns)
+
+	conv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_anon_conv",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	models, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_anon_models",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	srv := &Server{
+		raw:      nc,
+		cfg:      Config{AllowAnonymous: true}, // Anonymous mode
+		log:      logrus.New().WithField("component", "ingress-test"),
+		convKV:   conv,
+		modelsKV: models,
+		tokensKV: nil, // No tokens bucket, but should be OK in anonymous mode
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+}
+
+func TestHandleReadyNATSDisconnected(t *testing.T) {
+	srv := &Server{
+		raw: nil,
+		cfg: Config{AllowAnonymous: true},
+		log: logrus.New().WithField("component", "ingress-test"),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "nats not connected")
+}
+
+func TestHandleReadyConvKVMissing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping NATS dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+
+	srv := &Server{
+		raw:    nc,
+		cfg:    Config{AllowAnonymous: true},
+		log:    logrus.New().WithField("component", "ingress-test"),
+		convKV: nil, // Missing conversation bucket
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "conversation bucket unavailable")
+}
+
+func TestHandleReadyModelsKVMissing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, nc := connectIngressJetStream(t, ns)
+
+	conv, err := js.CreateKeyValue(&nats.KeyValueConfig{
+		Bucket:  "ttl_ready_models_missing_conv",
+		History: 1,
+	})
+	require.NoError(t, err)
+
+	srv := &Server{
+		raw:      nc,
+		cfg:      Config{AllowAnonymous: true},
+		log:      logrus.New().WithField("component", "ingress-test"),
+		convKV:   conv,
+		modelsKV: nil, // Missing models bucket
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	srv.handleReady(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "models bucket unavailable")
 }
 
 func TestHandleReadyFailures(t *testing.T) {
@@ -2432,4 +2640,510 @@ func TestHandleChatCompletionsHandlesEnsureConversationFailure(t *testing.T) {
 	var errResp openai.ErrorResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 	assert.Contains(t, strings.ToLower(errResp.Error.Message), "conversation")
+}
+
+func TestWaitForIdleWorkerWithNilRaw(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		raw: nil,
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	err := srv.waitForIdleWorker(context.Background(), "sessions.test")
+	assert.NoError(t, err)
+}
+
+func TestWaitForIdleWorkerWithEmptyPrefix(t *testing.T) {
+	t.Parallel()
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+	defer nc.Close()
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	err := srv.waitForIdleWorker(context.Background(), "")
+	assert.NoError(t, err)
+}
+
+func TestWaitForIdleWorkerWithCachedIdleWorker(t *testing.T) {
+	t.Parallel()
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+	defer nc.Close()
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "test"),
+		stateCache: struct {
+			mu      sync.RWMutex
+			workers map[string]map[string]cachedWorkerState
+		}{
+			workers: make(map[string]map[string]cachedWorkerState),
+		},
+	}
+
+	prefix := "sessions.test."
+	srv.stateCache.workers[prefix] = map[string]cachedWorkerState{
+		"worker1": {
+			state:   "idle",
+			active:  0,
+			updated: time.Now(),
+		},
+	}
+
+	err := srv.waitForIdleWorker(context.Background(), prefix)
+	assert.NoError(t, err)
+}
+
+func TestWaitForIdleWorkerReceivesIdleEvent(t *testing.T) {
+	t.Parallel()
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+	defer nc.Close()
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "test"),
+		stateCache: struct {
+			mu      sync.RWMutex
+			workers map[string]map[string]cachedWorkerState
+		}{
+			workers: make(map[string]map[string]cachedWorkerState),
+		},
+	}
+
+	prefix := "sessions.test."
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		event := conversation.WorkerStateEvent{
+			Dllama:    "worker1",
+			State:     "idle",
+			Active:    0,
+			Timestamp: time.Now().Unix(),
+		}
+		data, _ := json.Marshal(event)
+		_ = nc.Publish(prefix+"worker1.state", data)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := srv.waitForIdleWorker(ctx, prefix)
+	assert.NoError(t, err)
+}
+
+func TestWaitForIdleWorkerContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+	defer nc.Close()
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "test"),
+		stateCache: struct {
+			mu      sync.RWMutex
+			workers map[string]map[string]cachedWorkerState
+		}{
+			workers: make(map[string]map[string]cachedWorkerState),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := srv.waitForIdleWorker(ctx, "sessions.test.")
+	assert.Error(t, err)
+	assert.Equal(t, context.Canceled, err)
+}
+
+func TestStartStateObserverWithNilRaw(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		raw: nil,
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	err := srv.startStateObserver()
+	assert.NoError(t, err)
+}
+
+func TestStartStateObserverSubscribesSuccessfully(t *testing.T) {
+	t.Parallel()
+
+	ns := startIngressJetStream(t)
+	_, nc := connectIngressJetStream(t, ns)
+	defer nc.Close()
+
+	srv := &Server{
+		raw: nc,
+		log: logrus.New().WithField("component", "test"),
+		stateCache: struct {
+			mu      sync.RWMutex
+			workers map[string]map[string]cachedWorkerState
+		}{
+			workers: make(map[string]map[string]cachedWorkerState),
+		},
+	}
+
+	err := srv.startStateObserver()
+	assert.NoError(t, err)
+	assert.NotNil(t, srv.stateSub)
+}
+
+func TestReplicaPowerForModelUsesConfigValue(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{ReplicaPower: 5},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	power := srv.replicaPowerForModel(nil)
+	assert.Equal(t, int32(5), power)
+}
+
+func TestReplicaPowerForModelUsesModelValue(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{ReplicaPower: 0},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	model := &registry.Model{ReplicaPower: 3}
+	power := srv.replicaPowerForModel(model)
+	assert.Equal(t, int32(3), power)
+}
+
+func TestReplicaPowerForModelDefaultsToOne(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{ReplicaPower: 0},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	power := srv.replicaPowerForModel(nil)
+	assert.Equal(t, int32(1), power)
+}
+
+func TestPopulateModelDefaultsWithNamespaceInKey(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			ModelPrefix: "models:",
+			Namespace:   "default-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	model := &registry.Model{}
+	srv.populateModelDefaults(model, "models:test-ns/test-model")
+
+	assert.Equal(t, "test-ns", model.Namespace)
+	assert.Equal(t, "test-model", model.Name)
+}
+
+func TestPopulateModelDefaultsPreservesExistingNamespace(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			ModelPrefix: "models:",
+			Namespace:   "default-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	model := &registry.Model{Namespace: "existing-ns"}
+	srv.populateModelDefaults(model, "models:test-ns/test-model")
+
+	assert.Equal(t, "existing-ns", model.Namespace)
+}
+
+func TestPopulateModelDefaultsPreservesExistingName(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			ModelPrefix: "models:",
+			Namespace:   "default-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	model := &registry.Model{Name: "existing-name"}
+	srv.populateModelDefaults(model, "models:test-ns/test-model")
+
+	assert.Equal(t, "existing-name", model.Name)
+}
+
+func TestLoadTokenCacheWithNilKV(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		tokensKV: nil,
+		log:      logrus.New().WithField("component", "test"),
+	}
+
+	cache := srv.loadTokenCache(context.Background())
+	assert.NotNil(t, cache)
+	assert.Empty(t, cache)
+}
+
+func TestLoadTokenCacheUsesValidCache(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		tokensKV: keyValueStub{},
+		log:      logrus.New().WithField("component", "test"),
+		tokenCache: struct {
+			mu      sync.RWMutex
+			values  map[string]tokenEntry
+			expires time.Time
+		}{
+			values:  map[string]tokenEntry{"hash1": {disabled: false}},
+			expires: time.Now().Add(1 * time.Hour),
+		},
+	}
+
+	cache := srv.loadTokenCache(context.Background())
+	assert.Len(t, cache, 1)
+	assert.Contains(t, cache, "hash1")
+}
+
+func TestLoadTokenCacheHandlesNoKeysFound(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return nil, nats.ErrNoKeysFound
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+		tokenCache: struct {
+			mu      sync.RWMutex
+			values  map[string]tokenEntry
+			expires time.Time
+		}{
+			values:  nil,
+			expires: time.Now().Add(-1 * time.Hour),
+		},
+	}
+
+	cache := srv.loadTokenCache(context.Background())
+	assert.NotNil(t, cache)
+	assert.Empty(t, cache)
+}
+
+func TestLoadTokenCacheLoadsFromKV(t *testing.T) {
+	t.Parallel()
+
+	token := registry.Token{
+		Hash:     "abc123",
+		Disabled: false,
+	}
+	tokenData, _ := json.Marshal(token)
+
+	srv := &Server{
+		cfg: Config{TokenPrefix: "tokens:"},
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{"tokens:abc123"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{value: tokenData}, nil
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+		tokenCache: struct {
+			mu      sync.RWMutex
+			values  map[string]tokenEntry
+			expires time.Time
+		}{
+			values:  nil,
+			expires: time.Now().Add(-1 * time.Hour),
+		},
+	}
+
+	cache := srv.loadTokenCache(context.Background())
+	assert.Len(t, cache, 1)
+	assert.Contains(t, cache, "abc123")
+	assert.False(t, cache["abc123"].disabled)
+}
+
+func TestWaitForMessageContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	msgs := make(chan *nats.Msg)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	msg, err := waitForMessage(ctx, msgs)
+	assert.Nil(t, msg)
+	assert.Equal(t, context.Canceled, err)
+}
+
+func TestWaitForMessageReceivesMessage(t *testing.T) {
+	t.Parallel()
+
+	msgs := make(chan *nats.Msg, 1)
+	expectedMsg := &nats.Msg{Subject: "test.subject", Data: []byte("test data")}
+	msgs <- expectedMsg
+
+	ctx := context.Background()
+	msg, err := waitForMessage(ctx, msgs)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedMsg, msg)
+}
+
+func TestWaitForMessageChannelClosed(t *testing.T) {
+	t.Parallel()
+
+	msgs := make(chan *nats.Msg)
+	close(msgs)
+
+	ctx := context.Background()
+	msg, err := waitForMessage(ctx, msgs)
+	assert.Nil(t, msg)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "subscription closed")
+}
+
+func TestLoadTokenCacheSkipsInvalidKeys(t *testing.T) {
+	t.Parallel()
+
+	token := registry.Token{
+		Hash:     "valid123",
+		Disabled: true,
+	}
+	tokenData, _ := json.Marshal(token)
+
+	srv := &Server{
+		cfg: Config{TokenPrefix: "tokens:"},
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{"tokens:valid123", "other:invalid"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				if key == "tokens:valid123" {
+					return &kvEntryStub{value: tokenData}, nil
+				}
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+		tokenCache: struct {
+			mu      sync.RWMutex
+			values  map[string]tokenEntry
+			expires time.Time
+		}{
+			values:  nil,
+			expires: time.Now().Add(-1 * time.Hour),
+		},
+	}
+
+	cache := srv.loadTokenCache(context.Background())
+	assert.Len(t, cache, 1)
+	assert.Contains(t, cache, "valid123")
+	assert.True(t, cache["valid123"].disabled)
+}
+
+func TestModelKeyUsesDefaultNamespace(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			ModelPrefix: "models:",
+			Namespace:   "default-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	key := srv.modelKey("", "test-model")
+	assert.Equal(t, "models:default-ns/test-model", key)
+}
+
+func TestModelKeyUsesProvidedNamespace(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			ModelPrefix: "models:",
+			Namespace:   "default-ns",
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	key := srv.modelKey("custom-ns", "test-model")
+	assert.Equal(t, "models:custom-ns/test-model", key)
+}
+
+func TestRegistryModelReadyReturnsFalseForNilModel(t *testing.T) {
+	t.Parallel()
+
+	ready := registryModelReady(nil)
+	assert.False(t, ready)
+}
+
+func TestRegistryModelReadyReturnsFalseForMissingPVC(t *testing.T) {
+	t.Parallel()
+
+	model := &registry.Model{
+		OutputPVCName:       "",
+		ConversionSizeHuman: "1Gi",
+	}
+
+	ready := registryModelReady(model)
+	assert.False(t, ready)
+}
+
+func TestRegistryModelReadyReturnsFalseForMissingConversionSize(t *testing.T) {
+	t.Parallel()
+
+	model := &registry.Model{
+		OutputPVCName:       "pvc-name",
+		ConversionSizeBytes: 0,
+		ConversionSizeHuman: "",
+	}
+
+	ready := registryModelReady(model)
+	assert.False(t, ready)
+}
+
+func TestRegistryModelReadyReturnsTrueForValidModel(t *testing.T) {
+	t.Parallel()
+
+	model := &registry.Model{
+		OutputPVCName:       "pvc-name",
+		ConversionSizeHuman: "1Gi",
+	}
+
+	ready := registryModelReady(model)
+	assert.True(t, ready)
+}
+
+func TestRegistryModelReadyReturnsTrueForValidModelWithBytes(t *testing.T) {
+	t.Parallel()
+
+	model := &registry.Model{
+		OutputPVCName:       "pvc-name",
+		ConversionSizeBytes: 1073741824,
+	}
+
+	ready := registryModelReady(model)
+	assert.True(t, ready)
 }

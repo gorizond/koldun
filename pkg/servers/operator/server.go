@@ -29,6 +29,8 @@ type Server struct {
 	cfg        Config
 	log        *logrus.Entry
 	httpServer *http.Server
+	// shutdownHook allows tests to override Shutdown behavior to exercise error branches.
+	shutdownHook func(context.Context) error
 }
 
 // New creates a new health server instance.
@@ -69,7 +71,11 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		shutdown := s.httpServer.Shutdown
+		if s.shutdownHook != nil {
+			shutdown = s.shutdownHook
+		}
+		if err := shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			s.log.WithError(err).Warn("health server shutdown error")
 		}
 		return nil

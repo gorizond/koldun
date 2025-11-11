@@ -50,6 +50,9 @@ type conversationReconciler struct {
 	sessions generic.ControllerInterface[*v1.Session, *v1.SessionList]
 	apply    apply.Apply
 
+	dialer   natsDialer
+	dialOpts []nats.Option
+
 	conn natsConnection
 	kv   nats.KeyValue
 }
@@ -81,30 +84,17 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 		}
 	}
 
-	conn, err := dial(cfg.NATSURL, nats.Name("koldun-operator"))
-	if err != nil {
-		return fmt.Errorf("connect NATS: %w", err)
-	}
-
-	js, err := conn.JetStream()
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("jetstream context: %w", err)
-	}
-
-	kv, err := ensureConversationBucket(js, cfg.KVBucket)
-	if err != nil {
-		conn.Close()
-		return fmt.Errorf("kv bucket %s: %w", cfg.KVBucket, err)
-	}
-
 	reconciler := &conversationReconciler{
 		cfg:      cfg,
 		log:      log,
 		sessions: m.Kold.Session(),
 		apply:    m.Apply(ctx),
-		conn:     conn,
-		kv:       kv,
+		dialer:   dial,
+		dialOpts: []nats.Option{nats.Name("koldun-operator")},
+	}
+
+	if err := reconciler.openConnection(); err != nil {
+		return err
 	}
 
 	go reconciler.run(ctx)
@@ -130,27 +120,66 @@ func ensureConversationBucket(js keyValueProvider, bucket string) (nats.KeyValue
 func (r *conversationReconciler) run(ctx context.Context) {
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
-	defer r.conn.Drain()
+	defer r.drainConn()
 
-	r.sync(ctx)
+	if !r.syncWithReconnect(ctx) {
+		return
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.sync(ctx)
+			if !r.syncWithReconnect(ctx) {
+				return
+			}
 		}
 	}
 }
 
-func (r *conversationReconciler) sync(ctx context.Context) {
+func (r *conversationReconciler) syncWithReconnect(ctx context.Context) bool {
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+
+		if err := r.sync(); err != nil {
+			if !isConnectionClosed(err) && !isBucketMissing(err) {
+				r.log.WithError(err).Warn("sync conversations")
+				return true
+			}
+
+			if isBucketMissing(err) {
+				r.log.WithError(err).Warn("conversation bucket missing; reconnecting")
+			} else {
+				r.log.WithError(err).Warn("nats connection closed; reconnecting")
+			}
+			if err := r.reconnect(ctx); err != nil {
+				if ctx.Err() != nil {
+					return false
+				}
+				r.log.WithError(err).Error("reconnect failed")
+				return false
+			}
+			r.log.Info("conversation reconciler reconnected to NATS")
+			continue
+		}
+
+		return true
+	}
+}
+
+func (r *conversationReconciler) sync() error {
 	keys, err := r.kv.Keys()
 	if err == nats.ErrNoKeysFound {
 		keys = nil
 	} else if err != nil {
+		if isConnectionClosed(err) || isBucketMissing(err) {
+			return err
+		}
 		r.log.WithError(err).Warn("list kv keys")
-		return
+		return nil
 	}
 
 	expected := make(map[string]struct{})
@@ -160,6 +189,9 @@ func (r *conversationReconciler) sync(ctx context.Context) {
 		}
 		entry, err := r.kv.Get(key)
 		if err != nil {
+			if isConnectionClosed(err) || isBucketMissing(err) {
+				return err
+			}
 			if err != nats.ErrKeyNotFound {
 				r.log.WithError(err).WithField("key", key).Warn("get kv entry")
 			}
@@ -181,7 +213,7 @@ func (r *conversationReconciler) sync(ctx context.Context) {
 	existing, err := r.sessions.Cache().List("", labels.Everything())
 	if err != nil {
 		r.log.WithError(err).Warn("list sessions")
-		return
+		return nil
 	}
 
 	for _, session := range existing {
@@ -202,6 +234,8 @@ func (r *conversationReconciler) sync(ctx context.Context) {
 			r.log.WithError(err).WithField("session", key).Error("delete stale session")
 		}
 	}
+
+	return nil
 }
 
 func (r *conversationReconciler) ensureSession(record *conversation.Record) error {
@@ -301,4 +335,96 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 	return r.apply.WithDefaultNamespace(record.Namespace).
 		WithSetID(fmt.Sprintf("conversation-session-%s", record.Hash)).
 		ApplyObjects(session)
+}
+
+func (r *conversationReconciler) openConnection() error {
+	if r.dialer == nil {
+		return fmt.Errorf("conversation reconciler missing dialer")
+	}
+
+	r.closeConn()
+
+	conn, err := r.dialer(r.cfg.NATSURL, r.dialOpts...)
+	if err != nil {
+		return fmt.Errorf("connect NATS: %w", err)
+	}
+
+	js, err := conn.JetStream()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("jetstream context: %w", err)
+	}
+
+	kv, err := ensureConversationBucket(js, r.cfg.KVBucket)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("kv bucket %s: %w", r.cfg.KVBucket, err)
+	}
+
+	r.conn = conn
+	r.kv = kv
+	return nil
+}
+
+func (r *conversationReconciler) reconnect(ctx context.Context) error {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if err := r.openConnection(); err == nil {
+			return nil
+		} else {
+			r.log.WithError(err).Warn("failed to reconnect to NATS, will retry")
+		}
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func (r *conversationReconciler) closeConn() {
+	if r.conn != nil {
+		r.conn.Close()
+	}
+	r.conn = nil
+	r.kv = nil
+}
+
+func (r *conversationReconciler) drainConn() {
+	if r.conn == nil {
+		return
+	}
+	if err := r.conn.Drain(); err != nil {
+		r.conn.Close()
+	}
+}
+
+func isConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, nats.ErrConnectionClosed) ||
+		errors.Is(err, nats.ErrConnectionDraining)
+}
+
+func isBucketMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, nats.ErrBucketNotFound) ||
+		errors.Is(err, nats.ErrStreamNotFound)
 }

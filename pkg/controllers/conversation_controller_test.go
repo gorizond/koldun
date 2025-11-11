@@ -213,7 +213,9 @@ func TestStartConversationReconcilerRequiresBucket(t *testing.T) {
 
 func TestStartConversationReconcilerDialError(t *testing.T) {
 
-	err := StartConversationReconciler(context.Background(), &Manager{}, ConversationConfig{
+	manager := newConversationManagerStub()
+
+	err := StartConversationReconciler(context.Background(), manager, ConversationConfig{
 		NATSURL:  "nats://example:4222",
 		KVBucket: "conversations",
 		dialer: func(string, ...nats.Option) (natsConnection, error) {
@@ -234,7 +236,9 @@ func TestStartConversationReconcilerJetStreamErrorClosesConnection(t *testing.T)
 		},
 	}
 
-	err := StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	manager := newConversationManagerStub()
+
+	err := StartConversationReconciler(context.Background(), manager, cfg)
 	require.EqualError(t, err, "jetstream context: js boom")
 	require.True(t, conn.closed.Load(), "connection should be closed on JetStream error")
 }
@@ -291,6 +295,71 @@ func TestStartConversationReconcilerStartsLoopAndDrainsConnection(t *testing.T) 
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestStartConversationReconcilerReconnectsAfterConnectionClosed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().List(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+
+	manager := &Manager{
+		apply: newFakeApply(),
+		Kold: &fakeKoldInterface{
+			session: sessions,
+		},
+	}
+
+	srv := runJetStreamServer(t)
+	var dialCount atomic.Int32
+	var tracked atomic.Pointer[trackingConn]
+
+	cfg := ConversationConfig{
+		NATSURL:      srv.ClientURL(),
+		KVBucket:     "conversation-reconnect",
+		PollInterval: 5 * time.Millisecond,
+		dialer: func(url string, opts ...nats.Option) (natsConnection, error) {
+			dialCount.Add(1)
+			nc, err := nats.Connect(url, opts...)
+			if err != nil {
+				return nil, err
+			}
+			conn := newTrackingConn(nc)
+			tracked.Store(conn)
+			return conn, nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, StartConversationReconciler(ctx, manager, cfg))
+
+	require.Eventually(t, func() bool {
+		return dialCount.Load() == 1 && tracked.Load() != nil
+	}, 5*time.Second, 10*time.Millisecond, "initial connection was not established")
+
+	first := tracked.Load()
+	require.NotNil(t, first)
+
+	if inner, ok := first.inner.(*nats.Conn); ok {
+		inner.Close()
+	} else {
+		first.Close()
+	}
+
+	require.Eventually(t, func() bool {
+		return dialCount.Load() >= 2 && tracked.Load() != nil && tracked.Load() != first
+	}, 5*time.Second, 20*time.Millisecond, "conversation reconciler did not reconnect after connection closed")
+
+	cancel()
+	require.Eventually(t, func() bool {
+		conn := tracked.Load()
+		return conn != nil && conn.Drained()
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestStartConversationReconcilerUsesDefaultDialer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -338,18 +407,31 @@ func TestStartConversationReconcilerClosesConnectionWhenBucketEnsureFails(t *tes
 		},
 	}
 
-	err = StartConversationReconciler(context.Background(), &Manager{}, cfg)
+	manager := newConversationManagerStub()
+
+	err = StartConversationReconciler(context.Background(), manager, cfg)
 	require.EqualError(t, err, "kv bucket conversations: kv boom")
 	require.True(t, failingConn.Drained(), "connection should close when bucket ensure fails")
 }
 
+func newConversationManagerStub() *Manager {
+	return &Manager{
+		apply: newFakeApply(),
+		Kold:  &fakeKoldInterface{},
+	}
+}
+
 func runJetStreamServer(t *testing.T) *server.Server {
+	return runJetStreamServerOnPort(t, -1)
+}
+
+func runJetStreamServerOnPort(t *testing.T, port int) *server.Server {
 	t.Helper()
 
 	opts := &server.Options{
 		JetStream: true,
 		StoreDir:  t.TempDir(),
-		Port:      -1,
+		Port:      port,
 	}
 
 	serverInstance, err := server.NewServer(opts)
@@ -532,7 +614,7 @@ func TestConversationReconcilerSyncCreatesAndDeletesSessions(t *testing.T) {
 		kv:       kv,
 	}
 
-	reconciler.sync(context.Background())
+	require.NoError(t, reconciler.sync())
 
 	require.Len(t, fakeApply.appliedObjects, 1)
 	session, ok := fakeApply.appliedObjects[0].(*v1.Session)
@@ -561,7 +643,7 @@ func TestConversationReconcilerSyncHandlesKeyListingError(t *testing.T) {
 		},
 	}
 
-	reconciler.sync(context.Background())
+	require.NoError(t, reconciler.sync())
 }
 
 func TestConversationReconcilerSyncHandlesSessionListError(t *testing.T) {
@@ -581,7 +663,7 @@ func TestConversationReconcilerSyncHandlesSessionListError(t *testing.T) {
 		kv:       &fakeMemoryKV{bucket: "conversations"},
 	}
 
-	reconciler.sync(context.Background())
+	require.NoError(t, reconciler.sync())
 }
 
 func TestConversationReconcilerSyncDeletesStaleSessionsWhenNoKVRecords(t *testing.T) {
@@ -624,7 +706,7 @@ func TestConversationReconcilerSyncDeletesStaleSessionsWhenNoKVRecords(t *testin
 		kv:       &fakeMemoryKV{bucket: "conversations"},
 	}
 
-	reconciler.sync(context.Background())
+	require.NoError(t, reconciler.sync())
 
 	require.Empty(t, fakeApply.appliedObjects)
 }
@@ -721,7 +803,7 @@ func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *
 		kv:       kv,
 	}
 
-	reconciler.sync(context.Background())
+	require.NoError(t, reconciler.sync())
 
 	require.Len(t, innerApply.appliedObjects, 1)
 	created, ok := innerApply.appliedObjects[0].(*v1.Session)

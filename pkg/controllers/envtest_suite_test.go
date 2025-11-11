@@ -19,7 +19,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
-const controllerRuntimeVersion = "0.20.4"
+const (
+	controllerRuntimeVersion = "0.20.4"
+	kubernetesEnvtestVersion = "1.32.x!"
+)
 
 var (
 	testEnv           *envtest.Environment
@@ -147,10 +150,10 @@ func locateKubebuilderAssets() (string, error) {
 	}
 
 	if len(attempted) == 0 {
-		return "", fmt.Errorf("kubebuilder assets not found; install them with `setup-envtest use --controller-runtime-version %s --install-dir ./bin/envtest` and export KUBEBUILDER_ASSETS to the reported directory", controllerRuntimeVersion)
+		return "", fmt.Errorf("kubebuilder assets not found; install them with `setup-envtest use -p env --bin-dir ./bin/envtest %s` (controller-runtime %s) and export KUBEBUILDER_ASSETS to the reported directory", kubernetesEnvtestVersion, controllerRuntimeVersion)
 	}
 
-	return "", fmt.Errorf("kubebuilder assets not found; install them with `setup-envtest use --controller-runtime-version %s --install-dir ./bin/envtest` and export KUBEBUILDER_ASSETS to the reported directory. Checked: %s", controllerRuntimeVersion, strings.Join(attempted, "; "))
+	return "", fmt.Errorf("kubebuilder assets not found; install them with `setup-envtest use -p env --bin-dir ./bin/envtest %s` (controller-runtime %s) and export KUBEBUILDER_ASSETS to the reported directory. Checked: %s", kubernetesEnvtestVersion, controllerRuntimeVersion, strings.Join(attempted, "; "))
 }
 
 func kubebuilderAssetCandidates() []string {
@@ -306,8 +309,9 @@ func autoDownloadKubebuilderAssets() error {
 
 	cmd := exec.Command(setupPath,
 		"use",
-		"--controller-runtime-version", controllerRuntimeVersion,
-		"--install-dir", installDir,
+		"-p", "env",
+		"--bin-dir", installDir,
+		kubernetesEnvtestVersion,
 	)
 	cmd.Env = os.Environ()
 

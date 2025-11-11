@@ -167,11 +167,11 @@ Controllers rely on [`envtest`](https://book.kubebuilder.io/reference/envtest.ht
 
 ```bash
 go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
-# Downloads the stack compatible with controller-runtime v0.20.4 and prints the export lines
-eval "$(setup-envtest use --controller-runtime-version 0.20.4 --install-dir ./bin/envtest)"
+# Downloads the Kubernetes stack compatible with controller-runtime v0.20.4 and prints the export lines
+eval "$(setup-envtest use -p env --bin-dir ./bin/envtest 1.32.x!)"
 
 # Persist for new shells / CI jobs (optional but recommended)
-export KUBEBUILDER_ASSETS="$(pwd)/bin/envtest/kubebuilder/bin"
+export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 ls "$KUBEBUILDER_ASSETS"  # sanity-check kube-apiserver/etcd are present
 
 # Verify the integration test; it will skip with a helpful message if assets are missing
@@ -179,10 +179,12 @@ go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -cou
 ```
 
 - `make envtest-preflight` wraps the `setup-envtest use` invocation, validates that both `kube-apiserver` and `etcd` binaries exist, and reprints the `KUBEBUILDER_ASSETS` export line. Use it after toolchain upgrades or when bootstrapping CI runners.
-- `.envrc` now exports `KUBEBUILDER_ASSETS=$PWD/bin/envtest/kubebuilder/bin`; run `direnv allow` (or copy the line into your shell profile) so controller tests discover the assets automatically.
-- Capture the `KUBEBUILDER_ASSETS` path printed by `setup-envtest use` (typically `./bin/envtest/kubebuilder/bin`) for local shells and CI pipelines.
+- `.envrc` now exports `KUBEBUILDER_ASSETS=$(./hack/print-kubebuilder-assets.sh)`; run `direnv allow` (or copy the line into your shell profile) so controller tests discover the assets automatically.
+- Capture the `KUBEBUILDER_ASSETS` path printed by `setup-envtest use` (typically `./bin/envtest/k8s/1.32.0-<os>-<arch>`) or run `./hack/print-kubebuilder-assets.sh` to auto-detect it for local shells and CI pipelines.
 - Cache the `./bin/envtest` directory in CI runners to avoid downloading the binaries on every job; re-run `setup-envtest use` only when bumping controller-runtime.
+- Once the cache exists, set `KOLD_SKIP_ENVTEST_DOWNLOAD=1` in CI (and optionally locally) so `ensureKubebuilderAssets()` fails fast if the binaries disappear instead of spending ~10 seconds trying to auto-download them.
 - GitHub Actions runs these smoke tests in `.github/workflows/ci-build.yaml` via the `controllers-envtest` job. The job restores the `bin/envtest` cache, installs `setup-envtest`, executes `make envtest-preflight`, and blocks the Docker build job until `go test ./pkg/controllers -count=1 -cover -timeout=5m` passes.
+- Для любых CI раннеров (включая self-hosted) следуйте чек-листу в [`docs/ci-envtest.md`](docs/ci-envtest.md): восстановите кеш `bin/envtest`, выполните `make envtest-preflight`, экспортируйте `KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"`, а затем прогоните `make controllers-smoke`.
 - Add the `export KUBEBUILDER_ASSETS=…` line to your shell profile (e.g. `.envrc`, `.zshrc`) so `go test` picks it up without re-running `setup-envtest`.
 - The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
 
@@ -197,7 +199,7 @@ go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -cou
 | --- | --- |
 | Format | `go fmt ./... && gofmt -w .` |
 | Unit tests | `go test ./...` (append `-race` for data race checks) |
-| Controllers smoke | `make controllers-smoke` (`go test ./pkg/controllers -count=1 -coverprofile=/tmp/controllers.cover`) |
+| Controllers smoke | `make controllers-smoke` (`go test ./pkg/controllers -count=1 -timeout=5m`) |
 | Build binary | `go build ./cmd/operator` |
 | Run operator | `go run ./cmd/operator --mode=operator` |
 | Build/push image | `skaffold build` |
