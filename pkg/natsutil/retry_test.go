@@ -296,3 +296,90 @@ func (m *mockKeyValueStatus) Sources() []*nats.StreamSource                  { r
 func (m *mockKeyValueStatus) Storage() nats.StorageType                      { return nats.FileStorage }
 func (m *mockKeyValueStatus) Placement() *nats.Placement                     { return nil }
 func (m *mockKeyValueStatus) SubjectTransform() *nats.SubjectTransformConfig { return nil }
+
+// TestKVPutWithRetry_SuccessAfterRetries tests successful put after temporary errors
+func TestKVPutWithRetry_SuccessAfterRetries(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockKV := mocks.NewMockNATSKeyValue(ctrl)
+	mockStatus := &mockKeyValueStatus{bucket: "test-bucket"}
+	tempErr := errors.New("temporary error")
+
+	mockKV.EXPECT().Status().Return(mockStatus, nil).AnyTimes()
+
+	gomock.InOrder(
+		mockKV.EXPECT().Put("test-key", []byte("value")).Return(uint64(0), tempErr),
+		mockKV.EXPECT().Put("test-key", []byte("value")).Return(uint64(0), tempErr),
+		mockKV.EXPECT().Put("test-key", []byte("value")).Return(uint64(3), nil),
+	)
+
+	cfg := natsutil.RetryConfig{
+		MaxRetries:     3,
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+		BackoffFactor:  2.0,
+	}
+
+	logger := logrus.New().WithField("test", "retry")
+	rev, err := natsutil.KVPutWithRetry(mockKV, "test-key", []byte("value"), cfg, logger)
+
+	if err != nil {
+		t.Errorf("Expected success after retries, got %v", err)
+	}
+	if rev != 3 {
+		t.Errorf("Expected revision 3, got %d", rev)
+	}
+}
+
+// TestKVPutWithRetry_AllRetriesFailed tests failure after all retries
+func TestKVPutWithRetry_AllRetriesFailed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockKV := mocks.NewMockNATSKeyValue(ctrl)
+	mockStatus := &mockKeyValueStatus{bucket: "test-bucket"}
+	tempErr := errors.New("persistent error")
+
+	mockKV.EXPECT().Status().Return(mockStatus, nil).AnyTimes()
+	mockKV.EXPECT().Put("test-key", []byte("value")).Return(uint64(0), tempErr).Times(4) // MaxRetries + 1
+
+	cfg := natsutil.RetryConfig{
+		MaxRetries:     3,
+		InitialBackoff: 1 * time.Millisecond,
+		MaxBackoff:     10 * time.Millisecond,
+		BackoffFactor:  2.0,
+	}
+
+	logger := logrus.New().WithField("test", "retry")
+	rev, err := natsutil.KVPutWithRetry(mockKV, "test-key", []byte("value"), cfg, logger)
+
+	if err == nil {
+		t.Error("Expected error after all retries failed")
+	}
+	if rev != 0 {
+		t.Errorf("Expected revision 0 on failure, got %d", rev)
+	}
+}
+
+// TestKVPutWithRetry_StatusError tests error handling when Status() fails
+func TestKVPutWithRetry_StatusError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockKV := mocks.NewMockNATSKeyValue(ctrl)
+	statusErr := errors.New("status failed")
+
+	mockKV.EXPECT().Status().Return(nil, statusErr).Times(1)
+	mockKV.EXPECT().Put("test-key", []byte("value")).Return(uint64(1), nil).Times(1)
+
+	cfg := natsutil.DefaultRetryConfig()
+	rev, err := natsutil.KVPutWithRetry(mockKV, "test-key", []byte("value"), cfg, nil)
+
+	if err != nil {
+		t.Errorf("Expected no error (Status error should not fail operation), got %v", err)
+	}
+	if rev != 1 {
+		t.Errorf("Expected revision 1, got %d", rev)
+	}
+}
