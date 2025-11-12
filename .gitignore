@@ -18,3 +18,5 @@ koldun.test
 bin/
 
 /reasoning
+/context
+/CLAUDE.md

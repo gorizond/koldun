@@ -63,7 +63,7 @@ envtest-preflight:
 	}
 
 # Run controller tests WITHOUT coverage (avoids t.Parallel + coverprofile deadlock)
-# See reasoning/guides/testing.md "Envtest Hanging Issue" section for details
+# See context/guides/testing.md "Envtest Hanging Issue" section for details
 controllers-smoke:
 	@echo "Running controller tests..."
 	@ASSETS="$${KUBEBUILDER_ASSETS:-}"; \
