@@ -35,6 +35,21 @@ The refreshed `envtest_suite_test.go` will skip gracefully (with guidance) when 
 - `./hack/print-kubebuilder-assets.sh` mirrors the auto-discovery logic from `envtest_suite_test.go` and prints the first directory that already contains the control-plane binaries. The Makefile and CI use it to avoid hardcoding platform-specific paths.
 - Cache the entire `./bin/envtest` directory in CI to keep the controller smoke test well under a minute. Session 51 (pre-optimization) clocked in at ~60s because of the JetStream recovery parity test; after trimming the bootstrap loops in Session 53 the same runner now finishes in ≈49s real. Sessions 56-57 added edge case tests raising coverage from 99.4% to **99.8%** (practical maximum). Once the cache is reliable, set `KOLD_SKIP_ENVTEST_DOWNLOAD=1` so the suite fails fast instead of trying to auto-download assets during a run.
 
+### Acceptable Coverage Gaps
+
+The following uncovered code paths are intentionally not tested:
+
+**pkg/controllers (99.8% coverage)**:
+- `syncWithReconnect` (88.9%): `isConnectionClosed` without `isBucketMissing` requires real infrastructure failure
+- `reconnectWithOverride` (66.7%): Tests use mock `reconnectFn`, so actual `r.reconnect(ctx)` line never executes
+- `openConnection` (94.1%): JetStream setup errors require real infrastructure failure
+
+**pkg/natsutil (74.1% coverage)**:
+- All wrapper functions (22 functions at 0%): Thin wrappers for dependency injection that simply delegate to underlying NATS types. Testing them adds no value.
+- Business logic (retry functions) is well covered at 97%+
+
+These gaps represent infrastructure error paths or trivial delegation code that would require integration/e2e tests to cover meaningfully.
+
 ### Envtest Quick Start
 
 Run controller reconcilers against an in-memory Kubernetes API (envtest) to validate CRUD logic and integration flows without needing a live cluster.
