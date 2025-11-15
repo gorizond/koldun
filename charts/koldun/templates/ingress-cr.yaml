@@ -1,17 +1,30 @@
-{{- range .Values.ingresses }}
+{{- range $idx, $ing := .Values.ingresses }}
 apiVersion: koldun.gorizond.io/v1
 kind: Ingress
 metadata:
-  name: {{ required "ingresses[].name is required" .name }}
-  namespace: {{ default $.Release.Namespace .namespace }}
-  {{- with .annotations }}
+  name: {{ required "ingresses[].name is required" $ing.name }}
+  namespace: {{ default $.Release.Namespace $ing.namespace }}
+  {{- with $ing.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-{{- if not .spec }}
+{{- if not $ing.spec }}
   {{- fail "ingresses[].spec must be provided" }}
 {{- end }}
-{{ toYaml .spec | indent 2 }}
+{{- $spec := $ing.spec }}
+{{- if not (hasKey $spec "backend") }}
+  {{- fail (printf "ingresses[%d].spec.backend must be provided" $idx) }}
+{{- end }}
+{{- $metrics := "" }}
+{{- if hasKey $ing "dispatcherMetricsListen" }}
+  {{- $metrics = $ing.dispatcherMetricsListen }}
+{{- else if $.Values.ingressDefaults.dispatcherMetricsListen }}
+  {{- $metrics = $.Values.ingressDefaults.dispatcherMetricsListen }}
+{{- end }}
+{{- if and $metrics (not (hasKey $spec.backend "dispatcherMetricsListen")) }}
+  {{- $_ := set $spec.backend "dispatcherMetricsListen" $metrics }}
+{{- end }}
+{{ toYaml $spec | indent 2 }}
 ---
 {{- end }}

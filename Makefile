@@ -1,10 +1,23 @@
-.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke
+.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke compose-test-up compose-test-down compose-test compose-update-baseline help
 
 ENVTEST_CONTROLLER_RUNTIME_VERSION ?= 0.20.4
 ENVTEST_K8S_VERSION ?= 1.32.x!
 ENVTEST_DIR ?= ./bin/envtest
 PRINT_ENVTEST_ASSETS := ./hack/print-kubebuilder-assets.sh
 SETUP_ENVTEST_BIN ?= $(shell command -v setup-envtest 2>/dev/null || printf "%s" "$(HOME)/go/bin/setup-envtest")
+COMPOSE_FILE ?= docker-compose.test.yml
+COMPOSE_TEST_LOG_PATH ?= artifacts/compose-logs.txt
+COMPOSE_TEST_COVERPROFILE ?= compose.coverprofile
+COMPOSE_TEST_BASELINE ?= analytics/compose_coverage_baseline.json
+
+help:
+	@echo "Available targets:"
+	@printf "  %-25s %s\n" "test" "Run go test ./..."
+	@printf "  %-25s %s\n" "coverage" "Generate coverage.out and HTML report"
+	@printf "  %-25s %s\n" "envtest-preflight" "Download and validate envtest assets"
+	@printf "  %-25s %s\n" "controllers-smoke" "Run controller envtest suite without coverage"
+	@printf "  %-25s %s\n" "compose-test" "Spin up docker compose stack and run dispatcher/ingress tests"
+	@printf "  %-25s %s\n" "compose-update-baseline" "Update analytics/compose_coverage_baseline.json from compose.coverprofile"
 
 # Clean temporary files generated during testing and coverage
 clean:
@@ -83,3 +96,31 @@ test-quick:
 	@echo "Running quick test suite (excludes controllers)..."
 	@go test ./cmd/... ./pkg/api/... ./pkg/clients/... ./pkg/registry/... -timeout=2m
 	@echo "✓ Quick tests passed"
+
+compose-test-up:
+	docker compose -f $(COMPOSE_FILE) up -d
+
+compose-test-down:
+	docker compose -f $(COMPOSE_FILE) down -v
+
+compose-test:
+	@set -euo pipefail; \
+	LOG_PATH="$${COMPOSE_TEST_LOG_PATH:-artifacts/compose-logs.txt}"; \
+	COVER_PATH="$${COMPOSE_TEST_COVERPROFILE:-compose.coverprofile}"; \
+	mkdir -p "$$(dirname "$$LOG_PATH")"; \
+	mkdir -p "$$(dirname "$$COVER_PATH")"; \
+	: > "$$LOG_PATH"; \
+	CACHE_DIR="$$(mktemp -d)"; \
+	KEEP_STACK="$${COMPOSE_TEST_KEEP_STACK:-}"; \
+	trap 'CODE=$$?; docker compose -f $(COMPOSE_FILE) logs --no-color > "$$LOG_PATH" 2>&1 || true; if [ -z "$$KEEP_STACK" ]; then $(MAKE) compose-test-down >/dev/null 2>&1 || true; else echo "COMPOSE_TEST_KEEP_STACK=1 set; leaving compose stack running" >&2; fi; rm -rf "$$CACHE_DIR"; exit $$CODE' EXIT; \
+	$(MAKE) compose-test-up >/dev/null; \
+	./hack/localstack/wait-for-stack.sh 180; \
+	NATS_URL="$${KOLDUN_NATS_URL:-nats://koldun:koldun@127.0.0.1:4222}"; \
+	export KOLDUN_NATS_URL="$$NATS_URL"; \
+	if [ -z "$${KOLDUN_DISPATCHER_NATS_URL:-}" ]; then \
+		export KOLDUN_DISPATCHER_NATS_URL="$$NATS_URL"; \
+	fi; \
+	GOCACHE="$$CACHE_DIR" go test -count=1 -coverprofile="$$COVER_PATH" ./pkg/servers/ingress ./pkg/servers/dispatcher
+
+compose-update-baseline:
+	@./hack/update-compose-coverage-baseline.sh "$(COMPOSE_TEST_COVERPROFILE)" "$(COMPOSE_TEST_BASELINE)"

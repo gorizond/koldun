@@ -86,11 +86,12 @@ func TestRecord_Validate(t *testing.T) {
 
 func TestRecord_ValidateDefaults(t *testing.T) {
 	record := Record{
-		Hash:        "test-hash",
-		Namespace:   "default",
-		Model:       "test-model",
-		RootImage:   "root:latest",
-		WorkerImage: "worker:latest",
+		Hash:                    "test-hash",
+		Namespace:               "default",
+		Model:                   "test-model",
+		RootImage:               "root:latest",
+		WorkerImage:             "worker:latest",
+		DispatcherMetricsListen: "  :9090  ",
 	}
 
 	err := record.Validate()
@@ -116,6 +117,10 @@ func TestRecord_ValidateDefaults(t *testing.T) {
 
 	if record.Scaling == nil {
 		t.Error("Scaling should be initialized")
+	}
+
+	if record.DispatcherMetricsListen != ":9090" {
+		t.Errorf("DispatcherMetricsListen should be trimmed, got %q", record.DispatcherMetricsListen)
 	}
 }
 

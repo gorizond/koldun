@@ -396,6 +396,9 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	if dispatcherImage != "" {
 		args = append(args, fmt.Sprintf("--backend-session-dispatcher-image=%s", dispatcherImage))
 	}
+	if addr := strings.TrimSpace(spec.Backend.DispatcherMetricsListen); addr != "" {
+		args = append(args, fmt.Sprintf("--backend-session-dispatcher-metrics-listen=%s", addr))
+	}
 
 	if spec.Backend.NATS.URL != "" {
 		args = append(args, fmt.Sprintf("--backend-nats-url=%s", spec.Backend.NATS.URL))

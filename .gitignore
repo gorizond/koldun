@@ -9,6 +9,7 @@ coverage.out
 coverage.html
 *.out
 coverage.func
+artifacts/
 
 # Test binaries
 *.test
@@ -20,3 +21,4 @@ bin/
 /reasoning
 /context
 /CLAUDE.md
+hack/localstack/kubeconfig/kubeconfig

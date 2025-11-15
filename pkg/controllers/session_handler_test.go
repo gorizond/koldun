@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/testutil"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -138,7 +138,7 @@ func TestSessionCheckHealthScenarios(t *testing.T) {
 	})
 
 	t.Run("successful endpoint returns true", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := testutil.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			require.Equal(t, "/v1/models", r.URL.Path)
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -154,7 +154,7 @@ func TestSessionCheckHealthScenarios(t *testing.T) {
 	})
 
 	t.Run("non-successful status returns false", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := testutil.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			require.Equal(t, "/v1/models", r.URL.Path)
 			w.WriteHeader(http.StatusInternalServerError)
 		}))
@@ -1637,6 +1637,48 @@ func TestSessionEnsureDispatcherHonorsAckTimeout(t *testing.T) {
 	require.NotEmpty(t, deployment.Spec.Template.Spec.Containers)
 	args := deployment.Spec.Template.Spec.Containers[0].Args
 	require.Contains(t, args, "--dispatcher-ack-wait=45s")
+}
+
+func TestSessionEnsureDispatcherAddsMetricsPort(t *testing.T) {
+
+	fakeApply := newFakeApply()
+	handler := &sessionHandler{
+		apply: fakeApply,
+		log:   logrus.NewEntry(logrus.New()),
+	}
+
+	sess := &v1.Session{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chat",
+			Namespace: "models",
+		},
+		Spec: v1.SessionSpec{
+			Hash: "hash",
+			Queue: &v1.SessionQueueSpec{
+				BacklogSubject:      "sessions.backlog",
+				AssignmentsBucket:   "sessions.assign",
+				DllamaSubjectPrefix: "sessions.dl",
+				StateStream:         "sessions.state",
+			},
+			NATS: &v1.SessionNATSConfig{
+				URL: "nats://demo:4222",
+			},
+			DispatcherImage:         "dispatcher:latest",
+			DispatcherMetricsListen: ":9091",
+		},
+	}
+
+	err := handler.ensureDispatcher(sess)
+	require.NoError(t, err)
+	require.Len(t, fakeApply.appliedObjects, 1)
+
+	deployment, ok := fakeApply.appliedObjects[0].(*appsv1.Deployment)
+	require.True(t, ok, "dispatcher deployment should be applied")
+	container := deployment.Spec.Template.Spec.Containers[0]
+	require.Contains(t, container.Args, "--dispatcher-metrics-listen=:9091")
+	require.Len(t, container.Ports, 1, "metrics port should be exposed")
+	require.Equal(t, int32(9091), container.Ports[0].ContainerPort)
+	require.Equal(t, "metrics", container.Ports[0].Name)
 }
 
 func TestSessionEnsureDispatcherUsesStateStreamAndRootImageFallback(t *testing.T) {

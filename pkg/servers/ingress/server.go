@@ -86,6 +86,8 @@ const (
 	corsAllowHeaders  = "Authorization, Content-Type, X-Requested-With, X-Api-Key, X-API-Key, X-Auth-Token, KOLDUN_API_TOKEN, OLLMANA_API_KEY"
 	corsAllowMethods  = "GET, POST, OPTIONS"
 	corsExposeHeaders = "Content-Type"
+
+	errConversationQueueMisconfigured = "conversation queue misconfigured"
 )
 
 // Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
@@ -108,11 +110,12 @@ type Config struct {
 	ConversationTTL time.Duration
 	ResponseTimeout time.Duration
 
-	SessionMinDllamas           int32
-	SessionMaxDllamas           int32
-	SessionScaleUpBacklog       int32
-	SessionScaleDownIdleSeconds int32
-	SessionDispatcherImage      string
+	SessionMinDllamas              int32
+	SessionMaxDllamas              int32
+	SessionScaleUpBacklog          int32
+	SessionScaleDownIdleSeconds    int32
+	SessionDispatcherImage         string
+	SessionDispatcherMetricsListen string
 
 	HashSecret     []byte
 	AllowAnonymous bool
@@ -154,6 +157,9 @@ type Server struct {
 		mu      sync.RWMutex
 		workers map[string]map[string]cachedWorkerState
 	}
+
+	afterResponseSubscribe func() // test hook invoked after response subscription is created
+	ensureConversationHook func(context.Context, string, *registry.Model, int32) (*conversation.Record, error)
 }
 
 type tokenEntry struct {
@@ -213,6 +219,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.ResponseTimeout == 0 {
 		cfg.ResponseTimeout = 2 * time.Minute
 	}
+	cfg.SessionDispatcherMetricsListen = strings.TrimSpace(cfg.SessionDispatcherMetricsListen)
 	if cfg.SessionMinDllamas <= 0 {
 		cfg.SessionMinDllamas = 1
 	}
@@ -621,15 +628,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	s.refreshConversationTTL(hash)
 
-	backlogSubject := record.Queue.BacklogSubject
-	if strings.TrimSpace(backlogSubject) == "" {
-		backlogSubject = sessionBacklogSubject(hash)
+	queue := record.Queue
+	if queue == nil {
+		s.log.WithField("hash", hash).Error("missing conversation queue configuration")
+		writeError(w, http.StatusBadGateway, errConversationQueueMisconfigured)
+		return
 	}
 
-	responsePrefix := ""
-	if record.Queue != nil {
-		responsePrefix = strings.TrimSpace(record.Queue.ResponseSubjectPrefix)
+	backlogSubject := strings.TrimSpace(queue.BacklogSubject)
+	if backlogSubject == "" {
+		s.log.WithField("hash", hash).Error("missing backlog subject for conversation queue")
+		writeError(w, http.StatusBadGateway, errConversationQueueMisconfigured)
+		return
 	}
+
+	responsePrefix := strings.TrimSpace(queue.ResponseSubjectPrefix)
 	if responsePrefix == "" {
 		responsePrefix = responseSubjectPrefix(s.cfg.OutPrefix, hash)
 	}
@@ -644,8 +657,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer respCancel()
 
-	dllamaPrefix := record.Queue.DllamaSubjectPrefix
-	if strings.TrimSpace(dllamaPrefix) == "" {
+	dllamaPrefix := strings.TrimSpace(queue.DllamaSubjectPrefix)
+	if dllamaPrefix == "" {
 		dllamaPrefix = dllamaSubjectPrefix(hash)
 	}
 	if load == 1 {
@@ -668,6 +681,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		_ = sub.Unsubscribe()
 		close(msgs)
 	}()
+
+	if hook := s.afterResponseSubscribe; hook != nil {
+		hook()
+	}
 
 	requestID := newRequestID()
 
@@ -733,6 +750,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ensureConversation(ctx context.Context, hash string, model *registry.Model, active int32) (*conversation.Record, error) {
+	if hook := s.ensureConversationHook; hook != nil {
+		return hook(ctx, hash, model, active)
+	}
+
 	s.log.WithFields(logrus.Fields{
 		"hash":     hash,
 		"nats_url": s.cfg.NATSURL,
@@ -760,6 +781,10 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 			}
 			if record.DispatcherImage != s.cfg.SessionDispatcherImage {
 				record.DispatcherImage = s.cfg.SessionDispatcherImage
+				recordChanged = true
+			}
+			if record.DispatcherMetricsListen != s.cfg.SessionDispatcherMetricsListen {
+				record.DispatcherMetricsListen = s.cfg.SessionDispatcherMetricsListen
 				recordChanged = true
 			}
 			if record.NATS.URL != s.cfg.NATSURL {
@@ -871,16 +896,17 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 	}
 
 	record := &conversation.Record{
-		Hash:            hash,
-		Session:         fmt.Sprintf("session-%s", sanitizeSessionHash(hash)),
-		Namespace:       s.cfg.Namespace,
-		Model:           fmt.Sprintf("%s/%s", modelNamespace, model.Name),
-		CreatedAt:       time.Now().Unix(),
-		ReplicaPower:    requiredReplica,
-		RootImage:       s.cfg.RootImage,
-		WorkerImage:     s.cfg.WorkerImage,
-		DispatcherImage: s.cfg.SessionDispatcherImage,
-		NATS:            conversation.NATSConfig{URL: s.cfg.NATSURL},
+		Hash:                    hash,
+		Session:                 fmt.Sprintf("session-%s", sanitizeSessionHash(hash)),
+		Namespace:               s.cfg.Namespace,
+		Model:                   fmt.Sprintf("%s/%s", modelNamespace, model.Name),
+		CreatedAt:               time.Now().Unix(),
+		ReplicaPower:            requiredReplica,
+		RootImage:               s.cfg.RootImage,
+		WorkerImage:             s.cfg.WorkerImage,
+		DispatcherImage:         s.cfg.SessionDispatcherImage,
+		DispatcherMetricsListen: s.cfg.SessionDispatcherMetricsListen,
+		NATS:                    conversation.NATSConfig{URL: s.cfg.NATSURL},
 		Queue: &conversation.QueueConfig{
 			BacklogSubject:        sessionBacklogSubject(hash),
 			ResponseSubjectPrefix: responseSubjectPrefix(s.cfg.OutPrefix, hash),

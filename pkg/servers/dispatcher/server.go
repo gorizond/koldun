@@ -86,19 +86,21 @@ type assignment struct {
 	payload      []byte
 }
 
+var ErrQueueMisconfigured = errors.New("dispatcher queue misconfigured")
+
 // New constructs a dispatcher instance.
 func New(cfg Config) (*Server, error) {
+	cfg.BacklogSubject = strings.TrimSpace(cfg.BacklogSubject)
+	cfg.AssignmentsBucket = strings.TrimSpace(cfg.AssignmentsBucket)
+
 	if strings.TrimSpace(cfg.Hash) == "" {
 		return nil, fmt.Errorf("hash is required")
 	}
 	if strings.TrimSpace(cfg.NATSURL) == "" {
 		return nil, fmt.Errorf("nats url is required")
 	}
-	if strings.TrimSpace(cfg.BacklogSubject) == "" {
-		return nil, fmt.Errorf("backlog subject is required")
-	}
-	if strings.TrimSpace(cfg.AssignmentsBucket) == "" {
-		return nil, fmt.Errorf("assignments bucket is required")
+	if err := validateQueueConfig(cfg); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(cfg.DllamaSubjectPrefix) == "" {
 		return nil, fmt.Errorf("dllama subject prefix is required")
@@ -107,11 +109,11 @@ func New(cfg Config) (*Server, error) {
 		cfg.AckWait = 2 * time.Minute
 	}
 	cfg.DllamaSubjectPrefix = ensureTrailingDot(cfg.DllamaSubjectPrefix)
-	if strings.TrimSpace(cfg.StateSubjectPrefix) == "" {
-		cfg.StateSubjectPrefix = cfg.DllamaSubjectPrefix
-	} else {
-		cfg.StateSubjectPrefix = ensureTrailingDot(cfg.StateSubjectPrefix)
+	statePrefix, err := sanitizeStateSubjectPrefix(cfg.StateSubjectPrefix)
+	if err != nil {
+		return nil, err
 	}
+	cfg.StateSubjectPrefix = statePrefix
 	if cfg.QueueGroup == "" {
 		cfg.QueueGroup = fmt.Sprintf("dispatcher-%s", sanitizeIdentifier(cfg.Hash))
 	}
@@ -212,6 +214,16 @@ func (s *Server) Run(ctx context.Context) error {
 	go s.updateMetricsPeriodically(ctx)
 
 	<-ctx.Done()
+	return nil
+}
+
+func validateQueueConfig(cfg Config) error {
+	if cfg.BacklogSubject == "" {
+		return fmt.Errorf("%w: backlog subject is required", ErrQueueMisconfigured)
+	}
+	if cfg.AssignmentsBucket == "" {
+		return fmt.Errorf("%w: assignments bucket is required", ErrQueueMisconfigured)
+	}
 	return nil
 }
 
@@ -464,6 +476,14 @@ func (s *Server) shouldLogNoIdle(now time.Time) bool {
 	}
 	s.lastNoIdleLog = now
 	return true
+}
+
+func sanitizeStateSubjectPrefix(prefix string) (string, error) {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		return "", fmt.Errorf("state subject prefix is required")
+	}
+	return ensureTrailingDot(prefix), nil
 }
 
 func ensureTrailingDot(prefix string) string {

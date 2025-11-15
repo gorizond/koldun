@@ -1,0 +1,5 @@
+{
+  "total": 85.2,
+  "updated_at": "2025-11-10T16:42:00Z",
+  "source": "Session 18 — ingress coverage push to 85%+ (go tool cover -func compose.coverprofile)"
+}

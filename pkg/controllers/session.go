@@ -3,8 +3,10 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -746,6 +748,13 @@ func desiredDispatcherDeployment(sess *v1.Session, labels map[string]string, que
 		Command:         []string{"/koldun"},
 		Args:            args,
 	}
+	if port := dispatcherMetricsPort(sess.Spec.DispatcherMetricsListen); port > 0 {
+		container.Ports = []corev1.ContainerPort{{
+			Name:          "metrics",
+			ContainerPort: port,
+			Protocol:      corev1.ProtocolTCP,
+		}}
+	}
 
 	deployment := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "Deployment"},
@@ -783,7 +792,32 @@ func dispatcherArgs(sess *v1.Session, backlogSubject, assignmentsBucket, dllamaP
 		fmt.Sprintf("--dispatcher-ack-wait=%s", ackWait.String()),
 	}
 
+	if metricsAddr := strings.TrimSpace(sess.Spec.DispatcherMetricsListen); metricsAddr != "" {
+		args = append(args, fmt.Sprintf("--dispatcher-metrics-listen=%s", metricsAddr))
+	}
+
 	return args
+}
+
+func dispatcherMetricsPort(listenAddr string) int32 {
+	addr := strings.TrimSpace(listenAddr)
+	if addr == "" {
+		return 0
+	}
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		lastColon := strings.LastIndex(addr, ":")
+		if lastColon >= 0 {
+			portStr = addr[lastColon+1:]
+		} else {
+			portStr = addr
+		}
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portStr))
+	if err != nil || port <= 0 || port > 65535 {
+		return 0
+	}
+	return int32(port)
 }
 
 func (h *sessionHandler) reconcileDllama(sess *v1.Session, dllama *v1.Dllama) error {

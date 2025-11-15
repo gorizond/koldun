@@ -67,11 +67,30 @@ HASH_KOLDUN=... \
 go run ./cmd/operator --mode=llm \
   --llm-request-subject "sessions.${HASH_KOLDUN}.dllama.0.in" \
   --llm-state-subject "sessions.${HASH_KOLDUN}.dllama.0.state"
+
+# Launch a dispatcher pinned to one conversation backlog
+HASH_KOLDUN=... \
+go run ./cmd/operator --mode=dispatcher \
+  --dispatcher-hash "${HASH_KOLDUN}" \
+  --dispatcher-nats-url nats://koldun:k0ldun@nats.default:4222 \
+  --dispatcher-backlog-subject "sessions.${HASH_KOLDUN}.requests" \
+  --dispatcher-assignments-bucket koldun_assignments \
+  --dispatcher-dllama-prefix "sessions.${HASH_KOLDUN}.dllama." \
+  --dispatcher-state-prefix "sessions.${HASH_KOLDUN}.dllama." \
+  --dispatcher-queue-group "dispatcher-${HASH_KOLDUN}" \
+  --dispatcher-ack-wait 2m
 ```
+
+### Dispatcher state subjects & metrics
+- `--dispatcher-state-prefix` **must** match the subject prefix used by worker heartbeats and always end with `.`. When Sessions are generated via `Ingress` or Helm templates you can override this by setting `spec.backend.queue.stateStream`; if the stream already contains dots, the session controller copies it directly into the dispatcher args so manual Deployments stay in sync with CRD-driven ones.
+- Set `--dispatcher-metrics-listen=:9090` (or another host:port) to expose `/metrics` and `/healthz` from dispatcher pods. The sample manifest in `k8s/dispatcher-deploy.yaml` enables the listener, opens port `9090`, and appends a ClusterIP Service plus PodMonitor example so Prometheus or readiness probes can scrape the endpoints immediately.
+- Session CRDs expose `spec.dispatcherMetricsListen`, and `Ingress.spec.backend.dispatcherMetricsListen` along with `--backend-session-dispatcher-metrics-listen` keep the generated dispatcher Deployments in lock-step with manual pods so `/metrics` is always wired consistently. Helm users can also set `ingressDefaults.dispatcherMetricsListen` (or per-ingress overrides) to inject the flag without hand-editing every spec snippet.
+
+Prometheus Operator setups can now reuse the PodMonitor example bundled with `k8s/dispatcher-deploy.yaml` (update the `release` label/namespace to match your stack). If you prefer Service-based scraping, the same manifest also ships a ClusterIP ready for ServiceMonitors; copy it per session dispatcher because the controller does not generate Services automatically to avoid per-session resource churn.
 
 ### Deploy to Kubernetes
 - **Helm**: Edit `charts/koldun/values.yaml` (images, NATS, session scaling) then `helm install koldun charts/koldun`.
-- **Raw manifests**: Apply the CRDs, controllers, and sample resources from the `k8s/` directory.
+- **Raw manifests**: Apply the CRDs, controllers, and sample resources from the `k8s/` directory. Use `k8s/dispatcher-deploy.yaml` when you need a dedicated dispatcher Deployment; it demonstrates the required `--dispatcher-state-prefix` flag and the optional `--dispatcher-metrics-listen` endpoint, which now also propagates from `spec.dispatcherMetricsListen` on Sessions/Ingresses.
 - Use `skaffold build` to publish the container image `ghcr.io/gorizond/koldun` before updating chart values.
 
 ## Example Custom Resources
@@ -154,10 +173,46 @@ spec:
 
 - The controller produces the backend Deployment (`--mode=ingress`), Service, and Kubernetes Ingress automatically.
 - Set `spec.backend.extraArgs` for advanced flags, or `spec.backend.hashSecret` to enable HMAC hashing.
+- Use `spec.backend.queue.stateStream` to override dispatcher heartbeat subjects; when it contains dots the controller reuses it directly for `--dispatcher-state-prefix` so Deployments and Helm/k8s manifests stay in sync.
 - Choosing `spec.service.type: LoadBalancer` or providing TLS annotations maps directly to the rendered Kubernetes Ingress.
 
 ## Development Workflow
 - Follow `AGENTS.md` for contributor expectations, code layout, testing, and security conventions.
+- Run `make help` to discover the canonical shortcuts (`test`, `controllers-smoke`, `compose-test`, `compose-update-baseline`) and reminders about compose coverage maintenance. Whenever the merged compose coverage exceeds the tracked value in `analytics/compose_coverage_baseline.json`, rerun `make compose-update-baseline`; the helper refreshes the JSON with the new percentage, timestamp, and commit hash so CI enforces the higher bar automatically.
+
+## Local Integration Stack (docker-compose)
+Run the NATS + MinIO + single-node k3s stack whenever you need a reproducible environment for ingress/dispatcher tests without depending on host networking quirks.
+
+```bash
+# from repo root
+export COMPOSE_FILE=docker-compose.test.yml
+docker compose up -d
+
+# kubeconfig appears under hack/localstack/kubeconfig/kubeconfig
+export KUBECONFIG=$PWD/hack/localstack/kubeconfig/kubeconfig
+
+# sample env vars for go test ./pkg/servers/ingress
+export KOLDUN_NATS_URL="nats://koldun:koldun@127.0.0.1:4222"
+export KOLDUN_DISPATCHER_NATS_URL="$KOLDUN_NATS_URL"
+export KOLDUN_MINIO_ENDPOINT="http://127.0.0.1:9000"
+export KOLDUN_MINIO_ACCESS_KEY=minio
+export KOLDUN_MINIO_SECRET_KEY=minio123
+```
+
+Bring the stack down with `docker compose down -v` when finished. See `hack/localstack/README.md` for full details on the services, health checks, and bucket/bootstrap logic.
+
+### Automated Usage
+- **Local**: `make compose-test` spins the stack up, waits for NATS/MinIO, and runs `go test` for both `pkg/servers/ingress` and `pkg/servers/dispatcher` against the same compose JetStream before tearing everything down. The target exports `KOLDUN_NATS_URL` (default `nats://koldun:koldun@127.0.0.1:4222`) and mirrors it into `KOLDUN_DISPATCHER_NATS_URL`, so dispatcher helpers automatically point at the compose stack. Each run emits `compose.coverprofile` (merged ingress+dispatcher coverage) and `artifacts/compose-logs.txt` with the full `docker compose logs` dump for easy upload/debugging.
+- **CI**: `.github/workflows/compose-ingress.yaml` mirrors the same workflow on GitHub Actions so every PR touching ingress, dispatcher, or the compose stack runs the end-to-end tests with real JetStream/MinIO. The job shells out to `make compose-test`, runs `go tool cover -func compose.coverprofile`, publishes the total into the job summary (with a direct link to the uploaded `compose.coverage.txt`), highlights any coverage increase with a call-to-action, and fails if coverage drops below the baseline recorded in `analytics/compose_coverage_baseline.json` or if a PR raises coverage without updating that baseline. Artifacts `compose.coverprofile`, `compose.coverage.txt`, and `artifacts/compose-logs.txt` are uploaded on every run for offline inspection.
+- **Coverage helpers**: after any local compose run, execute `go tool cover -func compose.coverprofile | tail -n 1` to inspect the “total” line and decide whether the baseline file should be updated. When you intentionally raise coverage, run `make compose-update-baseline` (wraps `hack/update-compose-coverage-baseline.sh $(COMPOSE_TEST_COVERPROFILE) $(COMPOSE_TEST_BASELINE)`) — the helper records the new total, UTC timestamp, and current commit hash in `analytics/compose_coverage_baseline.json` so CI enforces the higher target automatically.
+- **Keep the stack running**: set `COMPOSE_TEST_KEEP_STACK=1 make compose-test` to skip the automatic teardown phase for interactive debugging (logs are still captured). Clean up manually with `make compose-test-down` once you are finished poking at the containers.
+- **Dispatcher**: when running dispatcher tests manually, ensure the compose stack is up and run `export KOLDUN_DISPATCHER_NATS_URL=$KOLDUN_NATS_URL` (direnv users get this automatically via `.envrc`). Then execute `go test ./pkg/servers/dispatcher -cover -count=1` to validate backlog/retry flows without relying on loopback sockets.
+- Shared helpers belong in `pkg/controllers/common.go`; resource-specific logic lives in dedicated files (`root.go`, `worker.go`, etc.).
+- Prefer Go table-driven tests and mocks from `go.uber.org/mock` for JetStream/Kubernetes clients.
+- Avoid committing secrets; store NATS credentials and hash secrets in Kubernetes Secrets labelled `koldun.gorizond.io/token`.
+
+#### Troubleshooting
+- **`ErrConnectionRefused` / `nats: no servers available` during dispatcher tests**: ensure `docker compose up` is running and both `KOLDUN_NATS_URL` and `KOLDUN_DISPATCHER_NATS_URL` point to the compose endpoint (`nats://koldun:koldun@127.0.0.1:4222`). `make compose-test` and `.envrc` already wire this up; for manual runs export the variables before invoking `go test`.
 - Shared helpers belong in `pkg/controllers/common.go`; resource-specific logic lives in dedicated files (`root.go`, `worker.go`, etc.).
 - Prefer Go table-driven tests and mocks from `go.uber.org/mock` for JetStream/Kubernetes clients.
 - Avoid committing secrets; store NATS credentials and hash secrets in Kubernetes Secrets labelled `koldun.gorizond.io/token`.
@@ -176,6 +231,13 @@ ls "$KUBEBUILDER_ASSETS"  # sanity-check kube-apiserver/etcd are present
 
 # Verify the integration test; it will skip with a helpful message if assets are missing
 go test ./pkg/controllers -run TestDllamaReconciliationCreatesRootAndWorker -count=1
+```
+
+If you want the same two-step sequence our onboarding docs and CI jobs follow, run:
+
+```bash
+make envtest-preflight
+export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 ```
 
 - `make envtest-preflight` wraps the `setup-envtest use` invocation, validates that both `kube-apiserver` and `etcd` binaries exist, and reprints the `KUBEBUILDER_ASSETS` export line. Use it after toolchain upgrades or when bootstrapping CI runners.

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conversation-dispatcher
+  namespace: default
+  labels:
+    koldun.gorizond.io/component: dispatcher
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      koldun.gorizond.io/component: dispatcher
+      koldun.gorizond.io/session-hash: conversation-hash
+  template:
+    metadata:
+      labels:
+        koldun.gorizond.io/component: dispatcher
+        koldun.gorizond.io/session-hash: conversation-hash
+    spec:
+      containers:
+        - name: dispatcher
+          image: ghcr.io/gorizond/koldun:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - '--mode=dispatcher'
+            - '--dispatcher-hash=conversation-hash'
+            - '--dispatcher-nats-url=nats://koldun:k0ldun@nats.default:4222'
+            - '--dispatcher-backlog-subject=sessions.conversation-hash.requests'
+            - '--dispatcher-assignments-bucket=koldun_assignments'
+            - '--dispatcher-dllama-prefix=sessions.conversation-hash.dllama.'
+            - '--dispatcher-state-prefix=sessions.conversation-hash.dllama.'
+            - '--dispatcher-queue-group=dispatcher-conversation-hash'
+            - '--dispatcher-ack-wait=2m'
+            - '--dispatcher-metrics-listen=:9090'
+          # /metrics and /healthz are available once --dispatcher-metrics-listen is set.
+          ports:
+            - containerPort: 9090
+              name: metrics
+              protocol: TCP
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+---
+# Expose /metrics and /healthz through a stable ClusterIP so Prometheus ServiceMonitors
+# can scrape dispatcher pods without touching every Deployment.
+apiVersion: v1
+kind: Service
+metadata:
+  name: conversation-dispatcher-metrics
+  namespace: default
+  labels:
+    koldun.gorizond.io/component: dispatcher
+    koldun.gorizond.io/session-hash: conversation-hash
+spec:
+  ports:
+    - name: metrics
+      port: 9090
+      protocol: TCP
+      targetPort: metrics
+  selector:
+    koldun.gorizond.io/component: dispatcher
+    koldun.gorizond.io/session-hash: conversation-hash
+---
+# PodMonitor example for Prometheus Operator. Adjust the release label/namespace to match
+# your stack or swap for a ServiceMonitor if you prefer scraping via a Service.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: conversation-dispatcher
+  namespace: default
+  labels:
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - default
+  selector:
+    matchLabels:
+      koldun.gorizond.io/component: dispatcher
+      koldun.gorizond.io/session-hash: conversation-hash
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics

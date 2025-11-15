@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorizond/koldun/pkg/controllers"
+	"github.com/gorizond/koldun/pkg/testutil"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
@@ -275,9 +276,10 @@ func TestServer_respondStatus(t *testing.T) {
 }
 
 func TestServer_Run_ContextCancellation(t *testing.T) {
+	testutil.RequireLoopback(t)
 	health := controllers.NewHealth()
 	server, err := New(Config{
-		ListenAddress: ":0", // Use port 0 for automatic assignment
+		ListenAddress: "127.0.0.1:0", // Use port 0 on loopback for automatic assignment
 		Health:        health,
 	})
 	if err != nil {
@@ -454,9 +456,10 @@ func TestServer_Run_ServerClosedError(t *testing.T) {
 }
 
 func TestServer_Run_ReturnsNilWhenServerClosed(t *testing.T) {
+	testutil.RequireLoopback(t)
 	health := controllers.NewHealth()
 	server, err := New(Config{
-		ListenAddress: ":0",
+		ListenAddress: "127.0.0.1:0",
 		Health:        health,
 	})
 	if err != nil {
@@ -488,10 +491,11 @@ func TestServer_Run_ReturnsNilWhenServerClosed(t *testing.T) {
 }
 
 func TestServer_Run_LogsWarningWhenShutdownFails(t *testing.T) {
+	testutil.RequireLoopback(t)
 	health := controllers.NewHealth()
 	logger, hook := logrustest.NewNullLogger()
 	server, err := New(Config{
-		ListenAddress: ":0",
+		ListenAddress: "127.0.0.1:0",
 		Health:        health,
 		Logger:        logrus.NewEntry(logger),
 	})

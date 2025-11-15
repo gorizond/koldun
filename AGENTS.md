@@ -6,6 +6,8 @@ Core entrypoints live in `cmd/operator`, which selects operator, backend, dispat
 ## Build, Test, and Development Commands
 Run `go fmt ./... && gofmt -w` before committing to keep formatting consistent. Use `go build ./cmd/operator` to compile the unified binary or `go run ./cmd/operator --mode=operator` for a kubeconfig-backed smoke test. Execute `go test ./...` for unit coverage and add `-race` when debugging concurrency. Use `make controllers-smoke` (wrapper for `go test ./pkg/controllers -count=1 -timeout=5m`) as the lightweight envtest smoke for reconcilers. Container images are produced with `skaffold build`, publishing to `ghcr.io/gorizond/koldun`.
 
+Run `make help` to discover the most common shortcuts (`test`, `controllers-smoke`, `compose-test`, and `compose-update-baseline`). Compose smoke tests (`make compose-test`) bring up the docker-compose stack, run ingress/dispatcher integration suites, and write `compose.coverprofile`. Whenever the total coverage exceeds the persisted baseline, run `make compose-update-baseline` to regenerate `analytics/compose_coverage_baseline.json`; the helper records the new percentage, timestamp, and commit hash so CI enforces the higher bar automatically.
+
 ## Coding Style & Naming Conventions
 Write Go 1.21+ idiomatic code: tabs for indentation, camelCase for locals, PascalCase for exported symbols. Shared helpers belong in `pkg/controllers/common.go`; resource-specific logic should remain in files such as `root.go` or `worker.go`. CLI flags mirror the existing pattern in `cmd/operator/main.go`, using kebab-case names prefixed by the target mode. Always run gofmt tooling and avoid introducing non-ASCII characters unless already present in a file.
 
@@ -17,6 +19,13 @@ Envtest-powered controller tests (`pkg/controllers/dllama_reconcile_envtest_test
 ```bash
 go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
 eval "$(setup-envtest use -p env --bin-dir ./bin/envtest 1.32.x!)"
+```
+
+Or reuse the same two steps our onboarding, docs, and CI recommend:
+
+```bash
+make envtest-preflight
+export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 ```
 
 The refreshed `envtest_suite_test.go` will skip gracefully (with guidance) when assets are missing, so CI logs stay quiet.
@@ -31,3 +40,7 @@ Prefer short, imperative commit subjects (for example `feat: add dispatcher auto
 
 ## Security & Configuration Tips
 Keep credentials, NATS secrets, and hash keys in Kubernetes Secrets—never commit sensitive data. Revisit RBAC policies when shipping new controllers to ensure service accounts and JetStream permissions are scoped correctly. Update the Dockerfile and `skaffold.yaml` whenever build flags or binary names change so published images remain reproducible.
+
+- Dispatcher mode now enforces `--dispatcher-state-prefix` (non-empty and ending in `.`). Update any Helm values, raw manifests, or hand-run commands that start `cmd/operator --mode=dispatcher` to include the flag so the server can subscribe to worker state subjects.
+- Sessions generated via CRDs inherit the value from `spec.queue.dllamaSubjectPrefix` unless you set `spec.queue.stateStream`; providing a dotted stream name (for example `sessions.hash.state`) forces the controller to emit the same string for `--dispatcher-state-prefix`, keeping manual Deployments aligned with declarative resources.
+- Enable Prometheus/health scraping for dispatcher pods by supplying `--dispatcher-metrics-listen` (e.g. `:9090`) in manifests or CLI invocations. `spec.dispatcherMetricsListen` on Sessions (surfaced via `Ingress.spec.backend.dispatcherMetricsListen` or `--backend-session-dispatcher-metrics-listen`) keeps generated Deployments aligned, Helm charts can now inject the value via `ingressDefaults.dispatcherMetricsListen`, and `k8s/dispatcher-deploy.yaml` ships a ready-made Service plus PodMonitor template beside the Deployment so scraping works out of the box.

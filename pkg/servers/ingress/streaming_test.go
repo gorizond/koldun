@@ -218,6 +218,38 @@ func TestStreamResponseContextCancelled(t *testing.T) {
 	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
 }
 
+// TestStreamResponseSubscriptionClosed ensures SSE emits an error chunk when the
+// response subscription closes before any payloads are streamed (e.g. backlog
+// publish failure or dispatcher drop).
+func TestStreamResponseSubscriptionClosed(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	msgs := make(chan *nats.Msg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		srv.streamResponse(ctx, rec, msgs)
+	}()
+
+	close(msgs)
+	wg.Wait()
+
+	body := rec.Body.String()
+	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
+	require.Len(t, chunks, 2)
+
+	errorChunk := strings.TrimPrefix(chunks[0], "data: ")
+	require.Contains(t, errorChunk, `"subscription closed"`)
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
+}
+
 func TestConsumeStateEvent(t *testing.T) {
 	t.Parallel()
 
