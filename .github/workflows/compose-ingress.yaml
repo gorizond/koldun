@@ -77,22 +77,8 @@ jobs:
           printf "%s\n" "${coverage_output}" | tee compose.coverage.txt
           total_line="$(echo "${coverage_output}" | grep -E 'total:')"
           total_value="$(echo "${total_line}" | awk '{print $3}' | tr -d '%')"
-          baseline_value="$(python3 - <<'PY'
-import json
-from pathlib import Path
-data = json.loads(Path("analytics/compose_coverage_baseline.json").read_text())
-print(data["total"])
-PY
-)"
-          delta_pp="$(python3 - <<'PY' "$baseline_value" "$total_value"
-from decimal import Decimal
-import sys
-baseline = Decimal(sys.argv[1])
-total = Decimal(sys.argv[2])
-delta = total - baseline
-print(f"{delta:.2f}")
-PY
-)"
+          baseline_value="$(python3 -c 'import json; from pathlib import Path; data = json.loads(Path("analytics/compose_coverage_baseline.json").read_text()); print(data["total"])')"
+          delta_pp="$(python3 -c "from decimal import Decimal; import sys; baseline = Decimal('$baseline_value'); total = Decimal('$total_value'); delta = total - baseline; print(f'{delta:.2f}')")"
 
           {
             echo "### Compose coverage"
@@ -108,15 +94,7 @@ PY
           echo "total=${total_value}" >> "$GITHUB_OUTPUT"
           echo "baseline=${baseline_value}" >> "$GITHUB_OUTPUT"
 
-          needs_update=$(python3 - <<'PY' "$baseline_value" "$total_value"
-from decimal import Decimal
-import sys
-baseline = Decimal(sys.argv[1])
-total = Decimal(sys.argv[2])
-threshold = Decimal("0.005")
-print("true" if total - baseline > threshold else "false")
-PY
-)
+          needs_update=$(python3 -c "from decimal import Decimal; baseline = Decimal('$baseline_value'); total = Decimal('$total_value'); threshold = Decimal('0.005'); print('true' if total - baseline > threshold else 'false')")
 
           if [ "${needs_update}" = "true" ]; then
             {
@@ -131,16 +109,7 @@ EOF
             echo "needs-baseline-update=true" >> "$GITHUB_OUTPUT"
           fi
 
-          python3 - <<'PY' "$baseline_value" "$total_value"
-from decimal import Decimal
-import sys
-baseline = Decimal(sys.argv[1])
-total = Decimal(sys.argv[2])
-if total + Decimal("0.0005") < baseline:
-    diff = baseline - total
-    print(f"Coverage {total}% is below baseline {baseline}% (Δ -{diff:.2f}pp)")
-    sys.exit(1)
-PY
+          python3 -c "from decimal import Decimal; import sys; baseline = Decimal('$baseline_value'); total = Decimal('$total_value'); diff = baseline - total if total + Decimal('0.0005') < baseline else None; sys.exit(1) if diff and (print(f'Coverage {total}% is below baseline {baseline}% (Δ -{diff:.2f}pp)') or True) else sys.exit(0)"
 
       - name: Enforce compose baseline update
         if: ${{ github.event_name == 'pull_request' && steps.compose-coverage.outputs.needs-baseline-update == 'true' }}
