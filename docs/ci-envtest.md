@@ -60,10 +60,11 @@ jobs:
         run: ./hack/ci-envtest.sh
 ```
 
-### controllers-envtest job snapshot (2025-11-15)
+### controllers-envtest job snapshot (2025-11-16)
 
-- Re-running `./hack/ci-envtest.sh` locally (mirrors the `controllers-envtest` workflow) reported `go test ./pkg/controllers` finishing in **64.8 s** wall-clock time with the warmed macOS cache, which lines up with the ≈45 s local `/usr/bin/time -p make controllers-smoke` baseline once you add the extra log noise and setup work CI performs.
-- The same log earlier подсвечивал флейк в `TestConversationReconcilerRetriesBucketEnsureWhenJetStreamUnavailable` (иногда не появлялся `"failed to reconnect to NATS, will retry"`). Сессия 55 перенесла `blockDialer.Store(true)` до удаления bucket'а, поэтому controllers-envtest теперь стабилен.
+- Re-running `./hack/ci-envtest.sh` locally (mirrors the `controllers-envtest` workflow) reported `go test ./pkg/controllers` finishing in **73.5 s** (coverage 99.8%) wall-clock time with the warmed macOS cache, which lines up with the ≈45 s local `/usr/bin/time -p make controllers-smoke` baseline once you add the extra log noise and setup work CI performs.
+- The flake in `TestConversationReconcilerRetriesBucketEnsureWhenJetStreamUnavailable` (missing `"failed to reconnect to NATS, will retry"` log) has been fixed by moving `blockDialer.Store(true)` before `js.DeleteKeyValue()`, ensuring the reconnect loop hits the failure path reliably.
+- **Automatic cross-platform asset selection**: The test suite's `scoreKubebuilderAsset()` function prioritizes assets matching `runtime.GOOS` and `runtime.GOARCH`. In a Linux container both `bin/envtest/k8s/1.32.0-darwin-arm64` and `bin/envtest/k8s/1.32.0-linux-arm64` can coexist — the suite automatically selects the Linux binary (score 3 for linux+arm64 vs score 1 for darwin matching only arch). No manual renaming of darwin assets is required.
 - Detailed cached vs cold measurements for macOS and Linux runners now live in the README under the Envtest quick start section so CI operators can compare their timings without combing through workflow logs.
 
 ## Self-hosted runner / other CI template
@@ -105,8 +106,8 @@ before executing the rest of `go test ./...`.
   [quick start steps](../README.md#envtest-quick-start-new-machinerunner) to
   install the binaries (`make envtest-preflight`, export
   `KUBEBUILDER_ASSETS`, wrap `make controllers-smoke` with `/usr/bin/time -p`
-  to verify the ≈45 s macOS / ≈44 s Linux cached runtimes captured in the README
-  table (the same runner used to report ~60 s before we trimmed the parity test).
+  to verify the ≈45 s macOS / ≈44 s Linux cached runtimes captured in the README
+  table (the same runner used to report ~60 s before we trimmed the parity test).
   If the helper prints a different path on each run, ensure `./bin/envtest` is
   cached or mounted persistently.
 - **`conversation bucket missing; reconnecting` never disappears even after restarting JetStream.**
@@ -116,7 +117,7 @@ before executing the rest of `go test ./...`.
   to recreate the bucket. When you see this warning locally, re-run the
   [quick start](../README.md#envtest-quick-start-new-machinerunner) sequence
   to ensure the embedded server starts cleanly and compare the wall-clock
-  time (≈45 s cached, ≈4 minutes on the very first run because of Go/toolchain
+  time (≈45 s cached, ≈4 minutes on the very first run because of Go/toolchain
   downloads) with the baselines printed in README. If the warning persists,
   wipe `./bin/envtest` and re-run `make envtest-preflight` so the helper can
   repopulate the control-plane binaries.
@@ -137,7 +138,7 @@ before executing the rest of `go test ./...`.
   `TestConversationReconcilerMaintainsRecoveryTimeAcrossOutages`, which deletes
   the bucket while blocking dials (synthetic outage) and wipes the JetStream
   store twice to simulate a real restart. After the Session 52 optimization each
-  recovery loop completes in ≈1–3 s (still guarded by a 15 s upper bound), so a
+  recovery loop completes in ≈1–3 s (still guarded by a 15 s upper bound), so a
   longer run generally signals envtest downloads or disk throttling. If your run
   slows down, compare the durations logged by the test with the README baseline
   to spot missing caches.
