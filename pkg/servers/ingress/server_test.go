@@ -1,5 +1,6 @@
 package ingress
 
+// Test suite for ingress server functionality
 import (
 	"context"
 	"crypto/hmac"
