@@ -102,10 +102,10 @@ jobs:
               echo "> ✅ Coverage exceeded the baseline by ${delta_pp}pp. Run \`make compose-update-baseline\` and commit analytics/compose_coverage_baseline.json."
             } >> "$GITHUB_STEP_SUMMARY"
             mkdir -p artifacts
-            cat <<EOF > artifacts/compose-baseline-increase.txt
-Coverage ${total_value}% exceeded baseline ${baseline_value}% by ${delta_pp}pp.
-Run make compose-update-baseline (wrapping hack/update-compose-coverage-baseline.sh) and commit analytics/compose_coverage_baseline.json together with compose.coverprofile.
-EOF
+            {
+              echo "Coverage ${total_value}% exceeded baseline ${baseline_value}% by ${delta_pp}pp."
+              echo "Run make compose-update-baseline (wrapping hack/update-compose-coverage-baseline.sh) and commit analytics/compose_coverage_baseline.json together with compose.coverprofile."
+            } > artifacts/compose-baseline-increase.txt
             echo "needs-baseline-update=true" >> "$GITHUB_OUTPUT"
           fi
 
