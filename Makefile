@@ -1,4 +1,4 @@
-.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke compose-test-up compose-test-down compose-test compose-update-baseline help
+.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke controllers-coverage-check compose-test-up compose-test-down compose-test compose-update-baseline help
 
 SHELL := /bin/bash
 
@@ -18,6 +18,7 @@ help:
 	@printf "  %-25s %s\n" "coverage" "Generate coverage.out and HTML report"
 	@printf "  %-25s %s\n" "envtest-preflight" "Download and validate envtest assets"
 	@printf "  %-25s %s\n" "controllers-smoke" "Run controller envtest suite without coverage"
+	@printf "  %-25s %s\n" "controllers-coverage-check" "Verify controllers coverage >= 99% (CI gate)"
 	@printf "  %-25s %s\n" "compose-test" "Spin up docker compose stack and run dispatcher/ingress tests"
 	@printf "  %-25s %s\n" "compose-update-baseline" "Update analytics/compose_coverage_baseline.json from compose.coverprofile"
 
@@ -90,8 +91,13 @@ controllers-smoke:
 	fi; \
 	echo "Using KUBEBUILDER_ASSETS=$$ASSETS"; \
 	export KUBEBUILDER_ASSETS="$$ASSETS"; \
-	go test ./pkg/controllers -count=1 -timeout=5m
+	go test ./pkg/controllers -count=1 -timeout=10m
 	@echo "✓ All controller tests passed"
+
+# Verify controllers coverage meets minimum threshold (99%)
+# Used as CI gate to prevent coverage regression
+controllers-coverage-check:
+	@./hack/check-controller-coverage.sh
 
 # Verify individual test packages work (no deadlock in smaller test suites)
 test-quick:

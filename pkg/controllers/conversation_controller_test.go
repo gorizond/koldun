@@ -531,8 +531,10 @@ func TestEnsureConversationBucketPropagatesUnexpectedErrors(t *testing.T) {
 }
 
 type trackingConn struct {
-	inner   natsConnection
-	drained atomic.Bool
+	inner    natsConnection
+	drained  atomic.Bool
+	closed   atomic.Bool
+	drainErr error
 }
 
 func newTrackingConn(inner natsConnection) *trackingConn {
@@ -549,11 +551,14 @@ func (t *trackingConn) Close() {
 		toClose.Close()
 	}
 	t.drained.Store(true)
+	t.closed.Store(true)
 }
 
 func (t *trackingConn) Drain() error {
 	var err error
-	if t.inner != nil {
+	if t.drainErr != nil {
+		err = t.drainErr
+	} else if t.inner != nil {
 		err = t.inner.Drain()
 	}
 	if err == nil {
@@ -920,6 +925,122 @@ func TestConversationReconcilerReconnectsWhenBucketMissing(t *testing.T) {
 	require.Equal(t, int32(1), reconnects.Load(), "reconciler should reconnect after bucket deletion")
 }
 
+func TestConversationReconcilerSyncWithReconnectHandlesRecoverableErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil).AnyTimes()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "connection closed", err: nats.ErrConnectionClosed},
+		{name: "connection draining", err: nats.ErrConnectionDraining},
+		{name: "bucket missing", err: nats.ErrBucketNotFound},
+		{name: "stream missing", err: nats.ErrStreamNotFound},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			reconciler := &conversationReconciler{
+				cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+				log:      logrus.New().WithField("test", t.Name()),
+				sessions: sessions,
+				apply:    newFakeApply(),
+				kv: &fakeMemoryKV{
+					bucket:  "conversations",
+					keysErr: tt.err,
+				},
+			}
+
+			var reconnects atomic.Int32
+			reconciler.reconnectFn = func(context.Context) error {
+				reconnects.Add(1)
+				reconciler.kv = &fakeMemoryKV{bucket: "conversations"}
+				return nil
+			}
+
+			require.True(t, reconciler.syncWithReconnect(context.Background()))
+			require.Equal(t, int32(1), reconnects.Load(), "expected reconnect for %s", tt.name)
+		})
+	}
+}
+
+func TestConversationReconcilerSyncWithReconnectFailsWhenReconnectErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil).AnyTimes()
+
+	reconnectErr := errors.New("reconnect failed")
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: nats.ErrConnectionClosed,
+		},
+	}
+
+	var reconnects atomic.Int32
+	reconciler.reconnectFn = func(context.Context) error {
+		reconnects.Add(1)
+		return reconnectErr
+	}
+
+	require.False(t, reconciler.syncWithReconnect(context.Background()))
+	require.Equal(t, int32(1), reconnects.Load(), "reconnect should be attempted before giving up")
+}
+
+func TestConversationReconcilerSyncWithReconnectStopsOnContextCancellation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil).AnyTimes()
+
+	reconciler := &conversationReconciler{
+		cfg:      ConversationConfig{TTLPrefix: "nats_ttl_"},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: nats.ErrBucketNotFound,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var reconnects atomic.Int32
+	reconciler.reconnectFn = func(ctx context.Context) error {
+		reconnects.Add(1)
+		cancel()
+		return ctx.Err()
+	}
+
+	require.False(t, reconciler.syncWithReconnect(ctx))
+	require.Equal(t, int32(1), reconnects.Load(), "context cancellation should still trigger a single reconnect attempt")
+}
+
 func TestConversationReconcilerReconnectPreservesPollInterval(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -953,6 +1074,55 @@ func TestConversationReconcilerReconnectPreservesPollInterval(t *testing.T) {
 
 	require.True(t, reconciler.syncWithReconnect(context.Background()))
 	require.Equal(t, cfg.PollInterval, reconciler.cfg.PollInterval, "poll interval should remain unchanged after reconnect")
+}
+
+func TestConversationReconcilerRunDrainsConnectionWhenSyncFails(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil).AnyTimes()
+
+	conn := newTrackingConn(nil)
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			PollInterval: 5 * time.Millisecond,
+		},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		conn:     conn,
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: nats.ErrConnectionClosed,
+		},
+	}
+
+	reconcileErr := errors.New("persistent reconnect failure")
+	reconciler.reconnectFn = func(context.Context) error {
+		return reconcileErr
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		reconciler.run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconciler.run did not exit after sync failure")
+	}
+
+	require.True(t, conn.Drained(), "connection should be drained when run exits due to sync failure")
 }
 
 func TestConversationReconcilerRecreatesBucketAfterDeletion(t *testing.T) {
@@ -1010,6 +1180,105 @@ func TestConversationReconcilerRecreatesBucketAfterDeletion(t *testing.T) {
 		_, statusErr := kv.Status()
 		return statusErr == nil
 	}, 5*time.Second, 50*time.Millisecond, "conversation reconciler did not recreate bucket after deletion")
+}
+
+func TestConversationReconcilerReconnectReturnsEarlyOnCancelledContext(t *testing.T) {
+	reconciler := &conversationReconciler{
+		log:    logrus.New().WithField("test", t.Name()),
+		dialer: func(string, ...nats.Option) (natsConnection, error) { return nil, nil },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := reconciler.reconnect(ctx)
+	require.ErrorIs(t, err, context.Canceled, "reconnect should return context error immediately when cancelled")
+}
+
+func TestConversationReconcilerReconnectStopsDuringBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	reconciler := &conversationReconciler{
+		log: logrus.New().WithField("test", t.Name()),
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			attempts.Add(1)
+			return nil, errors.New("connection refused")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	err := reconciler.reconnect(ctx)
+	require.ErrorIs(t, err, context.Canceled, "reconnect should stop during backoff when context cancelled")
+	require.GreaterOrEqual(t, attempts.Load(), int32(1), "at least one attempt should have been made")
+}
+
+func TestConversationReconcilerReconnectCapsBackoffAtMax(t *testing.T) {
+	var attempts atomic.Int32
+	reconciler := &conversationReconciler{
+		log: logrus.New().WithField("test", t.Name()),
+		cfg: ConversationConfig{KVBucket: "test-backoff"},
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			count := attempts.Add(1)
+			if count >= 6 {
+				srv := runJetStreamServer(t)
+				conn, err := nats.Connect(srv.ClientURL())
+				if err != nil {
+					return nil, err
+				}
+				return newTrackingConn(conn), nil
+			}
+			return nil, errors.New("connection refused")
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	err := reconciler.reconnect(ctx)
+	require.NoError(t, err, "reconnect should succeed after multiple retries")
+	require.GreaterOrEqual(t, attempts.Load(), int32(6), "should have made multiple attempts with exponential backoff")
+}
+
+func TestConversationReconcilerDrainConnHandlesNilConnection(t *testing.T) {
+	reconciler := &conversationReconciler{
+		log:  logrus.New().WithField("test", t.Name()),
+		conn: nil,
+	}
+	require.NotPanics(t, func() {
+		reconciler.drainConn()
+	}, "drainConn should not panic on nil connection")
+}
+
+func TestConversationReconcilerDrainConnClosesOnDrainError(t *testing.T) {
+	conn := newTrackingConn(nil)
+	conn.drainErr = errors.New("drain failed")
+	reconciler := &conversationReconciler{
+		log:  logrus.New().WithField("test", t.Name()),
+		conn: conn,
+	}
+
+	reconciler.drainConn()
+	require.True(t, conn.closed.Load(), "drainConn should close connection when drain fails")
+}
+
+func TestIsConnectionClosedReturnsTrueForDrainingError(t *testing.T) {
+	require.True(t, isConnectionClosed(nats.ErrConnectionDraining), "should recognize draining error")
+}
+
+func TestIsConnectionClosedReturnsFalseForNilError(t *testing.T) {
+	require.False(t, isConnectionClosed(nil), "should return false for nil error")
+}
+
+func TestIsBucketMissingReturnsTrueForStreamNotFoundError(t *testing.T) {
+	require.True(t, isBucketMissing(nats.ErrStreamNotFound), "should recognize stream not found error")
+}
+
+func TestIsBucketMissingReturnsFalseForNilError(t *testing.T) {
+	require.False(t, isBucketMissing(nil), "should return false for nil error")
 }
 
 type failingConn struct {
