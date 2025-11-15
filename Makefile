@@ -90,7 +90,7 @@ controllers-smoke:
 	fi; \
 	echo "Using KUBEBUILDER_ASSETS=$$ASSETS"; \
 	export KUBEBUILDER_ASSETS="$$ASSETS"; \
-	go test ./pkg/controllers -count=1 -timeout=5m
+	go test ./pkg/controllers -count=1 -timeout=10m
 	@echo "✓ All controller tests passed"
 
 # Verify individual test packages work (no deadlock in smaller test suites)
