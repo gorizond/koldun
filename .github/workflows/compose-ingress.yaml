@@ -1,0 +1,211 @@
+name: Ingress Compose Tests
+
+on:
+  push:
+    branches: ["main", "optimize", "develop"]
+    paths:
+      - "docker-compose.test.yml"
+      - "hack/localstack/**"
+      - "pkg/servers/ingress/**"
+      - "pkg/servers/dispatcher/**"
+      - "Makefile"
+      - ".github/workflows/compose-ingress.yaml"
+  pull_request:
+    paths:
+      - "docker-compose.test.yml"
+      - "hack/localstack/**"
+      - "pkg/servers/ingress/**"
+      - "pkg/servers/dispatcher/**"
+      - "Makefile"
+      - ".github/workflows/compose-ingress.yaml"
+
+jobs:
+  ingress-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILE: docker-compose.test.yml
+      KOLDUN_NATS_URL: nats://koldun:koldun@127.0.0.1:4222
+      KOLDUN_DISPATCHER_NATS_URL: nats://koldun:koldun@127.0.0.1:4222
+      COMPOSE_TEST_COVERPROFILE: compose.coverprofile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run compose tests
+        run: make compose-test
+
+      - name: Verify compose coverprofile
+        if: success()
+        run: |
+          set -euo pipefail
+          COVERPROFILE="${COMPOSE_TEST_COVERPROFILE:-compose.coverprofile}"
+          if [ ! -f "${COVERPROFILE}" ]; then
+            echo "compose-test completed but ${COVERPROFILE} is missing" >&2
+            exit 1
+          fi
+
+      - name: Summarize compose coverage
+        if: always()
+        id: compose-coverage
+        run: |
+          set -euo pipefail
+          COVERPROFILE="${COMPOSE_TEST_COVERPROFILE:-compose.coverprofile}"
+          echo "needs-baseline-update=false" >> "$GITHUB_OUTPUT"
+          echo "delta=0" >> "$GITHUB_OUTPUT"
+          echo "total=0" >> "$GITHUB_OUTPUT"
+          echo "baseline=0" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f "${COVERPROFILE}" ]; then
+            {
+              echo "### Compose coverage"
+              echo ""
+              echo "${COVERPROFILE} not found. The compose test run likely failed before coverage was generated."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          coverage_output=$(go tool cover -func="${COVERPROFILE}")
+          printf "%s\n" "${coverage_output}" | tee compose.coverage.txt
+          total_line="$(echo "${coverage_output}" | grep -E 'total:')"
+          total_value="$(echo "${total_line}" | awk '{print $3}' | tr -d '%')"
+          baseline_value="$(python3 - <<'PY'
+import json
+from pathlib import Path
+data = json.loads(Path("analytics/compose_coverage_baseline.json").read_text())
+print(data["total"])
+PY
+)"
+          delta_pp="$(python3 - <<'PY' "$baseline_value" "$total_value"
+from decimal import Decimal
+import sys
+baseline = Decimal(sys.argv[1])
+total = Decimal(sys.argv[2])
+delta = total - baseline
+print(f"{delta:.2f}")
+PY
+)"
+
+          {
+            echo "### Compose coverage"
+            echo ""
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            printf "| Total | %.2f%% |\n" "$total_value"
+            printf "| Baseline | %.2f%% |\n" "$baseline_value"
+            printf "| Δ vs baseline | %.2f%% |\n" "$delta_pp"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "delta=${delta_pp}" >> "$GITHUB_OUTPUT"
+          echo "total=${total_value}" >> "$GITHUB_OUTPUT"
+          echo "baseline=${baseline_value}" >> "$GITHUB_OUTPUT"
+
+          needs_update=$(python3 - <<'PY' "$baseline_value" "$total_value"
+from decimal import Decimal
+import sys
+baseline = Decimal(sys.argv[1])
+total = Decimal(sys.argv[2])
+threshold = Decimal("0.005")
+print("true" if total - baseline > threshold else "false")
+PY
+)
+
+          if [ "${needs_update}" = "true" ]; then
+            {
+              echo ""
+              echo "> ✅ Coverage exceeded the baseline by ${delta_pp}pp. Run \`make compose-update-baseline\` and commit analytics/compose_coverage_baseline.json."
+            } >> "$GITHUB_STEP_SUMMARY"
+            mkdir -p artifacts
+            cat <<EOF > artifacts/compose-baseline-increase.txt
+Coverage ${total_value}% exceeded baseline ${baseline_value}% by ${delta_pp}pp.
+Run make compose-update-baseline (wrapping hack/update-compose-coverage-baseline.sh) and commit analytics/compose_coverage_baseline.json together with compose.coverprofile.
+EOF
+            echo "needs-baseline-update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          python3 - <<'PY' "$baseline_value" "$total_value"
+from decimal import Decimal
+import sys
+baseline = Decimal(sys.argv[1])
+total = Decimal(sys.argv[2])
+if total + Decimal("0.0005") < baseline:
+    diff = baseline - total
+    print(f"Coverage {total}% is below baseline {baseline}% (Δ -{diff:.2f}pp)")
+    sys.exit(1)
+PY
+
+      - name: Enforce compose baseline update
+        if: ${{ github.event_name == 'pull_request' && steps.compose-coverage.outputs.needs-baseline-update == 'true' }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TOTAL: ${{ steps.compose-coverage.outputs.total }}
+          BASELINE: ${{ steps.compose-coverage.outputs.baseline }}
+          DELTA: ${{ steps.compose-coverage.outputs.delta }}
+        run: |
+          set -euo pipefail
+          if git diff --name-only "${BASE_SHA}"...HEAD | grep -q '^analytics/compose_coverage_baseline\.json$'; then
+            echo "compose baseline already updated in this PR"
+            exit 0
+          fi
+          {
+            echo "compose coverage ${TOTAL}% exceeded baseline ${BASELINE}% (Δ ${DELTA}pp) but analytics/compose_coverage_baseline.json was not modified."
+            echo "Run make compose-update-baseline and commit analytics/compose_coverage_baseline.json together with the new compose.coverprofile."
+          } >&2
+          exit 1
+
+      - name: Upload compose logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: artifacts/compose-logs.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload compose coverprofile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-coverprofile
+          path: ${{ env.COMPOSE_TEST_COVERPROFILE }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload compose coverage output
+        if: always()
+        id: upload-compose-coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-coverage
+          path: compose.coverage.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload compose baseline reminder
+        if: always() && steps.compose-coverage.outputs.needs-baseline-update == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-baseline-increase
+          path: artifacts/compose-baseline-increase.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Link coverage artifact in summary
+        if: always()
+        env:
+          COVERAGE_URL: ${{ steps.upload-compose-coverage.outputs.artifact-url }}
+        run: |
+          if [ -n "${COVERAGE_URL}" ]; then
+            {
+              echo ""
+              echo "[Download compose.coverage.txt](${COVERAGE_URL})"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

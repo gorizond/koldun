@@ -1,0 +1,90 @@
+services:
+  k3s:
+    image: rancher/k3s:v1.29.4-k3s1
+    privileged: true
+    command:
+      - server
+      - --disable=traefik
+      - --disable=servicelb
+      - --write-kubeconfig
+      - /output/kubeconfig
+      - --write-kubeconfig-mode
+      - "0644"
+    environment:
+      K3S_TOKEN: koldunlocal
+    volumes:
+      - k3s-data:/var/lib/rancher/k3s
+      - ./hack/localstack/kubeconfig:/output
+    ports:
+      - "16443:6443"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "k3s kubectl get nodes >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+    networks:
+      - koldun
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-c", "/etc/nats/nats.conf"]
+    environment:
+      - TZ=UTC
+    volumes:
+      - nats-data:/data
+      - ./hack/localstack/nats.conf:/etc/nats/nats.conf:ro
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z localhost 4222"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - koldun
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - koldun
+
+  minio-setup:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      set -euo pipefail
+      until mc alias set local http://minio:9000 minio minio123 >/dev/null 2>&1; do
+        sleep 2
+      done
+      mc mb --ignore-existing local/koldun-models
+      mc anonymous set download local/koldun-models
+      mc mb --ignore-existing local/koldun-tokens
+    networks:
+      - koldun
+
+networks:
+  koldun:
+    driver: bridge
+
+volumes:
+  k3s-data:
+  nats-data:
+  minio-data:

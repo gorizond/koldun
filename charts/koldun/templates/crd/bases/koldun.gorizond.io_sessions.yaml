@@ -45,6 +45,8 @@ spec:
                   type: string
                 dispatcherImage:
                   type: string
+                dispatcherMetricsListen:
+                  type: string
                 replicaPower:
                   type: integer
                   format: int32

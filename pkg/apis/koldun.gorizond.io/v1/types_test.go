@@ -1328,6 +1328,7 @@ func TestSessionDeepCopyVariants(t *testing.T) {
 			},
 		},
 		Spec: SessionSpec{
+			DispatcherMetricsListen: ":9090",
 			Queue: &SessionQueueSpec{
 				AckTimeout: &duration,
 			},
@@ -1408,14 +1409,15 @@ func TestIngressDeepCopyVariants(t *testing.T) {
 		},
 		Spec: IngressSpec{
 			Backend: IngressBackendSpec{
-				Image:           "ingress:latest",
-				ImagePullPolicy: "Always",
-				RootImage:       "root:latest",
-				WorkerImage:     "worker:latest",
-				DispatcherImage: "dispatcher:latest",
-				ReplicaPower:    4,
-				HashSecret:      "secret",
-				AllowAnonymous:  true,
+				Image:                   "ingress:latest",
+				ImagePullPolicy:         "Always",
+				RootImage:               "root:latest",
+				WorkerImage:             "worker:latest",
+				DispatcherImage:         "dispatcher:latest",
+				DispatcherMetricsListen: ":9090",
+				ReplicaPower:            4,
+				HashSecret:              "secret",
+				AllowAnonymous:          true,
 				NATS: IngressNATSConfig{
 					URL:                "nats://ingress:4222",
 					ConversationBucket: "conv",

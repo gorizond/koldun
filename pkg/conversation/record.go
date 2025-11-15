@@ -9,19 +9,20 @@ import (
 // Record is persisted in JetStream KeyValue entries (nats_ttl_<hash>) to describe
 // the desired Session topology for a conversation.
 type Record struct {
-	Hash            string                `json:"hash"`
-	Session         string                `json:"session,omitempty"`
-	Dllama          string                `json:"dllama,omitempty"`
-	Namespace       string                `json:"namespace"`
-	Model           string                `json:"model"`
-	CreatedAt       int64                 `json:"createdAt"`
-	ReplicaPower    int32                 `json:"replicaPower"`
-	RootImage       string                `json:"rootImage"`
-	WorkerImage     string                `json:"workerImage"`
-	DispatcherImage string                `json:"dispatcherImage,omitempty"`
-	NATS            NATSConfig            `json:"nats"`
-	Queue           *QueueConfig          `json:"queue,omitempty"`
-	Scaling         *SessionScalingConfig `json:"scaling,omitempty"`
+	Hash                    string                `json:"hash"`
+	Session                 string                `json:"session,omitempty"`
+	Dllama                  string                `json:"dllama,omitempty"`
+	Namespace               string                `json:"namespace"`
+	Model                   string                `json:"model"`
+	CreatedAt               int64                 `json:"createdAt"`
+	ReplicaPower            int32                 `json:"replicaPower"`
+	RootImage               string                `json:"rootImage"`
+	WorkerImage             string                `json:"workerImage"`
+	DispatcherImage         string                `json:"dispatcherImage,omitempty"`
+	DispatcherMetricsListen string                `json:"dispatcherMetricsListen,omitempty"`
+	NATS                    NATSConfig            `json:"nats"`
+	Queue                   *QueueConfig          `json:"queue,omitempty"`
+	Scaling                 *SessionScalingConfig `json:"scaling,omitempty"`
 }
 
 // QueueConfig stores optional NATS backlog configuration for a session.
@@ -91,6 +92,7 @@ func (r *Record) Validate() error {
 	if strings.TrimSpace(r.DispatcherImage) == "" {
 		r.DispatcherImage = r.RootImage
 	}
+	r.DispatcherMetricsListen = strings.TrimSpace(r.DispatcherMetricsListen)
 	if strings.TrimSpace(r.NATS.URL) != "" {
 		if err := r.NATS.Validate(); err != nil {
 			return fmt.Errorf("nats: %w", err)

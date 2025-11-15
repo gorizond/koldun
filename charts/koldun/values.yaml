@@ -142,8 +142,17 @@ tolerations: []
 affinity: {}
 
 ingresses: []
+# Pair ingress resources with the dispatcher sample manifest in k8s/dispatcher-deploy.yaml
+# when running dispatcher pods manually; that manifest highlights the required
+# --dispatcher-state-prefix flag, the Session.spec.queue.stateStream override behaviour,
+# and the optional spec.dispatcherMetricsListen / --dispatcher-metrics-listen endpoint for /metrics + /healthz scraping.
+# Common dispatcher knobs can be injected into every generated Ingress via ingressDefaults.
+ingressDefaults:
+  # Dispatcher metrics listener added to spec.backend.dispatcherMetricsListen when not overridden per ingress.
+  dispatcherMetricsListen: ":9090"
 # - name: example
 #   namespace: default
+#   dispatcherMetricsListen: ":9090" # override per-ingress or set to "" to disable while leaving defaults intact.
 #   spec:
 #     backend:
 #       image: ghcr.io/gorizond/koldun:latest

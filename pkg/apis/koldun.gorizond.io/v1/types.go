@@ -873,6 +873,8 @@ type SessionSpec struct {
 	WorkerImage string `json:"workerImage"`
 	// DispatcherImage is the image that runs the per-session dispatcher deployment.
 	DispatcherImage string `json:"dispatcherImage,omitempty"`
+	// DispatcherMetricsListen enables the dispatcher metrics listener (host:port or :port form).
+	DispatcherMetricsListen string `json:"dispatcherMetricsListen,omitempty"`
 	// ReplicaPower controls worker topology for spawned Dllamas (power of two).
 	ReplicaPower int32 `json:"replicaPower,omitempty"`
 	// MinIdle enforces a minimum number of idle Dllama workers kept ready (deprecated in favour of Scaling.MinDllamas).
@@ -1150,6 +1152,8 @@ type IngressBackendSpec struct {
 	RootImage       string `json:"rootImage"`
 	WorkerImage     string `json:"workerImage"`
 	DispatcherImage string `json:"dispatcherImage,omitempty"`
+	// DispatcherMetricsListen configures --dispatcher-metrics-listen for session-managed dispatchers.
+	DispatcherMetricsListen string `json:"dispatcherMetricsListen,omitempty"`
 	// ReplicaPower overrides the replica power configured on models when ensuring Sessions.
 	ReplicaPower    int32                       `json:"replicaPower,omitempty"`
 	HashSecret      string                      `json:"hashSecret,omitempty"`

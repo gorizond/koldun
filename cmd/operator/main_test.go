@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -296,6 +297,7 @@ func TestMainLLMMode(t *testing.T) {
 		"--llm-sidecar-url=http://127.0.0.1:9000",
 	}
 	t.Cleanup(func() { os.Args = origArgs })
+	stubSignalContext(t)
 
 	origLLM := newLLMServerFn
 	stub := &stubRunServer{}
@@ -315,6 +317,50 @@ func TestMainLLMMode(t *testing.T) {
 	require.Equal(t, 1, stub.runCount())
 	require.Equal(t, "test-hash", captured.Hash)
 	require.Equal(t, "http://127.0.0.1:9000", captured.SidecarURL)
+}
+
+func TestMainDispatcherMode(t *testing.T) {
+	origArgs := os.Args
+	os.Args = []string{
+		"koldun",
+		"dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-backlog-subject=sessions.test.requests",
+		"--dispatcher-assignments-bucket=koldun_assignments",
+		"--dispatcher-dllama-prefix=sessions.test.dllama.",
+		"--dispatcher-state-prefix=sessions.test.state.",
+		"--dispatcher-queue-group=dispatcher-test",
+		"--dispatcher-ack-wait=45s",
+		"--dispatcher-metrics-listen=:9099",
+	}
+	t.Cleanup(func() { os.Args = origArgs })
+	stubSignalContext(t)
+
+	origDispatcher := newDispatcherServerFn
+	stub := &stubRunServer{}
+	var captured dispatcher.Config
+	newDispatcherServerFn = func(cfg dispatcher.Config) (dispatcherServer, error) {
+		captured = cfg
+		return stub, nil
+	}
+	t.Cleanup(func() { newDispatcherServerFn = origDispatcher })
+
+	origExit := logrus.StandardLogger().ExitFunc
+	logrus.StandardLogger().ExitFunc = func(int) {}
+	t.Cleanup(func() { logrus.StandardLogger().ExitFunc = origExit })
+
+	main()
+
+	require.Equal(t, 1, stub.runCount())
+	require.Equal(t, "test-hash", captured.Hash)
+	require.Equal(t, "sessions.test.requests", captured.BacklogSubject)
+	require.Equal(t, "koldun_assignments", captured.AssignmentsBucket)
+	require.Equal(t, "sessions.test.dllama.", captured.DllamaSubjectPrefix)
+	require.Equal(t, "sessions.test.state.", captured.StateSubjectPrefix)
+	require.Equal(t, ":9099", captured.MetricsAddr)
+	require.Equal(t, 45*time.Second, captured.AckWait)
+	require.Equal(t, "dispatcher-test", captured.QueueGroup)
 }
 
 func TestRunIngressDelegatesToServer(t *testing.T) {
@@ -448,6 +494,166 @@ func TestRunDispatcherFatalOnRunError(t *testing.T) {
 	})
 }
 
+func TestMainDispatcherFailsOnQueueMisconfiguration(t *testing.T) {
+	logger := logrus.StandardLogger()
+	var buf bytes.Buffer
+	origOut := logger.Out
+	logger.SetOutput(&buf)
+	t.Cleanup(func() {
+		logger.SetOutput(origOut)
+	})
+
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{
+		"koldun",
+		"--mode=dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-assignments-bucket=assignments",
+		"--dispatcher-dllama-prefix=dllama.",
+		"--dispatcher-state-prefix=state.",
+		"--dispatcher-backlog-subject=   ",
+	}
+
+	stubSignalContext(t)
+	expectFatal(t, func() {
+		main()
+	})
+
+	require.Contains(t, buf.String(), dispatcher.ErrQueueMisconfigured.Error())
+}
+
+func TestMainDispatcherFailsOnMissingAssignmentsBucket(t *testing.T) {
+	logger := logrus.StandardLogger()
+	var buf bytes.Buffer
+	origOut := logger.Out
+	logger.SetOutput(&buf)
+	t.Cleanup(func() {
+		logger.SetOutput(origOut)
+	})
+
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{
+		"koldun",
+		"--mode=dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-assignments-bucket=   ",
+		"--dispatcher-dllama-prefix=dllama.",
+		"--dispatcher-state-prefix=state.",
+		"--dispatcher-backlog-subject=dispatcher.backlog",
+	}
+
+	stubSignalContext(t)
+	expectFatal(t, func() {
+		main()
+	})
+
+	require.Contains(t, buf.String(), dispatcher.ErrQueueMisconfigured.Error())
+}
+
+func TestMainDispatcherFailsOnMissingDllamaPrefix(t *testing.T) {
+	logger := logrus.StandardLogger()
+	var buf bytes.Buffer
+	origOut := logger.Out
+	logger.SetOutput(&buf)
+	t.Cleanup(func() {
+		logger.SetOutput(origOut)
+	})
+
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{
+		"koldun",
+		"--mode=dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-assignments-bucket=assignments",
+		"--dispatcher-backlog-subject=dispatcher.backlog",
+		"--dispatcher-dllama-prefix=   ",
+		"--dispatcher-state-prefix=state.",
+	}
+
+	stubSignalContext(t)
+	expectFatal(t, func() {
+		main()
+	})
+
+	require.Contains(t, buf.String(), "dllama subject prefix is required")
+}
+
+func TestMainDispatcherFailsOnMissingStatePrefix(t *testing.T) {
+	logger := logrus.StandardLogger()
+	var buf bytes.Buffer
+	origOut := logger.Out
+	logger.SetOutput(&buf)
+	t.Cleanup(func() {
+		logger.SetOutput(origOut)
+	})
+
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{
+		"koldun",
+		"--mode=dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-assignments-bucket=assignments",
+		"--dispatcher-backlog-subject=dispatcher.backlog",
+		"--dispatcher-dllama-prefix=dllama.",
+		"--dispatcher-state-prefix=   ",
+	}
+
+	stubSignalContext(t)
+	expectFatal(t, func() {
+		main()
+	})
+
+	require.Contains(t, buf.String(), "dispatcher state subject prefix is required")
+}
+
+func TestMainDispatcherFailsOnStatePrefixWithoutDot(t *testing.T) {
+	logger := logrus.StandardLogger()
+	var buf bytes.Buffer
+	origOut := logger.Out
+	logger.SetOutput(&buf)
+	t.Cleanup(func() {
+		logger.SetOutput(origOut)
+	})
+
+	origArgs := os.Args
+	t.Cleanup(func() {
+		os.Args = origArgs
+	})
+	os.Args = []string{
+		"koldun",
+		"--mode=dispatcher",
+		"--dispatcher-hash=test-hash",
+		"--dispatcher-nats-url=nats://example:4222",
+		"--dispatcher-assignments-bucket=assignments",
+		"--dispatcher-backlog-subject=dispatcher.backlog",
+		"--dispatcher-dllama-prefix=dllama.",
+		"--dispatcher-state-prefix=dllama",
+	}
+
+	stubSignalContext(t)
+	expectFatal(t, func() {
+		main()
+	})
+
+	require.Contains(t, buf.String(), "dispatcher state subject prefix must end with '.'")
+}
+
 type stubRunServer struct {
 	mu      sync.Mutex
 	count   int
@@ -474,6 +680,17 @@ func (s *stubRunServer) setError(err error) {
 	s.mu.Lock()
 	s.err = err
 	s.mu.Unlock()
+}
+
+func stubSignalContext(t *testing.T) {
+	t.Helper()
+	orig := setupSignalContextFn
+	setupSignalContextFn = func() context.Context {
+		return context.Background()
+	}
+	t.Cleanup(func() {
+		setupSignalContextFn = orig
+	})
 }
 
 type fatalExit struct{}

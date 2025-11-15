@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/testutil"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -455,7 +455,7 @@ func TestSessionHandlerCheckHealth(t *testing.T) {
 		ctx: context.Background(),
 	}
 
-	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	healthy := testutil.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer healthy.Close()
@@ -463,7 +463,7 @@ func TestSessionHandlerCheckHealth(t *testing.T) {
 	handler.httpClient = healthy.Client()
 	require.True(t, handler.checkHealth(strings.TrimPrefix(healthy.URL, "http://")))
 
-	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	unhealthy := testutil.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer unhealthy.Close()

@@ -241,7 +241,7 @@ func TestServerWaitForSidecarSuccess(t *testing.T) {
 		require.Equal(t, "/v1/models", r.URL.Path)
 		w.WriteHeader(http.StatusOK)
 	}
-	ts := httptest.NewServer(http.HandlerFunc(handler))
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
 	defer ts.Close()
 
 	client := ts.Client()
@@ -266,7 +266,7 @@ func TestServerWaitForSidecarTimeout(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
-	ts := httptest.NewServer(http.HandlerFunc(handler))
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
 	defer ts.Close()
 
 	client := ts.Client()
@@ -424,7 +424,7 @@ func TestStreamToSidecarPublishesChunks(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, ok := w.(http.Flusher)
@@ -484,7 +484,7 @@ func TestStreamToSidecarPublishesErrorOnFailure(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("sidecar failure"))
 	}))
@@ -634,7 +634,7 @@ func TestStreamToSidecarDonePublishFailure(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, ok := w.(http.Flusher)
@@ -679,7 +679,7 @@ func TestExecuteOncePublishesResponse(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"once-success"}`))
@@ -727,7 +727,7 @@ func TestExecuteOncePublishesErrorOnFailure(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	t.Cleanup(sidecar.Close)
@@ -779,7 +779,7 @@ func TestExecuteOncePublishesErrorOnEmptyBody(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("   "))
 	}))
@@ -830,7 +830,7 @@ func TestExecuteOnceRejectsOversizedResponse(t *testing.T) {
 	_, nc := connectJetStream(t, ns)
 
 	oversized := strings.Repeat("a", maxNonStreamResponseSize+1)
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, oversized)
 	}))
@@ -926,7 +926,7 @@ func TestRunStartsAndStops(t *testing.T) {
 		t.Skip("skipping NATS dependent test in short mode")
 	}
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -984,7 +984,7 @@ func TestRunStartsHealthServer(t *testing.T) {
 		t.Skip("skipping NATS dependent test in short mode")
 	}
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1044,7 +1044,7 @@ func TestRunFailsWhenSidecarTimesOut(t *testing.T) {
 		t.Skip("skipping sidecar timeout test in short mode")
 	}
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 	}))
 	defer sidecar.Close()
@@ -1084,7 +1084,7 @@ func TestEnsureQueueSubscriptionUpdatesExistingConsumer(t *testing.T) {
 		t.Skip("skipping NATS dependent test in short mode")
 	}
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1162,7 +1162,7 @@ func TestEnsureQueueSubscriptionRejectsWrongFilterSubject(t *testing.T) {
 	ns := startJetStreamServer(t)
 	js, _ := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1210,7 +1210,7 @@ func TestEnsureQueueSubscriptionHandlesUpdateConsumerError(t *testing.T) {
 
 	ns := startJetStreamServer(t)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1271,7 +1271,7 @@ func TestEnsureQueueSubscriptionUpdatesMaxAckPending(t *testing.T) {
 
 	ns := startJetStreamServer(t)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1332,7 +1332,7 @@ func TestEnsureQueueSubscriptionUpdatesInactiveThreshold(t *testing.T) {
 
 	ns := startJetStreamServer(t)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -1578,7 +1578,7 @@ func TestMonitorSidecarTriggersEviction(t *testing.T) {
 		t.Skip("skipping monitor test in short mode")
 	}
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusInternalServerError)
 	}))
 	defer sidecar.Close()
@@ -1647,7 +1647,7 @@ func TestMonitorSidecarResetsFailuresAfterSuccess(t *testing.T) {
 }
 
 func TestProbeSidecarUpdatesMetrics(t *testing.T) {
-	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	healthy := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer healthy.Close()
@@ -1666,7 +1666,7 @@ func TestProbeSidecarUpdatesMetrics(t *testing.T) {
 	value := promtestutil.ToFloat64(metrics.LLMSidecarHealthStatus.WithLabelValues("dllama-healthy"))
 	require.Equal(t, float64(1), value)
 
-	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	unhealthy := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer unhealthy.Close()
@@ -1694,7 +1694,7 @@ func TestHandleMessagePublishesStateAndResponse(t *testing.T) {
 	ns := startJetStreamServer(t)
 	_, nc := connectJetStream(t, ns)
 
-	sidecar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/chat/completions", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp-1"}`))
@@ -2000,6 +2000,7 @@ func (f *fakeConsumerManager) DeleteConsumer(_ string, consumer string, _ ...nat
 
 func startJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
+	testhelpers.RequireLoopback(t)
 
 	opts := &server.Options{
 		JetStream: true,
@@ -2103,7 +2104,7 @@ func TestWaitForSidecarContextCanceled(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	}
-	ts := httptest.NewServer(http.HandlerFunc(handler))
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
 	defer ts.Close()
 
 	srv := &Server{
@@ -2147,7 +2148,7 @@ func TestExecuteOnceWithSidecarTimeout(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // Longer than timeout
 		w.WriteHeader(http.StatusOK)
 	}
-	ts := httptest.NewServer(http.HandlerFunc(handler))
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
 	defer ts.Close()
 
 	srv := &Server{

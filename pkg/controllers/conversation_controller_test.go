@@ -11,6 +11,7 @@ import (
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/conversation"
+	"github.com/gorizond/koldun/pkg/testutil"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
@@ -92,14 +93,15 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 	const secretName = "nats-credentials"
 	hash := strings.Repeat("abc", 30)
 	record := &conversation.Record{
-		Hash:            hash,
-		Session:         "conversation-session",
-		Namespace:       "tenant-a",
-		Model:           "models-ns/instruct",
-		ReplicaPower:    0,
-		RootImage:       "ghcr.io/root:stable",
-		WorkerImage:     "ghcr.io/worker:stable",
-		DispatcherImage: "ghcr.io/dispatcher:stable",
+		Hash:                    hash,
+		Session:                 "conversation-session",
+		Namespace:               "tenant-a",
+		Model:                   "models-ns/instruct",
+		ReplicaPower:            0,
+		RootImage:               "ghcr.io/root:stable",
+		WorkerImage:             "ghcr.io/worker:stable",
+		DispatcherImage:         "ghcr.io/dispatcher:stable",
+		DispatcherMetricsListen: ":9090",
 		Scaling: &conversation.SessionScalingConfig{
 			MinDllamas:           2,
 			MaxDllamas:           5,
@@ -143,6 +145,7 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 	require.Equal(t, record.RootImage, applied.Spec.RootImage)
 	require.Equal(t, record.WorkerImage, applied.Spec.WorkerImage)
 	require.Equal(t, record.DispatcherImage, applied.Spec.DispatcherImage)
+	require.Equal(t, record.DispatcherMetricsListen, applied.Spec.DispatcherMetricsListen)
 	require.Equal(t, int32(1), applied.Spec.ReplicaPower, "replica power defaults to 1")
 	require.Equal(t, int32(2), applied.Spec.MinIdle)
 	require.Equal(t, int32(5), applied.Spec.MaxWorkers)
@@ -241,6 +244,23 @@ func TestStartConversationReconcilerJetStreamErrorClosesConnection(t *testing.T)
 	err := StartConversationReconciler(context.Background(), manager, cfg)
 	require.EqualError(t, err, "jetstream context: js boom")
 	require.True(t, conn.closed.Load(), "connection should be closed on JetStream error")
+}
+
+func TestStartConversationReconcilerFailsWhenJetStreamDisabled(t *testing.T) {
+	manager := newConversationManagerStub()
+	conn := &failingConn{jetStreamErr: nats.ErrJetStreamNotEnabled}
+
+	cfg := ConversationConfig{
+		NATSURL:  "nats://example:4222",
+		KVBucket: "conversations",
+		dialer: func(string, ...nats.Option) (natsConnection, error) {
+			return conn, nil
+		},
+	}
+
+	err := StartConversationReconciler(context.Background(), manager, cfg)
+	require.ErrorContains(t, err, nats.ErrJetStreamNotEnabled.Error())
+	require.True(t, conn.closed.Load(), "connection should be closed when JetStream is unavailable")
 }
 
 func TestStartConversationReconcilerStartsLoopAndDrainsConnection(t *testing.T) {
@@ -427,6 +447,7 @@ func runJetStreamServer(t *testing.T) *server.Server {
 
 func runJetStreamServerOnPort(t *testing.T, port int) *server.Server {
 	t.Helper()
+	testutil.RequireLoopback(t)
 
 	opts := &server.Options{
 		JetStream: true,
@@ -861,6 +882,134 @@ func TestConversationReconcilerRunDrainsConnectionOnContextCancel(t *testing.T) 
 	}
 
 	require.True(t, conn.Drained())
+}
+
+func TestConversationReconcilerReconnectsWhenBucketMissing(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil)
+
+	reconciler := &conversationReconciler{
+		cfg: ConversationConfig{
+			TTLPrefix:    "nats_ttl_",
+			PollInterval: 25 * time.Millisecond,
+		},
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: nats.ErrBucketNotFound,
+		},
+	}
+
+	var reconnects atomic.Int32
+	reconciler.reconnectFn = func(context.Context) error {
+		reconnects.Add(1)
+		reconciler.kv = &fakeMemoryKV{bucket: "conversations"}
+		return nil
+	}
+
+	require.True(t, reconciler.syncWithReconnect(context.Background()))
+	require.Equal(t, int32(1), reconnects.Load(), "reconciler should reconnect after bucket deletion")
+}
+
+func TestConversationReconcilerReconnectPreservesPollInterval(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil)
+
+	cfg := ConversationConfig{
+		TTLPrefix:    "nats_ttl_",
+		PollInterval: 125 * time.Millisecond,
+	}
+	reconciler := &conversationReconciler{
+		cfg:      cfg,
+		log:      logrus.New().WithField("test", t.Name()),
+		sessions: sessions,
+		apply:    newFakeApply(),
+		kv: &fakeMemoryKV{
+			bucket:  "conversations",
+			keysErr: nats.ErrBucketNotFound,
+		},
+	}
+
+	reconciler.reconnectFn = func(context.Context) error {
+		reconciler.kv = &fakeMemoryKV{bucket: "conversations"}
+		return nil
+	}
+
+	require.True(t, reconciler.syncWithReconnect(context.Background()))
+	require.Equal(t, cfg.PollInterval, reconciler.cfg.PollInterval, "poll interval should remain unchanged after reconnect")
+}
+
+func TestConversationReconcilerRecreatesBucketAfterDeletion(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().
+		List("", gomock.AssignableToTypeOf(labels.Everything())).
+		Return(nil, nil).AnyTimes()
+
+	manager := &Manager{
+		apply: newFakeApply(),
+		Kold: &fakeKoldInterface{
+			session: sessions,
+		},
+	}
+
+	srv := runJetStreamServer(t)
+	cfg := ConversationConfig{
+		NATSURL:      srv.ClientURL(),
+		KVBucket:     "conversations-recreate",
+		TTLPrefix:    "nats_ttl_",
+		PollInterval: 15 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	require.NoError(t, StartConversationReconciler(ctx, manager, cfg))
+
+	nc, err := nats.Connect(srv.ClientURL())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, nc.Drain())
+	})
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool {
+		_, err := js.KeyValue(cfg.KVBucket)
+		return err == nil
+	}, 5*time.Second, 20*time.Millisecond, "conversation reconciler did not create bucket")
+
+	require.NoError(t, js.DeleteKeyValue(cfg.KVBucket))
+
+	require.Eventually(t, func() bool {
+		kv, err := js.KeyValue(cfg.KVBucket)
+		if err != nil {
+			return false
+		}
+		_, statusErr := kv.Status()
+		return statusErr == nil
+	}, 5*time.Second, 50*time.Millisecond, "conversation reconciler did not recreate bucket after deletion")
 }
 
 type failingConn struct {

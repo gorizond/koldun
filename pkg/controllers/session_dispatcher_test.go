@@ -18,6 +18,7 @@ func TestDispatcherArgs(t *testing.T) {
 		queueGroup        string
 		ackWait           time.Duration
 		expectedContains  []string
+		expectedLen       int
 	}{
 		{
 			name: "basic dispatcher args",
@@ -46,6 +47,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-queue-group=session-dispatchers",
 				"--dispatcher-ack-wait=30s",
 			},
+			expectedLen: 9,
 		},
 		{
 			name: "trimmed hash and URL",
@@ -68,6 +70,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-nats-url=nats://localhost:4222",
 				"--dispatcher-ack-wait=1m0s",
 			},
+			expectedLen: 9,
 		},
 		{
 			name: "different ack wait durations",
@@ -88,6 +91,29 @@ func TestDispatcherArgs(t *testing.T) {
 			expectedContains: []string{
 				"--dispatcher-ack-wait=5m0s",
 			},
+			expectedLen: 9,
+		},
+		{
+			name: "metrics listener flag is appended",
+			session: &v1.Session{
+				Spec: v1.SessionSpec{
+					Hash: "metrics-hash",
+					NATS: &v1.SessionNATSConfig{
+						URL: "nats://nats:4222",
+					},
+					DispatcherMetricsListen: ":9100",
+				},
+			},
+			backlogSubject:    "backlog",
+			assignmentsBucket: "assignments",
+			dllamaPrefix:      "dllama.",
+			statePrefix:       "state.",
+			queueGroup:        "group",
+			ackWait:           time.Minute,
+			expectedContains: []string{
+				"--dispatcher-metrics-listen=:9100",
+			},
+			expectedLen: 10,
 		},
 	}
 
@@ -122,9 +148,12 @@ func TestDispatcherArgs(t *testing.T) {
 				t.Errorf("first arg should be 'dispatcher', got: %v", result)
 			}
 
-			// Verify we have the expected number of args (1 command + 8 flags)
-			if len(result) != 9 {
-				t.Errorf("expected 9 args, got %d: %v", len(result), result)
+			wantLen := tt.expectedLen
+			if wantLen == 0 {
+				wantLen = 9
+			}
+			if len(result) != wantLen {
+				t.Errorf("expected %d args, got %d: %v", wantLen, len(result), result)
 			}
 		})
 	}

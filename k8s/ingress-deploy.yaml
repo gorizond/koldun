@@ -1,3 +1,7 @@
+# Pair this backend deployment with k8s/dispatcher-deploy.yaml when you
+# need to run a dedicated dispatcher manually. The dispatcher manifest
+# shows how to provide the required --dispatcher-state-prefix flag and
+# optional --dispatcher-metrics-listen endpoint for /metrics + /healthz.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,6 +51,7 @@ spec:
             - '--backend-ttl-prefix=nats_ttl_'
             - '--backend-conversation-ttl=10m0s'
             - '--backend-response-timeout=2m0s'
+            - '--backend-session-dispatcher-metrics-listen=:9090'
           env:
             - name: POD_NAMESPACE
               valueFrom:

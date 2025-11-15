@@ -12,7 +12,6 @@ import (
 	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/gorizond/koldun/pkg/natsutil"
 	testhelpers "github.com/gorizond/koldun/pkg/testutil"
-	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
@@ -27,6 +26,7 @@ func TestNew(t *testing.T) {
 		cfg       Config
 		wantError bool
 		errSubstr string
+		queueErr  bool
 	}{
 		{
 			name: "valid configuration",
@@ -75,6 +75,7 @@ func TestNew(t *testing.T) {
 			},
 			wantError: true,
 			errSubstr: "backlog subject is required",
+			queueErr:  true,
 		},
 		{
 			name: "missing assignments bucket",
@@ -87,6 +88,7 @@ func TestNew(t *testing.T) {
 			},
 			wantError: true,
 			errSubstr: "assignments bucket is required",
+			queueErr:  true,
 		},
 		{
 			name: "missing dllama subject prefix",
@@ -99,6 +101,19 @@ func TestNew(t *testing.T) {
 			},
 			wantError: true,
 			errSubstr: "dllama subject prefix is required",
+		},
+		{
+			name: "missing state subject prefix",
+			cfg: Config{
+				Hash:                "test-session",
+				NATSURL:             "nats://localhost:4222",
+				BacklogSubject:      "backlog.test",
+				AssignmentsBucket:   "assignments-test",
+				DllamaSubjectPrefix: "dllama",
+				StateSubjectPrefix:  "   ",
+			},
+			wantError: true,
+			errSubstr: "state subject prefix is required",
 		},
 		{
 			name: "default AckWait is set",
@@ -128,6 +143,9 @@ func TestNew(t *testing.T) {
 				if tt.errSubstr != "" {
 					assert.Contains(t, err.Error(), tt.errSubstr)
 				}
+				if tt.queueErr {
+					assert.ErrorIs(t, err, ErrQueueMisconfigured)
+				}
 				assert.Nil(t, srv)
 			} else {
 				assert.NoError(t, err)
@@ -139,6 +157,44 @@ func TestNew(t *testing.T) {
 					}
 				}
 			}
+		})
+	}
+}
+
+func TestSanitizeStateSubjectPrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr string
+	}{
+		{
+			name:    "rejects empty prefix",
+			input:   "   ",
+			wantErr: "state subject prefix is required",
+		},
+		{
+			name:  "appends trailing dot",
+			input: "sessions.hash.state",
+			want:  "sessions.hash.state.",
+		},
+		{
+			name:  "preserves existing dot",
+			input: "sessions.hash.",
+			want:  "sessions.hash.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := sanitizeStateSubjectPrefix(tt.input)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -294,45 +350,6 @@ func TestSanitizeIdentifier(t *testing.T) {
 	}
 }
 
-func startTestNATSServer(t *testing.T) *server.Server {
-	t.Helper()
-
-	opts := &server.Options{
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		Port:      -1,
-	}
-
-	ns, err := server.NewServer(opts)
-	require.NoError(t, err)
-
-	go ns.Start()
-	if !ns.ReadyForConnections(5 * time.Second) {
-		ns.Shutdown()
-		t.Fatal("NATS server not ready")
-	}
-
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		nc, connectErr := nats.Connect(ns.ClientURL())
-		if connectErr == nil {
-			nc.Close()
-			break
-		}
-		if time.Now().After(deadline) {
-			ns.Shutdown()
-			t.Fatalf("NATS server not ready for JetStream: %v", connectErr)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	t.Cleanup(func() {
-		ns.Shutdown()
-	})
-
-	return ns
-}
-
 func newTestDispatcher(t *testing.T, natsURL string) *Server {
 	t.Helper()
 
@@ -342,6 +359,7 @@ func newTestDispatcher(t *testing.T, natsURL string) *Server {
 		BacklogSubject:      fmt.Sprintf("test.backlog.%d", time.Now().UnixNano()),
 		AssignmentsBucket:   fmt.Sprintf("assignments_%d", time.Now().UnixNano()),
 		DllamaSubjectPrefix: fmt.Sprintf("test.dllama.%d", time.Now().UnixNano()),
+		StateSubjectPrefix:  fmt.Sprintf("test.state.%d", time.Now().UnixNano()),
 		Logger:              logrus.NewEntry(logrus.New()),
 	}
 
@@ -350,6 +368,7 @@ func newTestDispatcher(t *testing.T, natsURL string) *Server {
 	require.NotNil(t, srv)
 
 	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, srv.js, srv.cfg.AssignmentsBucket)
 		_ = srv.nc.Drain()
 		srv.nc.Close()
 	})
@@ -362,8 +381,8 @@ func TestFinishAssignmentRequeuesAndCleansUp(t *testing.T) {
 		t.Skip("Skipping integration-style test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	assignment := &assignment{
 		assignmentID: "assign-1",
@@ -420,8 +439,8 @@ func TestRecoverAssignmentsRequeuesAndDeletes(t *testing.T) {
 		t.Skip("Skipping integration-style test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	keys := []string{"req-a", "req-b"}
 	for _, key := range keys {
@@ -473,8 +492,8 @@ func TestRunHandlesContextCancellation(t *testing.T) {
 		t.Skip("Skipping integration-style dispatcher run test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 	dispatcher.cfg.MetricsAddr = "127.0.0.1:0"
 
 	dispatcher.workers = map[string]*workerState{
@@ -565,8 +584,8 @@ func TestHandleBacklogDispatchesToIdleWorker(t *testing.T) {
 		t.Skip("Skipping NATS dependent test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	dispatcher.workers = map[string]*workerState{
 		"worker-1": {
@@ -624,8 +643,8 @@ func TestHandleBacklogDispatchesToIdleWorker(t *testing.T) {
 }
 
 func TestHandleBacklogNilMessage(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Should not panic with nil message
 	dispatcher.handleBacklog(nil)
@@ -638,8 +657,8 @@ func TestHandleBacklogNilMessage(t *testing.T) {
 }
 
 func TestHandleBacklogInvalidJSON(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	msg := &nats.Msg{
 		Subject: dispatcher.cfg.BacklogSubject,
@@ -657,8 +676,8 @@ func TestHandleBacklogInvalidJSON(t *testing.T) {
 }
 
 func TestHandleBacklogEmptyPayload(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	backlog := conversation.BacklogMessage{
 		ID:      "request-456",
@@ -686,8 +705,8 @@ func TestHandleBacklogNoIdleWorkersRequeues(t *testing.T) {
 		t.Skip("Skipping NATS dependent test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Set all workers to busy
 	dispatcher.workers = map[string]*workerState{
@@ -742,8 +761,8 @@ func TestHandleBacklogNoIdleWorkersRequeues(t *testing.T) {
 }
 
 func TestHandleStateNilMessage(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Should not panic with nil message
 	dispatcher.handleState(nil)
@@ -756,8 +775,8 @@ func TestHandleStateNilMessage(t *testing.T) {
 }
 
 func TestHandleStateInvalidJSON(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	msg := &nats.Msg{
 		Subject: "test.state",
@@ -775,8 +794,8 @@ func TestHandleStateInvalidJSON(t *testing.T) {
 }
 
 func TestHandleStateEmptyWorkerName(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	event := conversation.WorkerStateEvent{
 		Dllama: "", // Empty worker name
@@ -801,8 +820,8 @@ func TestHandleStateEmptyWorkerName(t *testing.T) {
 }
 
 func TestHandleStateRegistersNewWorker(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	event := conversation.WorkerStateEvent{
 		Dllama: "worker-1",
@@ -831,8 +850,8 @@ func TestHandleStateRegistersNewWorker(t *testing.T) {
 }
 
 func TestHandleStateUpdatesExistingWorker(t *testing.T) {
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Register initial worker
 	dispatcher.workers = map[string]*workerState{
@@ -875,8 +894,8 @@ func TestHandleStateIdleTriggersFinish(t *testing.T) {
 		t.Skip("Skipping NATS dependent test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Setup inflight assignment
 	assignment := &assignment{
@@ -932,8 +951,8 @@ func TestHandleStateErrorTriggersRequeue(t *testing.T) {
 		t.Skip("Skipping NATS dependent test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Setup inflight assignment
 	assignment := &assignment{
@@ -1063,8 +1082,8 @@ func TestHandleBacklogKVPutFailure(t *testing.T) {
 		t.Skip("Skipping NATS dependent test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	dispatcher := newTestDispatcher(t, ns.ClientURL())
+	natsURL := testNATSURL(t)
+	dispatcher := newTestDispatcher(t, natsURL)
 
 	// Setup idle worker
 	dispatcher.workers = map[string]*workerState{
@@ -1300,30 +1319,12 @@ func TestRequeueAssignmentLogsPublishError(t *testing.T) {
 	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
 }
 
-// Integration test with embedded NATS server
 func TestDispatcherIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
 
-	// Start embedded NATS server
-	opts := &server.Options{
-		JetStream: true,
-		StoreDir:  t.TempDir(),
-		Port:      -1, // Random port
-	}
-	ns, err := server.NewServer(opts)
-	require.NoError(t, err)
-
-	go ns.Start()
-	defer ns.Shutdown()
-
-	// Wait for server to be ready
-	if !ns.ReadyForConnections(5 * time.Second) {
-		t.Fatal("NATS server not ready")
-	}
-
-	natsURL := ns.ClientURL()
+	natsURL := testNATSURL(t)
 
 	// Create dispatcher
 	logger := logrus.New()
@@ -1342,7 +1343,10 @@ func TestDispatcherIntegration(t *testing.T) {
 	srv, err := New(cfg)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
-	defer srv.nc.Close()
+	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, srv.js, cfg.AssignmentsBucket)
+		srv.nc.Close()
+	})
 
 	// Test 1: Verify initialization
 	assert.NotNil(t, srv.nc)

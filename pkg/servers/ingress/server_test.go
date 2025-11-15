@@ -20,6 +20,7 @@ import (
 	"github.com/gorizond/koldun/pkg/api/openai"
 	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/registry"
+	"github.com/gorizond/koldun/pkg/testutil"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
@@ -886,6 +887,7 @@ func TestIngressIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
+	testutil.RequireLoopback(t)
 
 	// Start embedded NATS server
 	opts := &server.Options{
@@ -1921,6 +1923,576 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 	}
 }
 
+func TestHandleChatCompletionsStreamsResponses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 5 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+	})
+
+	token := "streaming-token"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "ingress-test")
+
+	hash, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+	backlogSubject := sessionBacklogSubject(hash)
+
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	backlogConn, err := nats.Connect(srv.cfg.NATSURL, nats.Timeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		backlogConn.Close()
+	})
+
+	sub, err := backlogConn.SubscribeSync(backlogSubject)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sub.Unsubscribe()
+	})
+	require.NoError(t, backlogConn.Flush())
+
+	errCh := make(chan error, 1)
+	go func() {
+		msg, msgErr := sub.NextMsg(5 * time.Second)
+		if msgErr != nil {
+			errCh <- msgErr
+			return
+		}
+
+		var backlog conversation.BacklogMessage
+		if uErr := json.Unmarshal(msg.Data, &backlog); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		var payload struct {
+			ResponseSubject string `json:"responseSubject"`
+		}
+		if uErr := json.Unmarshal(backlog.Payload, &payload); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		pubConn, pubErr := nats.Connect(srv.cfg.NATSURL, nats.Timeout(2*time.Second))
+		if pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		defer pubConn.Close()
+
+		chunk := []byte(`{"choices":[{"delta":{"role":"assistant","content":"stream-chunk"}}]}`)
+		if pubErr := pubConn.Publish(payload.ResponseSubject, chunk); pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		if pubErr := pubConn.Publish(payload.ResponseSubject, []byte("[DONE]")); pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		errCh <- pubConn.Flush()
+	}()
+
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	srv.handleChatCompletions(rec, req)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for streaming response")
+	}
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Greater(t, rec.flushes, 0)
+
+	body := strings.TrimSpace(rec.Body.String())
+	require.NotEmpty(t, body)
+	chunks := strings.Split(body, "\n\n")
+	require.Len(t, chunks, 2)
+
+	first := strings.TrimPrefix(strings.TrimSpace(chunks[0]), "data: ")
+	var chunk streamingChunk
+	require.NoError(t, json.Unmarshal([]byte(first), &chunk))
+	require.Equal(t, "chat.completion.chunk", chunk.Object)
+	require.Len(t, chunk.Choices, 1)
+	require.Equal(t, "stream-chunk", strings.TrimSpace(chunk.Choices[0].Delta.Content))
+
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
+}
+
+func TestHandleChatCompletionsStreamPublishFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 5 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if srv.raw != nil {
+			_ = srv.raw.Drain()
+			srv.raw.Close()
+		}
+	})
+
+	token := "streaming-token"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "ingress-test")
+
+	hash, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	srv.afterResponseSubscribe = func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+		srv.afterResponseSubscribe = nil
+	}
+
+	rec := httptest.NewRecorder()
+	srv.handleChatCompletions(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+	require.Contains(t, errResp.Error.Message, "failed to enqueue request")
+}
+
+func TestHandleChatCompletionsNonStreamPublishFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 5 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if srv.raw != nil {
+			_ = srv.raw.Drain()
+			srv.raw.Close()
+		}
+	})
+
+	token := "non-stream-token"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "ingress-test")
+
+	hash, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	srv.afterResponseSubscribe = func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+		srv.afterResponseSubscribe = nil
+	}
+
+	rec := httptest.NewRecorder()
+	srv.handleChatCompletions(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+	require.Contains(t, errResp.Error.Message, "failed to enqueue request")
+}
+
+func TestHandleChatCompletionsQueueMisconfigured(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 5 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if srv.raw != nil {
+			_ = srv.raw.Drain()
+			srv.raw.Close()
+		}
+	})
+
+	token := "queue-misconfigured"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}]}`
+	newRequest := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", "ingress-test")
+		return req
+	}
+
+	testCases := []struct {
+		name  string
+		queue *conversation.QueueConfig
+	}{
+		{
+			name:  "nil queue",
+			queue: nil,
+		},
+		{
+			name:  "empty backlog",
+			queue: &conversation.QueueConfig{},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			req := newRequest()
+			hash, err := conversationHashFromHeaders(req, nil)
+			require.NoError(t, err)
+
+			require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+			t.Cleanup(func() {
+				srv.decrementSessionLoad(hash)
+			})
+
+			srv.ensureConversationHook = func(ctx context.Context, h string, model *registry.Model, active int32) (*conversation.Record, error) {
+				return &conversation.Record{
+					Hash:      h,
+					Namespace: cfg.Namespace,
+					Model:     model.Name,
+					Queue:     tc.queue,
+				}, nil
+			}
+			t.Cleanup(func() {
+				srv.ensureConversationHook = nil
+			})
+
+			rec := httptest.NewRecorder()
+			srv.handleChatCompletions(rec, req)
+
+			require.Equal(t, http.StatusBadGateway, rec.Code)
+			var errResp openai.ErrorResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+			require.Contains(t, errResp.Error.Message, "conversation queue misconfigured")
+		})
+	}
+}
+
+func TestHandleChatCompletionsStreamContextCancel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  false,
+		ResponseTimeout: 5 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+	})
+
+	token := "streaming-token"
+	tokenHash := sha256Hex(token)
+	tokenEntry := registry.Token{
+		Hash:      tokenHash,
+		Namespace: cfg.Namespace,
+	}
+	tokenPayload, err := json.Marshal(tokenEntry)
+	require.NoError(t, err)
+	_, err = srv.tokensKV.Put(srv.cfg.TokenPrefix+tokenHash, tokenPayload)
+	require.NoError(t, err)
+	srv.invalidateTokenCache()
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelEntry := registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	}
+	modelPayload, err := json.Marshal(modelEntry)
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	requestBody := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}],"stream":true}`
+	baseReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody))
+	baseReq.Header.Set("Content-Type", "application/json")
+	baseReq.Header.Set("Authorization", "Bearer "+token)
+	baseReq.Header.Set("X-Session-Id", "test-session")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := baseReq.WithContext(ctx)
+
+	hash, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+	backlogSubject := sessionBacklogSubject(hash)
+
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	backlogConn, err := nats.Connect(srv.cfg.NATSURL, nats.Timeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		backlogConn.Close()
+	})
+
+	sub, err := backlogConn.SubscribeSync(backlogSubject)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = sub.Unsubscribe()
+	})
+	require.NoError(t, backlogConn.Flush())
+
+	errCh := make(chan error, 1)
+	go func() {
+		msg, msgErr := sub.NextMsg(5 * time.Second)
+		if msgErr != nil {
+			errCh <- msgErr
+			return
+		}
+
+		var backlog conversation.BacklogMessage
+		if uErr := json.Unmarshal(msg.Data, &backlog); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		var payload struct {
+			ResponseSubject string `json:"responseSubject"`
+		}
+		if uErr := json.Unmarshal(backlog.Payload, &payload); uErr != nil {
+			errCh <- uErr
+			return
+		}
+
+		pubConn, pubErr := nats.Connect(srv.cfg.NATSURL, nats.Timeout(2*time.Second))
+		if pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		defer pubConn.Close()
+
+		chunk := []byte(`{"choices":[{"delta":{"role":"assistant","content":"partial"}}]}`)
+		if pubErr := pubConn.Publish(payload.ResponseSubject, chunk); pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+
+		if flushErr := pubConn.Flush(); flushErr != nil {
+			errCh <- flushErr
+			return
+		}
+
+		time.AfterFunc(20*time.Millisecond, cancel)
+		errCh <- nil
+	}()
+
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	srv.handleChatCompletions(rec, req)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for streaming cancellation")
+	}
+
+	body := strings.TrimSpace(rec.Body.String())
+	require.NotEmpty(t, body)
+	chunks := strings.Split(body, "\n\n")
+	require.Len(t, chunks, 3)
+
+	first := strings.TrimPrefix(strings.TrimSpace(chunks[0]), "data: ")
+	var chunk streamingChunk
+	require.NoError(t, json.Unmarshal([]byte(first), &chunk))
+	require.Equal(t, "partial", strings.TrimSpace(chunk.Choices[0].Delta.Content))
+
+	errorChunk := strings.TrimPrefix(strings.TrimSpace(chunks[1]), "data: ")
+	var errResp openai.ErrorResponse
+	require.NoError(t, json.Unmarshal([]byte(errorChunk), &errResp))
+	require.Contains(t, errResp.Error.Message, "context canceled")
+
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[2]))
+}
+
 type keyValueStub struct {
 	nats.KeyValue
 	keysFn   func() ([]string, error)
@@ -1974,6 +2546,7 @@ func (e *kvEntryStub) Revision() uint64 {
 
 func startIngressJetStream(t *testing.T) *server.Server {
 	t.Helper()
+	testutil.RequireLoopback(t)
 
 	opts := &server.Options{
 		JetStream: true,
@@ -2080,17 +2653,18 @@ func TestEnsureConversationCreatesNewRecord(t *testing.T) {
 
 	srv := &Server{
 		cfg: Config{
-			Namespace:                   "test-ns",
-			RootImage:                   "root:v1",
-			WorkerImage:                 "worker:v1",
-			SessionDispatcherImage:      "dispatcher:v1",
-			NATSURL:                     "nats://test:4222",
-			TTLPrefix:                   "conv:",
-			OutPrefix:                   "out.",
-			SessionMinDllamas:           1,
-			SessionMaxDllamas:           5,
-			SessionScaleUpBacklog:       10,
-			SessionScaleDownIdleSeconds: 300,
+			Namespace:                      "test-ns",
+			RootImage:                      "root:v1",
+			WorkerImage:                    "worker:v1",
+			SessionDispatcherImage:         "dispatcher:v1",
+			SessionDispatcherMetricsListen: ":9090",
+			NATSURL:                        "nats://test:4222",
+			TTLPrefix:                      "conv:",
+			OutPrefix:                      "out.",
+			SessionMinDllamas:              1,
+			SessionMaxDllamas:              5,
+			SessionScaleUpBacklog:          10,
+			SessionScaleDownIdleSeconds:    300,
 		},
 		log: logrus.New().WithField("component", "test"),
 		convKV: keyValueStub{
@@ -2119,6 +2693,7 @@ func TestEnsureConversationCreatesNewRecord(t *testing.T) {
 	assert.Equal(t, "abc123", record.Hash)
 	assert.Equal(t, "test-ns", record.Namespace)
 	assert.Equal(t, "model-ns/test-model", record.Model)
+	assert.Equal(t, ":9090", record.DispatcherMetricsListen)
 	assert.Equal(t, int32(2), record.Scaling.ActiveRequests)
 	assert.Equal(t, int32(2), record.Scaling.DesiredDllamas)
 	assert.Equal(t, "conv:abc123", putKey)
@@ -2127,16 +2702,17 @@ func TestEnsureConversationCreatesNewRecord(t *testing.T) {
 
 func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
 	oldRecord := &conversation.Record{
-		Hash:            "hash123",
-		Session:         "session-hash123",
-		Namespace:       "test-ns",
-		Model:           "old-ns/old-model",
-		CreatedAt:       1234567890,
-		ReplicaPower:    1,
-		RootImage:       "root:old",
-		WorkerImage:     "worker:old",
-		DispatcherImage: "dispatcher:old",
-		NATS:            conversation.NATSConfig{URL: "nats://old:4222"},
+		Hash:                    "hash123",
+		Session:                 "session-hash123",
+		Namespace:               "test-ns",
+		Model:                   "old-ns/old-model",
+		CreatedAt:               1234567890,
+		ReplicaPower:            1,
+		RootImage:               "root:old",
+		WorkerImage:             "worker:old",
+		DispatcherImage:         "dispatcher:old",
+		DispatcherMetricsListen: ":8080",
+		NATS:                    conversation.NATSConfig{URL: "nats://old:4222"},
 		Queue: &conversation.QueueConfig{
 			BacklogSubject:        "old.backlog",
 			ResponseSubjectPrefix: "old.response.",
@@ -2162,17 +2738,18 @@ func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
 
 	srv := &Server{
 		cfg: Config{
-			Namespace:                   "test-ns",
-			RootImage:                   "root:new",
-			WorkerImage:                 "worker:new",
-			SessionDispatcherImage:      "dispatcher:new",
-			NATSURL:                     "nats://new:4222",
-			TTLPrefix:                   "conv:",
-			OutPrefix:                   "out.",
-			SessionMinDllamas:           2,
-			SessionMaxDllamas:           10,
-			SessionScaleUpBacklog:       20,
-			SessionScaleDownIdleSeconds: 600,
+			Namespace:                      "test-ns",
+			RootImage:                      "root:new",
+			WorkerImage:                    "worker:new",
+			SessionDispatcherImage:         "dispatcher:new",
+			SessionDispatcherMetricsListen: ":9191",
+			NATSURL:                        "nats://new:4222",
+			TTLPrefix:                      "conv:",
+			OutPrefix:                      "out.",
+			SessionMinDllamas:              2,
+			SessionMaxDllamas:              10,
+			SessionScaleUpBacklog:          20,
+			SessionScaleDownIdleSeconds:    600,
 		},
 		log: logrus.New().WithField("component", "test"),
 		convKV: keyValueStub{
@@ -2205,6 +2782,7 @@ func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
 	assert.Equal(t, "root:new", record.RootImage)
 	assert.Equal(t, "worker:new", record.WorkerImage)
 	assert.Equal(t, "dispatcher:new", record.DispatcherImage)
+	assert.Equal(t, ":9191", record.DispatcherMetricsListen)
 	assert.Equal(t, "nats://new:4222", record.NATS.URL)
 	assert.Equal(t, int32(2), record.Scaling.MinDllamas)
 	assert.Equal(t, int32(10), record.Scaling.MaxDllamas)
@@ -3060,6 +3638,116 @@ func TestLoadTokenCacheSkipsInvalidKeys(t *testing.T) {
 	assert.Len(t, cache, 1)
 	assert.Contains(t, cache, "valid123")
 	assert.True(t, cache["valid123"].disabled)
+}
+
+func TestValidateTokenAcceptsPlaintext(t *testing.T) {
+	t.Parallel()
+
+	plaintext := "test-token"
+	tokenData, err := json.Marshal(registry.Token{Hash: sha256Hex(plaintext)})
+	require.NoError(t, err)
+
+	srv := &Server{
+		cfg: Config{TokenPrefix: "tokens:"},
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return []string{"tokens:test-token"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				require.Equal(t, "tokens:test-token", key)
+				return &kvEntryStub{value: tokenData}, nil
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.expires = time.Now().Add(-time.Minute)
+
+	err = srv.validateToken(context.Background(), plaintext)
+	require.NoError(t, err)
+}
+
+func TestValidateTokenAcceptsHexDigest(t *testing.T) {
+	t.Parallel()
+
+	hashed := sha256Hex("already-hashed")
+	srv := &Server{
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.values = map[string]tokenEntry{hashed: {disabled: false}}
+	srv.tokenCache.expires = time.Now().Add(time.Minute)
+
+	require.NoError(t, srv.validateToken(context.Background(), hashed))
+}
+
+func TestValidateTokenRefreshesCacheAfterMiss(t *testing.T) {
+	t.Parallel()
+
+	plaintext := "delayed-token"
+	tokenData, err := json.Marshal(registry.Token{Hash: sha256Hex(plaintext)})
+	require.NoError(t, err)
+
+	var fetches int
+	srv := &Server{
+		cfg: Config{TokenPrefix: "tokens:"},
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				fetches++
+				return []string{"tokens:delayed"}, nil
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return &kvEntryStub{value: tokenData}, nil
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.values = map[string]tokenEntry{}
+	srv.tokenCache.expires = time.Now().Add(time.Minute)
+
+	err = srv.validateToken(context.Background(), plaintext)
+	require.NoError(t, err)
+	require.Equal(t, 1, fetches, "token bucket should be queried after cache invalidation")
+}
+
+func TestValidateTokenRejectsUnknownToken(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{TokenPrefix: "tokens:"},
+		tokensKV: keyValueStub{
+			keysFn: func() ([]string, error) {
+				return nil, nats.ErrNoKeysFound
+			},
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.expires = time.Now().Add(-time.Minute)
+
+	err := srv.validateToken(context.Background(), "missing-token")
+	require.EqualError(t, err, "token not found")
+}
+
+func TestLookupTokenNormalisesHashes(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.values = map[string]tokenEntry{"abc123": {disabled: false}}
+	srv.tokenCache.expires = time.Now().Add(time.Minute)
+
+	assert.True(t, srv.lookupToken(context.Background(), "ABC123 "))
+}
+
+func TestLookupTokenRejectsDisabledEntries(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log: logrus.New().WithField("component", "test"),
+	}
+	srv.tokenCache.values = map[string]tokenEntry{"abc123": {disabled: true}}
+	srv.tokenCache.expires = time.Now().Add(time.Minute)
+
+	assert.False(t, srv.lookupToken(context.Background(), "abc123"))
 }
 
 func TestModelKeyUsesDefaultNamespace(t *testing.T) {

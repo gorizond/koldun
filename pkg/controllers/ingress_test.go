@@ -30,12 +30,13 @@ func newIngressSpec() *v1.IngressSpec {
 
 	return &v1.IngressSpec{
 		Backend: v1.IngressBackendSpec{
-			Image:          "ghcr.io/gorizond/backend:latest",
-			RootImage:      "ghcr.io/gorizond/root:latest",
-			WorkerImage:    "ghcr.io/gorizond/worker:latest",
-			ReplicaPower:   2,
-			HashSecret:     "topsecret",
-			AllowAnonymous: true,
+			Image:                   "ghcr.io/gorizond/backend:latest",
+			RootImage:               "ghcr.io/gorizond/root:latest",
+			WorkerImage:             "ghcr.io/gorizond/worker:latest",
+			DispatcherMetricsListen: ":9090",
+			ReplicaPower:            2,
+			HashSecret:              "topsecret",
+			AllowAnonymous:          true,
 			NATS: v1.IngressNATSConfig{
 				URL:                "nats://example:4222",
 				ConversationBucket: "conversation-bucket",
@@ -378,6 +379,7 @@ func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {
 		"--backend-worker-image=ghcr.io/gorizond/worker:latest",
 		"--backend-replica-power=2",
 		"--backend-session-dispatcher-image=ghcr.io/gorizond/backend:latest",
+		"--backend-session-dispatcher-metrics-listen=:9090",
 		"--backend-nats-url=nats://example:4222",
 		"--backend-conversation-bucket=conversation-bucket",
 		"--backend-models-bucket=models-bucket",
@@ -471,6 +473,7 @@ func TestDesiredBackendDeployment(t *testing.T) {
 	require.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
 	require.True(t, strings.HasPrefix(container.Args[0], "--mode=backend"))
 	require.True(t, containsArg(container.Args, "--backend-session-dispatcher-image=ghcr.io/gorizond/dispatcher:stable"))
+	require.True(t, containsArg(container.Args, "--backend-session-dispatcher-metrics-listen=:9090"))
 	require.Equal(t, ing.Spec.Backend.ExtraArgs, container.Args[len(container.Args)-len(ing.Spec.Backend.ExtraArgs):])
 	require.Equal(t, ing.Spec.Backend.Resources, container.Resources)
 }

@@ -82,6 +82,8 @@ var (
 	newDispatcherServerFn = func(cfg dispatcher.Config) (dispatcherServer, error) {
 		return dispatcher.New(cfg)
 	}
+
+	setupSignalContextFn = signals.SetupSignalContext
 )
 
 func main() {
@@ -106,29 +108,30 @@ func main() {
 		llmSidecarFailureThreshold int
 
 		// Backend flags
-		backendListen                      string
-		backendNamespace                   string
-		backendNATSURL                     string
-		backendInPrefix                    string
-		backendOutPrefix                   string
-		backendTTLPrefix                   string
-		backendConversationBucket          string
-		backendModelsBucket                string
-		backendTokensBucket                string
-		backendModelPrefix                 string
-		backendTokenPrefix                 string
-		backendConversationTTL             time.Duration
-		backendResponseTimeout             time.Duration
-		backendSessionMinDllamas           int
-		backendSessionMaxDllamas           int
-		backendSessionScaleUpBacklog       int
-		backendSessionScaleDownIdleSeconds int
-		backendSessionDispatcherImage      string
-		backendReplicaPower                int
-		backendHashSecret                  string
-		backendAllowAnonymous              bool
-		backendRootImage                   string
-		backendWorkerImage                 string
+		backendListen                         string
+		backendNamespace                      string
+		backendNATSURL                        string
+		backendInPrefix                       string
+		backendOutPrefix                      string
+		backendTTLPrefix                      string
+		backendConversationBucket             string
+		backendModelsBucket                   string
+		backendTokensBucket                   string
+		backendModelPrefix                    string
+		backendTokenPrefix                    string
+		backendConversationTTL                time.Duration
+		backendResponseTimeout                time.Duration
+		backendSessionMinDllamas              int
+		backendSessionMaxDllamas              int
+		backendSessionScaleUpBacklog          int
+		backendSessionScaleDownIdleSeconds    int
+		backendSessionDispatcherImage         string
+		backendSessionDispatcherMetricsListen string
+		backendReplicaPower                   int
+		backendHashSecret                     string
+		backendAllowAnonymous                 bool
+		backendRootImage                      string
+		backendWorkerImage                    string
 
 		// Dispatcher flags
 		dispatcherHash              string
@@ -139,6 +142,7 @@ func main() {
 		dispatcherStatePrefix       string
 		dispatcherQueueGroup        string
 		dispatcherAckWait           time.Duration
+		dispatcherMetricsListen     string
 
 		// Operator conversation/registry flags
 		operatorNATSURL             string
@@ -180,6 +184,7 @@ func main() {
 	fs.StringVar(&dispatcherStatePrefix, "dispatcher-state-prefix", "", "Subject prefix used for worker state heartbeats (defaults to dllama prefix)")
 	fs.StringVar(&dispatcherQueueGroup, "dispatcher-queue-group", "", "Queue group name for backlog consumption")
 	fs.DurationVar(&dispatcherAckWait, "dispatcher-ack-wait", 2*time.Minute, "Ack wait for backlog messages")
+	fs.StringVar(&dispatcherMetricsListen, "dispatcher-metrics-listen", "", "Listen address for dispatcher metrics and health endpoints (empty disables)")
 
 	fs.StringVar(&backendListen, "backend-listen", ":8082", "Backend HTTP listen address")
 	fs.StringVar(&backendNamespace, "backend-namespace", "default", "Namespace for Dllama resources")
@@ -199,6 +204,7 @@ func main() {
 	fs.IntVar(&backendSessionScaleUpBacklog, "backend-session-scale-up-backlog", 0, "Queued message threshold to trigger additional Dllama instances")
 	fs.IntVar(&backendSessionScaleDownIdleSeconds, "backend-session-scale-down-idle-seconds", 0, "Idle seconds before scaling down Dllama instances")
 	fs.StringVar(&backendSessionDispatcherImage, "backend-session-dispatcher-image", "", "Container image for session dispatcher pods (defaults to backend image)")
+	fs.StringVar(&backendSessionDispatcherMetricsListen, "backend-session-dispatcher-metrics-listen", "", "Listen address for session dispatcher metrics/health endpoints (empty disables)")
 	fs.StringVar(&backendHashSecret, "backend-hash-secret", "", "Optional secret used for hash_koldun HMAC (base64/plain)")
 	fs.BoolVar(&backendAllowAnonymous, "backend-allow-anonymous", false, "Allow ingress backend to accept requests without API tokens")
 	fs.StringVar(&backendRootImage, "backend-root-image", "", "Container image for Dllama root pods")
@@ -233,7 +239,7 @@ func main() {
 	klog.SetOutput(os.Stderr)
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
 
-	ctx := signals.SetupSignalContext()
+	ctx := setupSignalContextFn()
 
 	switch strings.ToLower(mode) {
 	case "operator":
@@ -273,40 +279,50 @@ func main() {
 		})
 	case "backend", "ingress":
 		runIngress(ctx, ingress.Config{
-			ListenAddress:               backendListen,
-			Namespace:                   backendNamespace,
-			RootImage:                   backendRootImage,
-			WorkerImage:                 backendWorkerImage,
-			NATSURL:                     backendNATSURL,
-			ConversationBucket:          backendConversationBucket,
-			ModelsBucket:                backendModelsBucket,
-			TokensBucket:                backendTokensBucket,
-			InPrefix:                    backendInPrefix,
-			OutPrefix:                   backendOutPrefix,
-			TTLPrefix:                   backendTTLPrefix,
-			ModelPrefix:                 backendModelPrefix,
-			TokenPrefix:                 backendTokenPrefix,
-			ConversationTTL:             backendConversationTTL,
-			ResponseTimeout:             backendResponseTimeout,
-			SessionMinDllamas:           int32(backendSessionMinDllamas),
-			SessionMaxDllamas:           int32(backendSessionMaxDllamas),
-			SessionScaleUpBacklog:       int32(backendSessionScaleUpBacklog),
-			SessionScaleDownIdleSeconds: int32(backendSessionScaleDownIdleSeconds),
-			SessionDispatcherImage:      backendSessionDispatcherImage,
-			HashSecret:                  hashSecret,
-			AllowAnonymous:              backendAllowAnonymous,
-			ReplicaPower:                int32(backendReplicaPower),
+			ListenAddress:                  backendListen,
+			Namespace:                      backendNamespace,
+			RootImage:                      backendRootImage,
+			WorkerImage:                    backendWorkerImage,
+			NATSURL:                        backendNATSURL,
+			ConversationBucket:             backendConversationBucket,
+			ModelsBucket:                   backendModelsBucket,
+			TokensBucket:                   backendTokensBucket,
+			InPrefix:                       backendInPrefix,
+			OutPrefix:                      backendOutPrefix,
+			TTLPrefix:                      backendTTLPrefix,
+			ModelPrefix:                    backendModelPrefix,
+			TokenPrefix:                    backendTokenPrefix,
+			ConversationTTL:                backendConversationTTL,
+			ResponseTimeout:                backendResponseTimeout,
+			SessionMinDllamas:              int32(backendSessionMinDllamas),
+			SessionMaxDllamas:              int32(backendSessionMaxDllamas),
+			SessionScaleUpBacklog:          int32(backendSessionScaleUpBacklog),
+			SessionScaleDownIdleSeconds:    int32(backendSessionScaleDownIdleSeconds),
+			SessionDispatcherImage:         backendSessionDispatcherImage,
+			SessionDispatcherMetricsListen: backendSessionDispatcherMetricsListen,
+			HashSecret:                     hashSecret,
+			AllowAnonymous:                 backendAllowAnonymous,
+			ReplicaPower:                   int32(backendReplicaPower),
 		})
 	case "dispatcher":
+		statePrefix := strings.TrimSpace(dispatcherStatePrefix)
+		if statePrefix == "" {
+			logrus.Fatal("dispatcher state subject prefix is required")
+		}
+		if !strings.HasSuffix(statePrefix, ".") {
+			logrus.Fatal("dispatcher state subject prefix must end with '.'")
+		}
+
 		runDispatcher(ctx, dispatcher.Config{
 			Hash:                dispatcherHash,
 			NATSURL:             dispatcherNATSURL,
 			BacklogSubject:      dispatcherBacklogSubject,
 			AssignmentsBucket:   dispatcherAssignmentsBucket,
 			DllamaSubjectPrefix: dispatcherDllamaPrefix,
-			StateSubjectPrefix:  dispatcherStatePrefix,
+			StateSubjectPrefix:  statePrefix,
 			QueueGroup:          dispatcherQueueGroup,
 			AckWait:             dispatcherAckWait,
+			MetricsAddr:         dispatcherMetricsListen,
 		})
 	default:
 		logrus.Fatalf("unknown mode %q", mode)

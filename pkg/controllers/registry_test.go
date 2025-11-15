@@ -8,6 +8,7 @@ import (
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/gorizond/koldun/pkg/registry"
+	"github.com/gorizond/koldun/pkg/testutil"
 	"github.com/gorizond/koldun/pkg/tokens"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
@@ -25,6 +26,7 @@ func TestModelKey(t *testing.T) {
 
 func startRegistryJetStreamServer(t *testing.T) *server.Server {
 	t.Helper()
+	testutil.RequireLoopback(t)
 
 	opts := &server.Options{
 		JetStream: true,

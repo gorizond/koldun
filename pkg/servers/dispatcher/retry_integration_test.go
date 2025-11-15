@@ -4,16 +4,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
-func connectTestNATS(t *testing.T, ns *server.Server) *nats.Conn {
+func connectTestNATS(t *testing.T, natsURL string) *nats.Conn {
 	t.Helper()
 
-	nc, err := nats.Connect(ns.ClientURL(), nats.Timeout(2*time.Second))
+	nc, err := nats.Connect(natsURL, nats.Timeout(2*time.Second))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
@@ -29,8 +28,8 @@ func TestPublishWithRetrySuccess(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 
 	sub, err := nc.SubscribeSync("dispatcher.subject")
 	require.NoError(t, err)
@@ -51,8 +50,8 @@ func TestPublishWithRetryNonRetryableError(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 
 	// Close the connection to trigger ErrConnectionClosed on publish.
 	nc.Close()
@@ -67,13 +66,16 @@ func TestKVPutWithRetry(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "dispatcher_kv"})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, js, "dispatcher_kv")
+	})
 
 	logger := logrus.New().WithField("component", "dispatcher-test")
 
@@ -91,13 +93,16 @@ func TestKVDeleteWithRetry(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "dispatcher_kv_delete"})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, js, "dispatcher_kv_delete")
+	})
 
 	logger := logrus.New().WithField("component", "dispatcher-test")
 
@@ -119,8 +124,8 @@ func TestPublishWithRetryBackoff(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 
 	// Create a subscription to receive messages
 	sub, err := nc.SubscribeSync("test.backoff")
@@ -154,8 +159,8 @@ func TestPublishWithRetryExhaustion(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 
 	// Close connection to force retries to fail
 	nc.Close()
@@ -184,13 +189,16 @@ func TestKVPutWithRetrySuccessAfterRetry(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "dispatcher_kv_retry"})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, js, "dispatcher_kv_retry")
+	})
 
 	cfg := RetryConfig{
 		MaxRetries:     3,
@@ -216,13 +224,16 @@ func TestKVDeleteWithRetryKeyNotFoundIdempotent(t *testing.T) {
 		t.Skip("skipping NATS integration test in short mode")
 	}
 
-	ns := startTestNATSServer(t)
-	nc := connectTestNATS(t, ns)
+	natsURL := testNATSURL(t)
+	nc := connectTestNATS(t, natsURL)
 	js, err := nc.JetStream()
 	require.NoError(t, err)
 
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "dispatcher_kv_idempotent"})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		cleanupDispatcherBucket(t, js, "dispatcher_kv_idempotent")
+	})
 
 	logger := logrus.New().WithField("component", "dispatcher-test")
 

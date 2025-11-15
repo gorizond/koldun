@@ -55,6 +55,8 @@ type conversationReconciler struct {
 
 	conn natsConnection
 	kv   nats.KeyValue
+
+	reconnectFn func(context.Context) error
 }
 
 // StartConversationReconciler initialises the conversation watcher if the NATS
@@ -92,6 +94,7 @@ func StartConversationReconciler(ctx context.Context, m *Manager, cfg Conversati
 		dialer:   dial,
 		dialOpts: []nats.Option{nats.Name("koldun-operator")},
 	}
+	reconciler.reconnectFn = reconciler.reconnect
 
 	if err := reconciler.openConnection(); err != nil {
 		return err
@@ -155,7 +158,7 @@ func (r *conversationReconciler) syncWithReconnect(ctx context.Context) bool {
 			} else {
 				r.log.WithError(err).Warn("nats connection closed; reconnecting")
 			}
-			if err := r.reconnect(ctx); err != nil {
+			if err := r.reconnectWithOverride(ctx); err != nil {
 				if ctx.Err() != nil {
 					return false
 				}
@@ -272,10 +275,11 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 				Kind:     "Model",
 				Name:     modelName,
 			},
-			ReplicaPower:    record.ReplicaPower,
-			RootImage:       record.RootImage,
-			WorkerImage:     record.WorkerImage,
-			DispatcherImage: record.DispatcherImage,
+			ReplicaPower:            record.ReplicaPower,
+			RootImage:               record.RootImage,
+			WorkerImage:             record.WorkerImage,
+			DispatcherImage:         record.DispatcherImage,
+			DispatcherMetricsListen: record.DispatcherMetricsListen,
 			MinIdle: func() int32 {
 				if record.Scaling != nil && record.Scaling.MinDllamas > 0 {
 					return record.Scaling.MinDllamas
@@ -411,6 +415,13 @@ func (r *conversationReconciler) drainConn() {
 	if err := r.conn.Drain(); err != nil {
 		r.conn.Close()
 	}
+}
+
+func (r *conversationReconciler) reconnectWithOverride(ctx context.Context) error {
+	if r.reconnectFn != nil {
+		return r.reconnectFn(ctx)
+	}
+	return r.reconnect(ctx)
 }
 
 func isConnectionClosed(err error) bool {

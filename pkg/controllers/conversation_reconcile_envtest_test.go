@@ -198,3 +198,70 @@ func TestConversationReconcilerCreatesSessionFromKV(t *testing.T) {
 		return tracked.Drained()
 	}, 5*time.Second, 50*time.Millisecond, "nats connection was not drained after cancellation")
 }
+
+func TestStartConversationReconcilerStopsWhenContextCancelled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping envtest integration in short mode")
+	}
+	if reason := envtestSkipReason; reason != "" {
+		t.Skip(reason)
+	}
+	if testEnvConfig == nil {
+		t.Skip("envtest assets unavailable")
+	}
+
+	srv := runJetStreamServer(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	manager, err := NewManager(testEnvConfig)
+	require.NoError(t, err)
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- manager.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		select {
+		case err := <-errChan:
+			if err != nil && ctx.Err() == nil {
+				t.Fatalf("manager.Start failed: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Log("manager shutdown exceeded grace period")
+		}
+	})
+
+	require.Eventually(t, func() bool {
+		return manager.Health().Ready()
+	}, 15*time.Second, 200*time.Millisecond, "manager never reported ready")
+
+	cfg := ConversationConfig{
+		NATSURL:      srv.ClientURL(),
+		KVBucket:     fmt.Sprintf("conversation-envtest-stop-%d", time.Now().UnixNano()),
+		PollInterval: 5 * time.Millisecond,
+	}
+
+	var tracked *trackingConn
+	cfg.dialer = func(url string, opts ...nats.Option) (natsConnection, error) {
+		conn, err := nats.Connect(url, opts...)
+		if err != nil {
+			return nil, err
+		}
+		tracked = newTrackingConn(conn)
+		return tracked, nil
+	}
+
+	require.NoError(t, StartConversationReconciler(ctx, manager, cfg))
+
+	require.Eventually(t, func() bool {
+		return tracked != nil
+	}, 5*time.Second, 50*time.Millisecond, "reconciler never established a NATS connection")
+
+	cancel()
+
+	require.Eventually(t, func() bool {
+		return tracked != nil && tracked.Drained()
+	}, 5*time.Second, 50*time.Millisecond, "nats connection was not drained after cancellation")
+}

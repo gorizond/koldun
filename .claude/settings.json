@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": {
+      "tools": [
+        "TodoWrite",
+        "Bash",
+        "Read",
+        "Write"
+      ]
+    }
+  }
+}
