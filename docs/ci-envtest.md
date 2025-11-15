@@ -30,7 +30,7 @@ enforces so bespoke runners can reproduce the behavior manually if needed.
    or reuse the value printed earlier. Without it `go test ./pkg/controllers`
    will attempt to download binaries again.
 5. **Run `make controllers-smoke`.** The target executes
-   `go test ./pkg/controllers -count=1 -timeout=5m`, re-exporting
+   `go test ./pkg/controllers -count=1 -timeout=10m`, re-exporting
    `KUBEBUILDER_ASSETS` so tests behave identically locally and in CI.
 6. **(Optional) Fail fast.** Set `export KOLD_SKIP_ENVTEST_DOWNLOAD=1` so the
    runner immediately reports missing binaries instead of downloading them.
@@ -59,6 +59,12 @@ jobs:
       - name: Run controllers envtest checklist
         run: ./hack/ci-envtest.sh
 ```
+
+### controllers-envtest job snapshot (2025-11-15)
+
+- Re-running `./hack/ci-envtest.sh` locally (mirrors the `controllers-envtest` workflow) reported `go test ./pkg/controllers` finishing in **64.8 s** wall-clock time with the warmed macOS cache, which lines up with the ≈45 s local `/usr/bin/time -p make controllers-smoke` baseline once you add the extra log noise and setup work CI performs.
+- The same log earlier подсвечивал флейк в `TestConversationReconcilerRetriesBucketEnsureWhenJetStreamUnavailable` (иногда не появлялся `"failed to reconnect to NATS, will retry"`). Сессия 55 перенесла `blockDialer.Store(true)` до удаления bucket'а, поэтому controllers-envtest теперь стабилен.
+- Detailed cached vs cold measurements for macOS and Linux runners now live in the README under the Envtest quick start section so CI operators can compare their timings without combing through workflow logs.
 
 ## Self-hosted runner / other CI template
 
@@ -92,3 +98,46 @@ tar -C bin -czf cache/bin-envtest.tar.gz envtest  # обновите кеш
 You can run the script locally to confirm the runner reproduces the same
 `bin/envtest/k8s/<version>-<os>-<arch>` path and that the smoke test works
 before executing the rest of `go test ./...`.
+
+## Envtest FAQ
+
+- **`envtest assets unavailable` / missing `KUBEBUILDER_ASSETS`.** Run the
+  [quick start steps](../README.md#envtest-quick-start-new-machinerunner) to
+  install the binaries (`make envtest-preflight`, export
+  `KUBEBUILDER_ASSETS`, wrap `make controllers-smoke` with `/usr/bin/time -p`
+  to verify the ≈45 s macOS / ≈44 s Linux cached runtimes captured in the README
+  table (the same runner used to report ~60 s before we trimmed the parity test).
+  If the helper prints a different path on each run, ensure `./bin/envtest` is
+  cached or mounted persistently.
+- **`conversation bucket missing; reconnecting` never disappears even after restarting JetStream.**
+  The controllers execute `TestConversationReconcilerRestoresBucketAfterRepeatedOfflineDeletion`
+  during `make controllers-smoke`, which simulates shutting JetStream down,
+  deleting the KV store on disk twice, and waiting for the reconnection loop
+  to recreate the bucket. When you see this warning locally, re-run the
+  [quick start](../README.md#envtest-quick-start-new-machinerunner) sequence
+  to ensure the embedded server starts cleanly and compare the wall-clock
+  time (≈45 s cached, ≈4 minutes on the very first run because of Go/toolchain
+  downloads) with the baselines printed in README. If the warning persists,
+  wipe `./bin/envtest` and re-run `make envtest-preflight` so the helper can
+  repopulate the control-plane binaries.
+- **`nats connection closed; reconnecting` repeating in tests.** The suite now
+  exercises a full JetStream shutdown/restart (`TestConversationReconcilerRecoversAfterJetStreamRestart`)
+  to prove reconnection is stable, so persistent loops generally mean your
+  local NATS port is blocked by another process. Stop stray `nats-server`
+  instances, rerun the quick start, and confirm the smoke test still finishes
+  within the baseline window.
+- **`conversation bucket missing; reconnecting` or `failed to reconnect to NATS, will retry`.**
+  These warnings occur when the KV bucket disappears mid-run (for example,
+  manual `nats kv rm` or deleting the JetStream store while the suite is
+  paused). Let the controller finish its reconnect loop; it will recreate the
+  bucket automatically. If the logs never switch to `conversation reconciler reconnected to NATS`,
+  rerun `make controllers-smoke` so the helper resets the embedded server and
+  poll interval.
+- **`controllers-smoke` suddenly takes 90+ seconds.** The suite now includes
+  `TestConversationReconcilerMaintainsRecoveryTimeAcrossOutages`, which deletes
+  the bucket while blocking dials (synthetic outage) and wipes the JetStream
+  store twice to simulate a real restart. After the Session 52 optimization each
+  recovery loop completes in ≈1–3 s (still guarded by a 15 s upper bound), so a
+  longer run generally signals envtest downloads or disk throttling. If your run
+  slows down, compare the durations logged by the test with the README baseline
+  to spot missing caches.
