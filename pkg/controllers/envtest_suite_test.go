@@ -221,12 +221,47 @@ func kubebuilderAssetCandidates() []string {
 		}
 	}
 
-	candidates := make([]string, 0, len(seen))
-	for path := range seen {
-		candidates = append(candidates, path)
+	type candidate struct {
+		path  string
+		score int
 	}
-	sort.Strings(candidates)
-	return candidates
+
+	goos := strings.ToLower(runtime.GOOS)
+	goarch := strings.ToLower(runtime.GOARCH)
+
+	candidates := make([]candidate, 0, len(seen))
+
+	for path := range seen {
+		candidates = append(candidates, candidate{
+			path:  path,
+			score: scoreKubebuilderAsset(path, goos, goarch),
+		})
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].score == candidates[j].score {
+			return candidates[i].path < candidates[j].path
+		}
+		return candidates[i].score > candidates[j].score
+	})
+
+	ordered := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ordered = append(ordered, candidate.path)
+	}
+	return ordered
+}
+
+func scoreKubebuilderAsset(path, goos, goarch string) int {
+	lower := strings.ToLower(path)
+	score := 0
+	if strings.Contains(lower, goos) {
+		score += 2
+	}
+	if strings.Contains(lower, goarch) {
+		score++
+	}
+	return score
 }
 
 func collectSubdirectories(root string, maxDepth int) []string {
