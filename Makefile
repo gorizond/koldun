@@ -1,5 +1,7 @@
 .PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke compose-test-up compose-test-down compose-test compose-update-baseline help
 
+SHELL := /bin/bash
+
 ENVTEST_CONTROLLER_RUNTIME_VERSION ?= 0.20.4
 ENVTEST_K8S_VERSION ?= 1.32.x!
 ENVTEST_DIR ?= ./bin/envtest
@@ -104,7 +106,7 @@ compose-test-down:
 	docker compose -f $(COMPOSE_FILE) down -v
 
 compose-test:
-	@bash -c 'set -euo pipefail; \
+	@set -euo pipefail; \
 	LOG_PATH="$${COMPOSE_TEST_LOG_PATH:-artifacts/compose-logs.txt}"; \
 	COVER_PATH="$${COMPOSE_TEST_COVERPROFILE:-compose.coverprofile}"; \
 	mkdir -p "$$(dirname "$$LOG_PATH")"; \
@@ -120,7 +122,7 @@ compose-test:
 	if [ -z "$${KOLDUN_DISPATCHER_NATS_URL:-}" ]; then \
 		export KOLDUN_DISPATCHER_NATS_URL="$$NATS_URL"; \
 	fi; \
-	GOCACHE="$$CACHE_DIR" go test -count=1 -coverprofile="$$COVER_PATH" ./pkg/servers/ingress ./pkg/servers/dispatcher'
+	GOCACHE="$$CACHE_DIR" go test -count=1 -coverprofile="$$COVER_PATH" ./pkg/servers/ingress ./pkg/servers/dispatcher
 
 compose-update-baseline:
 	@./hack/update-compose-coverage-baseline.sh "$(COMPOSE_TEST_COVERPROFILE)" "$(COMPOSE_TEST_BASELINE)"
