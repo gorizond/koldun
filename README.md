@@ -240,12 +240,41 @@ make envtest-preflight
 export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 ```
 
+- #### Envtest quick start (new machine/runner)
+  ```bash
+  make envtest-preflight
+  export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
+  /usr/bin/time -p make controllers-smoke
+  ```
+  Example log from the latest macOS arm64 run (cached envtest + module cache):
+
+  ```text
+  Running controller tests...
+  Using KUBEBUILDER_ASSETS=/Users/negash/.agor/worktrees/gorizond/koldun/optimize/bin/envtest/k8s/1.32.0-darwin-arm64
+  ok  	github.com/gorizond/koldun/pkg/controllers	39.729s
+  ✓ All controller tests passed
+  real 44.76
+  user 8.96
+  sys 4.39
+  ```
+
+  The helper prints the resolved `KUBEBUILDER_ASSETS` path, and wrapping the smoke test with `/usr/bin/time -p` gives a wall-clock baseline you can compare against future runs to spot missing caches or stalled envtest downloads. Prior to the Session 52 optimization, the suite took ~60 s because `TestConversationReconcilerMaintainsRecoveryTimeAcrossOutages` bootstrapped extra KV data and repeated cleanup; that section is now leaner (no pre-bootstrap, one reconnection loop per outage), hence the win. Keep the older ~60 s number in mind if you need to bisect regressions, but use the table below for current reference points on both macOS and Linux runners (cold = brand new checkout, cached = warmed envtest + module cache):
+
+  | Runner | Envtest state | `/usr/bin/time -p make controllers-smoke` (real) | `go test ./pkg/controllers` duration | Notes |
+  | --- | --- | --- | --- | --- |
+  | macOS 15.1 (Apple Silicon) | cached (envtest + module cache restored) | 44.76 s real (user 8.96 s / sys 4.39 s) | 39.73 s | Same workstation used for Sessions 52–53 |
+  | macOS 15.1 (Apple Silicon) | cold (fresh checkout, no caches) | 262.58 s real (user 120.46 s / sys 30.40 s) | 45.96 s | Includes first-run toolchain/module download; preceding `make envtest-preflight` adds 53.58 s |
+| Linux (golang:1.22-bookworm container on the same host) | cached | 44.04 s real (user 6.04 s / sys 2.73 s) | 41.13 s | `GOTOOLCHAIN=go1.25`, `./hack/print-kubebuilder-assets.sh` auto-selects `bin/envtest/k8s/1.32.0-linux-arm64` based on `uname -s` |
+| Linux (golang:1.22-bookworm container) | cold | 225.71 s real (user 117.14 s / sys 31.85 s) | 38.51 s | Includes downloading the Go toolchain + modules; envtest assets populated via `setup-envtest use` and auto-detected via `./hack/print-kubebuilder-assets.sh` |
+
+  For troubleshooting slow or failing smoke tests, consult the **Envtest FAQ** in [`docs/ci-envtest.md`](docs/ci-envtest.md#envtest-faq); it now points back to this table so you can compare your runner against the cached/cold baselines.
+
 - `make envtest-preflight` wraps the `setup-envtest use` invocation, validates that both `kube-apiserver` and `etcd` binaries exist, and reprints the `KUBEBUILDER_ASSETS` export line. Use it after toolchain upgrades or when bootstrapping CI runners.
 - `.envrc` now exports `KUBEBUILDER_ASSETS=$(./hack/print-kubebuilder-assets.sh)`; run `direnv allow` (or copy the line into your shell profile) so controller tests discover the assets automatically.
 - Capture the `KUBEBUILDER_ASSETS` path printed by `setup-envtest use` (typically `./bin/envtest/k8s/1.32.0-<os>-<arch>`) or run `./hack/print-kubebuilder-assets.sh` to auto-detect it for local shells and CI pipelines.
 - Cache the `./bin/envtest` directory in CI runners to avoid downloading the binaries on every job; re-run `setup-envtest use` only when bumping controller-runtime.
 - Once the cache exists, set `KOLD_SKIP_ENVTEST_DOWNLOAD=1` in CI (and optionally locally) so `ensureKubebuilderAssets()` fails fast if the binaries disappear instead of spending ~10 seconds trying to auto-download them.
-- GitHub Actions runs these smoke tests in `.github/workflows/ci-build.yaml` via the `controllers-envtest` job. The job restores the `bin/envtest` cache, installs `setup-envtest`, executes `make envtest-preflight`, and blocks the Docker build job until `go test ./pkg/controllers -count=1 -cover -timeout=5m` passes.
+- GitHub Actions runs these smoke tests in `.github/workflows/ci-build.yaml` via the `controllers-envtest` job. The job restores the `bin/envtest` cache, installs `setup-envtest`, executes `make envtest-preflight`, and blocks the Docker build job until `go test ./pkg/controllers -count=1 -timeout=10m` passes.
 - Для любых CI раннеров (включая self-hosted) следуйте чек-листу в [`docs/ci-envtest.md`](docs/ci-envtest.md): восстановите кеш `bin/envtest`, выполните `make envtest-preflight`, экспортируйте `KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"`, а затем прогоните `make controllers-smoke`.
 - Add the `export KUBEBUILDER_ASSETS=…` line to your shell profile (e.g. `.envrc`, `.zshrc`) so `go test` picks it up without re-running `setup-envtest`.
 - The helper in `pkg/controllers/envtest_suite_test.go` auto-discovers `KUBEBUILDER_ASSETS`; when the binaries are absent the test suite now exits early with an explicit instruction instead of noisy control-plane failures.
@@ -261,7 +290,7 @@ export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 | --- | --- |
 | Format | `go fmt ./... && gofmt -w .` |
 | Unit tests | `go test ./...` (append `-race` for data race checks) |
-| Controllers smoke | `make controllers-smoke` (`go test ./pkg/controllers -count=1 -timeout=5m`) |
+| Controllers smoke | `make controllers-smoke` (`go test ./pkg/controllers -count=1 -timeout=10m`) |
 | Build binary | `go build ./cmd/operator` |
 | Run operator | `go run ./cmd/operator --mode=operator` |
 | Build/push image | `skaffold build` |

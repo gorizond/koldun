@@ -474,3 +474,32 @@ func TestSessionHandlerCheckHealth(t *testing.T) {
 	// missing endpoint should fail fast
 	require.False(t, handler.checkHealth(""))
 }
+
+func TestDispatcherMetricsPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		addr     string
+		expected int32
+	}{
+		{"empty address", "", 0},
+		{"whitespace only", "   ", 0},
+		{"valid host:port", "localhost:9090", 9090},
+		{"valid IP:port", "127.0.0.1:8080", 8080},
+		{"IPv6 with port", "[::1]:3000", 3000},
+		{"port only with colon", ":9100", 9100},
+		{"bare port number", "9200", 9200},
+		{"invalid port string", "localhost:abc", 0},
+		{"port too high", "localhost:70000", 0},
+		{"port zero", "localhost:0", 0},
+		{"negative port", "localhost:-1", 0},
+		{"port with spaces", " :9300 ", 9300},
+		{"malformed address without brackets", "::1:4000", 4000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := dispatcherMetricsPort(tt.addr)
+			require.Equal(t, tt.expected, result, "dispatcherMetricsPort(%q)", tt.addr)
+		})
+	}
+}
