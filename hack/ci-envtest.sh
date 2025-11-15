@@ -27,5 +27,12 @@ export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 log "Using KUBEBUILDER_ASSETS=$KUBEBUILDER_ASSETS"
 
 export KOLD_SKIP_ENVTEST_DOWNLOAD="${KOLD_SKIP_ENVTEST_DOWNLOAD:-1}"
-log "Running controllers smoke (make controllers-smoke)"
-make controllers-smoke
+
+# Check if coverage gate is enabled (default: enabled in CI)
+if [[ "${SKIP_COVERAGE_CHECK:-0}" != "1" ]]; then
+  log "Running controllers coverage check (make controllers-coverage-check)"
+  make controllers-coverage-check
+else
+  log "Running controllers smoke (make controllers-smoke)"
+  make controllers-smoke
+fi
