@@ -15,10 +15,24 @@ type: application
 # This is the chart version. This version number should be incremented each time you make changes
 # to the chart and its templates, including the app version.
 # Versions are expected to follow Semantic Versioning (https://semver.org/)
-version: 0.0.6
+version: 0.0.7
 
 # This is the version number of the application being deployed. This version number should be
 # incremented each time you make changes to the application. Versions are not expected to
 # follow Semantic Versioning. They should reflect the version the application is using.
 # It is recommended to use it with quotes.
 appVersion: "1.16.0"
+
+dependencies:
+  - name: nats
+    version: "1.2.8"
+    repository: "https://nats-io.github.io/k8s/helm/charts/"
+    condition: nats.enabled
+  - name: minio
+    version: "5.4.0"
+    repository: "https://charts.min.io/"
+    condition: minio.enabled
+  - name: csi-s3
+    version: "0.41.0"
+    repository: "https://yandex-cloud.github.io/k8s-csi-s3/charts"
+    condition: csi-s3.enabled
