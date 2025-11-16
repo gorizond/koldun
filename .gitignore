@@ -22,3 +22,4 @@ bin/
 /context
 /CLAUDE.md
 hack/localstack/kubeconfig/kubeconfig
+charts/koldun/charts/*.tgz
