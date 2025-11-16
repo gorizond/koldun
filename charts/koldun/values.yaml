@@ -141,6 +141,83 @@ tolerations: []
 
 affinity: {}
 
+# -------------------------------------------------------------------
+# External infrastructure configuration (when not using subcharts)
+# -------------------------------------------------------------------
+externalNats:
+  # Use external NATS instead of subchart
+  enabled: false
+  url: "nats://external-nats:4222"
+
+externalMinio:
+  # Use external MinIO/S3 instead of subchart
+  enabled: false
+  endpoint: "external-minio:9000"
+  accessKey: ""
+  secretKey: ""
+  bucket: "koldun-models"
+
+# -------------------------------------------------------------------
+# NATS subchart configuration
+# https://nats-io.github.io/k8s/helm/charts/
+# -------------------------------------------------------------------
+nats:
+  enabled: false
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 10Gi
+    cluster:
+      enabled: false
+  # Single node setup
+  container:
+    merge:
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+
+# -------------------------------------------------------------------
+# MinIO subchart configuration (single node)
+# https://charts.min.io/
+# -------------------------------------------------------------------
+minio:
+  enabled: false
+  mode: standalone
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 50Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+  # Default credentials (override in production!)
+  rootUser: "minioadmin"
+  rootPassword: "minioadmin"
+  buckets:
+    - name: koldun-models
+      policy: none
+      purge: false
+
+# -------------------------------------------------------------------
+# CSI S3 driver subchart configuration
+# https://github.com/yandex-cloud/k8s-csi-s3
+# -------------------------------------------------------------------
+csi-s3:
+  enabled: false
+  # S3 endpoint configuration (auto-configured when minio.enabled=true)
+  storageClass:
+    name: csi-s3
+    singleBucket: koldun-models
+    mounter: geesefs
+    # Will be overridden by template if minio.enabled
+    endpoint: ""
+    accessKey: ""
+    secretKey: ""
+
 ingresses: []
 # Pair ingress resources with the dispatcher sample manifest in k8s/dispatcher-deploy.yaml
 # when running dispatcher pods manually; that manifest highlights the required

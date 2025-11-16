@@ -1,5 +1,6 @@
 {
-  "total": 85.2,
-  "updated_at": "2025-11-10T16:42:00Z",
-  "source": "Session 18 — ingress coverage push to 85%+ (go tool cover -func compose.coverprofile)"
+  "total": 87.5,
+  "updated_at": "2025-11-16T13:53:36Z",
+  "commit": "07d5d4ae166f01db91e528897a93bf7e30cbd9b2",
+  "source": "07d5d4a \u2014 ci: add GitHub Actions workflow for helm integration tests"
 }

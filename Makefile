@@ -1,4 +1,4 @@
-.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke controllers-coverage-check compose-test-up compose-test-down compose-test compose-update-baseline help
+.PHONY: clean test coverage coverage-clean envtest-preflight controllers-smoke controllers-coverage-check compose-test-up compose-test-down compose-test compose-update-baseline helm-deps helm-lint helm-template helm-test-integration help
 
 SHELL := /bin/bash
 
@@ -21,6 +21,10 @@ help:
 	@printf "  %-25s %s\n" "controllers-coverage-check" "Verify controllers coverage >= 99% (CI gate)"
 	@printf "  %-25s %s\n" "compose-test" "Spin up docker compose stack and run dispatcher/ingress tests"
 	@printf "  %-25s %s\n" "compose-update-baseline" "Update analytics/compose_coverage_baseline.json from compose.coverprofile"
+	@printf "  %-25s %s\n" "helm-deps" "Update Helm chart dependencies"
+	@printf "  %-25s %s\n" "helm-lint" "Lint Helm chart"
+	@printf "  %-25s %s\n" "helm-template" "Render Helm chart templates"
+	@printf "  %-25s %s\n" "helm-test-integration" "Run k3d integration test for Helm chart"
 
 # Clean temporary files generated during testing and coverage
 clean:
@@ -132,3 +136,24 @@ compose-test:
 
 compose-update-baseline:
 	@./hack/update-compose-coverage-baseline.sh "$(COMPOSE_TEST_COVERPROFILE)" "$(COMPOSE_TEST_BASELINE)"
+
+# Helm chart targets
+helm-deps:
+	@echo "Updating Helm chart dependencies..."
+	@helm dependency update charts/koldun
+	@echo "✓ Dependencies updated"
+
+helm-lint:
+	@echo "Linting Helm chart..."
+	@helm lint charts/koldun
+	@echo "✓ Chart linting passed"
+
+helm-template:
+	@echo "Rendering Helm chart templates..."
+	@helm template koldun charts/koldun --debug 2>&1 | head -100
+	@echo "..."
+	@echo "✓ Template rendering complete (showing first 100 lines)"
+
+helm-test-integration:
+	@echo "Running Helm integration tests with k3d..."
+	@./hack/test-helm-integration.sh
