@@ -67,4 +67,4 @@ path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 
-printf "Baseline updated to %.2f%% (%s)\n" "$total_value" "$commit_hash"
+env LC_NUMERIC=C printf "Baseline updated to %.2f%% (%s)\n" "$total_value" "$commit_hash"
