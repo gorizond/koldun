@@ -7,10 +7,10 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
 from collections import deque
+import gc
 
 repo_url = os.environ.get('SOURCE_URL')
 token = os.environ.get('HF_TOKEN')
@@ -42,7 +42,13 @@ if not files:
     print('[koldun] no files returned by HF API, exiting')
 
 session = boto3.session.Session()
-client = session.client('s3', endpoint_url=endpoint, config=Config(s3={'addressing_style': 'path'}))
+boto3_config = Config(
+    s3={'addressing_style': 'path'},
+    retries={'max_attempts': 3, 'mode': 'standard'},
+    connect_timeout=30,
+    read_timeout=60,
+)
+client = session.client('s3', endpoint_url=endpoint, config=boto3_config)
 def _safe_int(v, default):
     try:
         return int(v)
@@ -54,8 +60,9 @@ mem_bytes = _safe_int(mem_limit_bytes, 128*1024*1024)
 chunk_cap = _safe_int(os.environ.get('CHUNK_MAX_MIB'), 64) * 1024 * 1024
 conc = max(1, _safe_int(os.environ.get('CONCURRENCY'), 1))
 per_worker_mem = max(1, mem_bytes // conc)
-chunk = max(8*1024*1024, min(chunk_cap, per_worker_mem // 8))
+chunk = max(5*1024*1024, min(chunk_cap, per_worker_mem // 8))
 print(f"[koldun] memory_limit={mem_limit_str} ({mem_bytes} bytes), chunk_cap={chunk_cap}, chosen multipart_chunksize={chunk}, workers={conc}")
+print(f"[koldun] boto3 config: retries=3, connect_timeout=30s, read_timeout=60s")
 transfer_config = TransferConfig(
     multipart_threshold=chunk,
     multipart_chunksize=chunk,
@@ -180,17 +187,28 @@ def _get_s3_size(bucket, key):
         return None
 
 def _process_one(idx, total, path):
+    """Process a single file download and upload. Returns error or None on success."""
+    req_session = None
     try:
         url = hf_hub_url(repo_id=repo_id, filename=path)
         key = f"{prefix}/{path}" if prefix else path
+        print(f"[koldun] [{idx}/{total}] START processing {path}")
+
         # Skip upload if the same size already exists in S3
         remote_size = _get_remote_size(url)
+        print(f"[koldun] [{idx}/{total}] HEAD completed for {path}, size={_fmt_bytes(remote_size) if remote_size else 'unknown'}")
         existing_size = _get_s3_size(bucket, key)
         if remote_size and existing_size and remote_size == existing_size:
             print(f"[koldun] [{idx}/{total}] skip {path}: already exists with same size {_fmt_bytes(existing_size)}")
             return None
+
+        # Create dedicated session for this file to ensure proper cleanup
+        req_session = requests.Session()
+        req_session.headers.update(headers)
+
         print(f"[koldun] [{idx}/{total}] GET {url}")
-        with requests.get(url, headers=headers, stream=True) as r:
+        r = req_session.get(url, stream=True, timeout=(30, 120))
+        try:
             r.raise_for_status()
             size = r.headers.get('Content-Length')
             ctype = r.headers.get('Content-Type')
@@ -198,28 +216,51 @@ def _process_one(idx, total, path):
             r.raw.decode_content = True
             content_type = ctype or mimetypes.guess_type(path)[0]
             extra = {'ContentType': content_type} if content_type else None
-            print(f"[koldun] [{idx}/{total}] uploading to s3://{bucket}/{key} extra={bool(extra)}")
+            print(f"[koldun] [{idx}/{total}] BEGIN upload to s3://{bucket}/{key} extra={bool(extra)}")
             src = ProgressReader(r.raw, idx, total, path, total_bytes=size, interval_sec=5)
+            upload_start = time.time()
             if extra:
                 client.upload_fileobj(src, bucket, key, ExtraArgs=extra, Config=transfer_config)
             else:
                 client.upload_fileobj(src, bucket, key, Config=transfer_config)
-            print(f"[koldun] [{idx}/{total}] uploaded {path} -> s3://{bucket}/{key}")
+            upload_duration = time.time() - upload_start
+            print(f"[koldun] [{idx}/{total}] COMPLETED upload {path} -> s3://{bucket}/{key} in {upload_duration:.1f}s")
+        finally:
+            # Explicit cleanup: close response and drain any remaining data
+            try:
+                r.close()
+            except Exception:
+                pass
         return None
     except Exception as e:
+        import traceback
         print(f"[koldun] [{idx}/{total}] ERROR {path}: {e}")
+        print(f"[koldun] [{idx}/{total}] TRACEBACK: {traceback.format_exc()}")
         return e
+    finally:
+        # Close the session to release all connections
+        if req_session:
+            try:
+                req_session.close()
+            except Exception:
+                pass
 
+# Process files sequentially to avoid connection pool exhaustion
 errors = []
 total = len(files)
-with ThreadPoolExecutor(max_workers=conc) as pool:
-    futures = [pool.submit(_process_one, i, total, p) for i, p in enumerate(files, start=1)]
-    for fut in as_completed(futures):
-        err = fut.result()
-        if err is not None:
-            errors.append(err)
+print(f"[koldun] Processing {total} files SEQUENTIALLY (no ThreadPoolExecutor)")
+for idx, path in enumerate(files, start=1):
+    err = _process_one(idx, total, path)
+    if err is not None:
+        errors.append((path, err))
+    # Force garbage collection between files to ensure connections are released
+    gc.collect()
+    # Small delay to let OS release sockets
+    time.sleep(0.5)
+
 if errors:
-    raise Exception(f"[koldun] {len(errors)} parallel transfer(s) failed: {errors[:3]}")
-print('[koldun] download script finished')
+    error_summary = [f"{p}: {e}" for p, e in errors[:3]]
+    raise Exception(f"[koldun] {len(errors)} transfer(s) failed: {error_summary}")
+print(f'[koldun] download script finished successfully ({total} files processed)')
 
 
