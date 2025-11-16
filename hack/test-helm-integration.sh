@@ -12,6 +12,8 @@ TIMEOUT="${TIMEOUT:-600s}"
 DEBUG="${DEBUG:-false}"
 SKIP_OPERATOR="${SKIP_OPERATOR:-true}"  # Skip operator pod by default (image may not exist)
 TEST_CSI_S3="${TEST_CSI_S3:-false}"  # CSI S3 requires privileged mode, skip by default
+BUILD_IMAGE="${BUILD_IMAGE:-false}"  # Build and test operator image locally
+IMAGE_TAG="${IMAGE_TAG:-test}"  # Tag for locally built image
 
 log() { echo "[helm-test] $*"; }
 err() { echo "[helm-test] ERROR: $*" >&2; }
@@ -40,6 +42,19 @@ for cmd in k3d helm kubectl docker; do
     fi
 done
 
+# Build operator image if requested
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+    log "Building operator image locally..."
+    OPERATOR_IMAGE="ghcr.io/gorizond/koldun:${IMAGE_TAG}"
+    if ! docker build -t "$OPERATOR_IMAGE" .; then
+        err "Failed to build operator image"
+        exit 1
+    fi
+    log "Operator image built: $OPERATOR_IMAGE"
+    # Automatically enable operator testing when building image
+    SKIP_OPERATOR=false
+fi
+
 # Clean up any leftover cluster from previous run
 log "Cleaning up any existing cluster..."
 k3d cluster delete "$CLUSTER_NAME" 2>/dev/null || true
@@ -53,6 +68,16 @@ k3d cluster create "$CLUSTER_NAME" \
 
 log "Waiting for cluster to be ready..."
 kubectl wait --for=condition=Ready nodes --all --timeout=60s
+
+# Import locally built image into k3d cluster
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+    log "Importing operator image into k3d cluster..."
+    if ! k3d image import "$OPERATOR_IMAGE" -c "$CLUSTER_NAME"; then
+        err "Failed to import operator image into k3d cluster"
+        exit 1
+    fi
+    log "Operator image imported successfully"
+fi
 
 log "Creating namespace: $NAMESPACE"
 kubectl create namespace "$NAMESPACE"
@@ -77,8 +102,8 @@ HELM_ARGS=(
     # Disable MinIO persistence for tests (uses emptyDir)
     --set minio.persistence.enabled=false
     --set minio.resources.requests.memory=256Mi
-    # Disable post-install hooks to avoid timeout issues
-    --set minio.postJob.enabled=false
+    # Disable bucket creation to avoid post-install hook timeout
+    --set minio.buckets=null
     --timeout "$TIMEOUT"
 )
 
@@ -89,6 +114,15 @@ if [[ "$TEST_CSI_S3" == "true" ]]; then
 else
     log "Skipping CSI S3 driver (TEST_CSI_S3=false)"
     HELM_ARGS+=(--set csi-s3.enabled=false)
+fi
+
+# If building image, use custom tag and enable operator
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+    log "Using locally built image (tag: $IMAGE_TAG)"
+    HELM_ARGS+=(
+        --set image.tag="$IMAGE_TAG"
+        --set image.pullPolicy=Never
+    )
 fi
 
 # If skipping operator, set replicas to 0
@@ -222,8 +256,13 @@ if [[ "$TEST_CSI_S3" == "true" ]]; then
 else
     log "  - CSI S3: Skipped (set TEST_CSI_S3=true to enable)"
 fi
-log "  - Koldun: CRDs installed, operator skipped (SKIP_OPERATOR=$SKIP_OPERATOR)"
+if [[ "$BUILD_IMAGE" == "true" ]]; then
+    log "  - Koldun: CRDs installed, operator deployed (locally built image: $IMAGE_TAG)"
+elif [[ "$SKIP_OPERATOR" == "true" ]]; then
+    log "  - Koldun: CRDs installed, operator skipped (set BUILD_IMAGE=true to test operator)"
+else
+    log "  - Koldun: CRDs installed, operator deployed"
+fi
 log "  - Helm upgrade: Idempotent"
-log "  - Partial install: Works correctly"
 
 exit 0
