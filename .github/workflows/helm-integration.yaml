@@ -1,0 +1,73 @@
+name: Helm Integration Tests
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "charts/**"
+      - "hack/test-helm-integration.sh"
+      - ".github/workflows/helm-integration.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/**"
+      - "hack/test-helm-integration.sh"
+  workflow_dispatch:
+    inputs:
+      build_image:
+        description: "Build and test operator image"
+        type: boolean
+        default: false
+      test_csi_s3:
+        description: "Test CSI S3 driver"
+        type: boolean
+        default: false
+
+jobs:
+  helm-integration:
+    name: Helm Chart Integration Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Helm lint
+        run: |
+          helm dependency update charts/koldun
+          helm lint charts/koldun
+
+      - name: Run integration test
+        env:
+          DEBUG: "true"
+          BUILD_IMAGE: ${{ github.event.inputs.build_image || 'false' }}
+          TEST_CSI_S3: ${{ github.event.inputs.test_csi_s3 || 'false' }}
+          TIMEOUT: "600s"
+        run: |
+          chmod +x hack/test-helm-integration.sh
+          ./hack/test-helm-integration.sh
+
+      - name: Collect debug info on failure
+        if: failure()
+        run: |
+          echo "=== Docker containers ==="
+          docker ps -a
+          echo "=== k3d clusters ==="
+          k3d cluster list || true
+          echo "=== Docker logs (k3d) ==="
+          docker logs k3d-koldun-test-server-0 2>&1 | tail -100 || true
