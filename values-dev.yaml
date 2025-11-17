@@ -42,9 +42,20 @@ operator:
     ttlPrefix: "nats_ttl_"
     pollInterval: 10s
   registry:
-    modelsBucket: "koldun-models"
-    tokensBucket: "koldun-models"
+    modelsBucket: "koldun_models"
+    tokensBucket: "koldun_tokens"
     modelPrefix: "model/"
     tokenPrefix: "token/"
   health:
     port: 8080
+
+# Enable CSI S3 driver for model conversion
+csi-s3:
+  enabled: true
+  storageClass:
+    name: csi-s3
+    singleBucket: koldun-models
+    mounter: geesefs
+    endpoint: "http://koldun-minio:9000"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"
