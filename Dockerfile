@@ -7,7 +7,9 @@ ARG DL_VERSION
 RUN apk add --no-cache git make build-base
 WORKDIR /src
 RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
-RUN make dllama && make dllama-api && \
+# TERMUX_VERSION disables -march=native to avoid AVX/AVX2/AVX512 instructions
+# that may not be supported in virtualized environments (like Rancher Desktop Lima VM)
+RUN TERMUX_VERSION=1 make dllama && TERMUX_VERSION=1 make dllama-api && \
     DLLAMA_BIN=$(find . -maxdepth 4 -type f -name dllama -perm /111 | head -n1) && \
     DLLAMA_API_BIN=$(find . -maxdepth 4 -type f -name dllama-api -perm /111 | head -n1) && \
     install -Dm755 "$DLLAMA_BIN" /out/dllama && \
