@@ -98,6 +98,10 @@ func (h *modelHandler) ensureScript(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureBucketsForModel(obj *v1.Model) error {
+	// Skip bucket ensure for pre-converted models
+	if obj.Spec.PreConverted {
+		return nil
+	}
 	if h.ensureBucketsFn != nil {
 		return h.ensureBucketsFn(obj)
 	}
@@ -105,6 +109,10 @@ func (h *modelHandler) ensureBucketsForModel(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureDownload(obj *v1.Model) error {
+	// Skip download for pre-converted models
+	if obj.Spec.PreConverted {
+		return nil
+	}
 	if h.ensureDownloadJobFn != nil {
 		return h.ensureDownloadJobFn(obj)
 	}
@@ -112,6 +120,10 @@ func (h *modelHandler) ensureDownload(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureConversion(obj *v1.Model) error {
+	// Skip conversion for pre-converted models
+	if obj.Spec.PreConverted {
+		return nil
+	}
 	if h.ensureConversionFn != nil {
 		return h.ensureConversionFn(obj)
 	}
@@ -119,6 +131,10 @@ func (h *modelHandler) ensureConversion(obj *v1.Model) error {
 }
 
 func (h *modelHandler) ensureSizing(obj *v1.Model) error {
+	// Skip sizing for pre-converted models
+	if obj.Spec.PreConverted {
+		return nil
+	}
 	if h.ensureSizingFn != nil {
 		return h.ensureSizingFn(obj)
 	}

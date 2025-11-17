@@ -231,6 +231,15 @@ type ModelSpec struct {
 	PV *ModelPVSpec `json:"pv,omitempty"`
 	// ReplicaPower defines the desired worker fan-out (power of two) for Dllama instances referencing this model.
 	ReplicaPower int32 `json:"replicaPower,omitempty"`
+	// PreConverted indicates the model files are already in dllama format in the object storage.
+	// When true, download and conversion jobs are skipped and the model is immediately marked Ready.
+	PreConverted bool `json:"preConverted,omitempty"`
+	// PreConvertedSizeBytes is the total size in bytes of pre-converted model files.
+	// Required when PreConverted is true for registry sync to work.
+	PreConvertedSizeBytes int64 `json:"preConvertedSizeBytes,omitempty"`
+	// PreConvertedSizeHuman is a human-readable size (e.g., "805 MB") for pre-converted models.
+	// If not provided, it will be calculated from PreConvertedSizeBytes.
+	PreConvertedSizeHuman string `json:"preConvertedSizeHuman,omitempty"`
 }
 
 // ModelStatus reports whether the model artifact is ready for consumption.
