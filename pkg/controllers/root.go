@@ -429,7 +429,9 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 }
 
 func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string, resources corev1.ResourceRequirements) corev1.Container {
-	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", weightsFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
+	// distributed-llama requires q80 sync type for inter-node communication regardless of weights type
+	bufferFloatType := "q80"
+	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", bufferFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
 	if len(workers) > 0 {
 		args = append(args, "--workers")
 		args = append(args, workers...)
