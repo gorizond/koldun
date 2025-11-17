@@ -142,6 +142,20 @@ tolerations: []
 affinity: {}
 
 # -------------------------------------------------------------------
+# Metrics and monitoring configuration
+# -------------------------------------------------------------------
+metrics:
+  enabled: false
+  serviceMonitor:
+    # Labels for ServiceMonitor (add release label for Prometheus Operator)
+    labels: {}
+      # release: prometheus
+    # Scrape interval
+    interval: 30s
+    # Scrape timeout
+    scrapeTimeout: 10s
+
+# -------------------------------------------------------------------
 # External infrastructure configuration (when not using subcharts)
 # -------------------------------------------------------------------
 externalNats:

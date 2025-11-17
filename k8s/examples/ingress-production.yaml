@@ -1,0 +1,57 @@
+# Production Ingress - Multi-worker with scaling
+# For production deployments with auto-scaling
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: production-ingress
+  namespace: koldun
+spec:
+  backend:
+    # Production images from registry
+    image: ghcr.io/gorizond/koldun:latest
+    rootImage: ghcr.io/gorizond/koldun:latest
+    workerImage: ghcr.io/gorizond/koldun:latest
+    dispatcherImage: ghcr.io/gorizond/koldun:latest
+
+    # replicaPower=2 means 4 workers (2^2=4)
+    replicaPower: 2
+
+    # NATS configuration (update with your cluster)
+    nats:
+      url: nats://koldun:k0ldun@nats.koldun.svc:4222
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+      modelPrefix: model/
+      tokenPrefix: token/
+
+    # Session lifecycle
+    conversationTTL: 30m
+    responseTimeout: 5m
+
+    # Auto-scaling configuration
+    sessionScaling:
+      minDllamas: 1
+      maxDllamas: 10
+      scaleUpBacklog: 5
+      scaleDownIdleSeconds: 300
+
+    # Optional: HMAC hashing for secure conversation IDs
+    # hashSecret:
+    #   name: hash-secret
+    #   key: secret
+
+    # Dispatcher metrics for Prometheus
+    dispatcherMetricsListen: ":9090"
+
+  service:
+    port: 8082
+    type: ClusterIP
+
+  route:
+    host: api.example.com
+    path: /v1
+    ingressClassName: nginx
+    # TLS configuration
+    # tls:
+    #   secretName: api-tls-cert

@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "koldun.fullname" . }}-test-crds"
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  serviceAccountName: {{ include "koldun.serviceAccountName" . }}
+  containers:
+    - name: kubectl
+      image: bitnami/kubectl:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Checking Koldun CRDs..."
+
+          # List of expected CRDs
+          CRDS="dllamas.koldun.gorizond.io ingresses.koldun.gorizond.io models.koldun.gorizond.io roots.koldun.gorizond.io sessions.koldun.gorizond.io workers.koldun.gorizond.io"
+
+          for crd in $CRDS; do
+            if kubectl get crd "$crd" > /dev/null 2>&1; then
+              echo "✓ $crd installed"
+            else
+              echo "✗ $crd MISSING"
+              exit 1
+            fi
+          done
+
+          echo "All CRDs installed successfully"
+
+          # Check that we can list resources
+          echo "Testing resource access..."
+          kubectl get models.koldun.gorizond.io -n {{ .Release.Namespace }} || exit 1
+          kubectl get ingresses.koldun.gorizond.io -n {{ .Release.Namespace }} || exit 1
+          kubectl get sessions.koldun.gorizond.io -n {{ .Release.Namespace }} || exit 1
+
+          echo "CRD test PASSED"
+  restartPolicy: Never
