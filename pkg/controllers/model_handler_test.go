@@ -821,3 +821,75 @@ func (n *nonNamespacedControllerStub[T, TL]) WithImpersonation(cfg rest.Imperson
 	_, err := n.controllerStub.WithImpersonation(cfg)
 	return n, err
 }
+
+func TestModelHandlerPreConvertedSkipsBuckets(t *testing.T) {
+	handler := &modelHandler{}
+	var called bool
+
+	handler.ensureBucketsFn = func(m *v1.Model) error {
+		called = true
+		return errors.New("should not be called")
+	}
+
+	model := &v1.Model{
+		Spec: v1.ModelSpec{PreConverted: true},
+	}
+
+	err := handler.ensureBucketsForModel(model)
+	require.NoError(t, err)
+	require.False(t, called, "bucket function should be skipped for pre-converted models")
+}
+
+func TestModelHandlerPreConvertedSkipsDownload(t *testing.T) {
+	handler := &modelHandler{}
+	var called bool
+
+	handler.ensureDownloadJobFn = func(m *v1.Model) error {
+		called = true
+		return errors.New("should not be called")
+	}
+
+	model := &v1.Model{
+		Spec: v1.ModelSpec{PreConverted: true},
+	}
+
+	err := handler.ensureDownload(model)
+	require.NoError(t, err)
+	require.False(t, called, "download function should be skipped for pre-converted models")
+}
+
+func TestModelHandlerPreConvertedSkipsConversion(t *testing.T) {
+	handler := &modelHandler{}
+	var called bool
+
+	handler.ensureConversionFn = func(m *v1.Model) error {
+		called = true
+		return errors.New("should not be called")
+	}
+
+	model := &v1.Model{
+		Spec: v1.ModelSpec{PreConverted: true},
+	}
+
+	err := handler.ensureConversion(model)
+	require.NoError(t, err)
+	require.False(t, called, "conversion function should be skipped for pre-converted models")
+}
+
+func TestModelHandlerPreConvertedSkipsSizing(t *testing.T) {
+	handler := &modelHandler{}
+	var called bool
+
+	handler.ensureSizingFn = func(m *v1.Model) error {
+		called = true
+		return errors.New("should not be called")
+	}
+
+	model := &v1.Model{
+		Spec: v1.ModelSpec{PreConverted: true},
+	}
+
+	err := handler.ensureSizing(model)
+	require.NoError(t, err)
+	require.False(t, called, "sizing function should be skipped for pre-converted models")
+}
