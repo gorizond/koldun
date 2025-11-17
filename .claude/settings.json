@@ -1,12 +1,11 @@
 {
   "permissions": {
-    "allow": {
-      "tools": [
-        "TodoWrite",
-        "Bash",
-        "Read",
-        "Write"
-      ]
-    }
+    "allow": [
+      "Bash",
+      "Edit",
+      "mcp__agor__agor_sessions_prompt"
+    ],
+    "deny": [],
+    "ask": []
   }
 }

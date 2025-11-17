@@ -225,8 +225,15 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	if quantType == "" {
 		quantType = weightsFloatType
 	}
-	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, quantType)
-	tokenizerFile := fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
+
+	// Use launchOptions from Model if available, otherwise fallback to constructed paths
+	modelFile, tokenizerFile := parseLaunchOptions(model.Spec.LaunchOptions)
+	if modelFile == "" {
+		modelFile = fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, quantType)
+	}
+	if tokenizerFile == "" {
+		tokenizerFile = fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
+	}
 
 	if strings.TrimSpace(root.Spec.ModelRef) == "" {
 		return fmt.Errorf("root %s/%s missing spec.modelRef", root.Namespace, root.Name)
@@ -690,4 +697,17 @@ func (h *rootHandler) ensureStatus(root *v1.Root) (*v1.Root, error) {
 	}
 
 	return h.roots.UpdateStatus(updated)
+}
+
+// parseLaunchOptions extracts --model and --tokenizer paths from launchOptions slice
+func parseLaunchOptions(opts []string) (modelPath, tokenizerPath string) {
+	for i := 0; i < len(opts)-1; i++ {
+		switch opts[i] {
+		case "--model":
+			modelPath = opts[i+1]
+		case "--tokenizer":
+			tokenizerPath = opts[i+1]
+		}
+	}
+	return
 }
