@@ -45,6 +45,7 @@ Koldun orchestrates distributed-llama inference topologies on Kubernetes. The si
 ### Prerequisites
 - Go 1.24+, Docker/Skaffold (for container builds), and access to a Kubernetes cluster (Kubernetes 1.30+) with JetStream-enabled NATS.
 - Helm 3 if you plan to install via the included chart.
+- **ARM64 Note**: When running on ARM64 (Apple Silicon, AWS Graviton), distributed-llama multi-worker mode may experience stability issues. Single-worker topology (replicaPower=1) is recommended for ARM64 environments. x86_64 is fully supported for all topology configurations.
 
 ### Build & Run Locally
 ```bash
@@ -540,6 +541,21 @@ export KUBEBUILDER_ASSETS="$(./hack/print-kubebuilder-assets.sh)"
 - Sample CRs: `k8s/examples/*.yaml` (models, dllama topologies, ingress definitions).
 - Token tooling lives in `pkg/tokens`; registry helpers in `pkg/registry` show how JetStream buckets are structured.
 - File an issue or PR with validation steps (`go test ./...`, Helm installation logs, kube events) to document behavioural changes.
+
+## Known Limitations
+
+### ARM64 Distributed Mode
+- **Multi-worker topology (replicaPower > 1)** causes segmentation faults (SIGSEGV) in distributed-llama on ARM64 with Rosetta/VZ translation
+- **Root cause**: Race conditions during worker initialization when Root attempts to connect to multiple workers simultaneously
+- **Workaround**: Use `replicaPower=1` (single worker) for ARM64 environments; this provides stable operation with distributed inference
+- **Performance**: CPU inference is slow (~5-10 seconds per token on ARM64); GPU acceleration recommended for production
+- **Recommendation**: Use x86_64 architecture with AVX2/AVX512 support for optimal distributed-llama performance
+
+### CPU Inference Performance
+- Each inference request can take **minutes** on CPU-only deployments
+- NATS queue backlog grows quickly under load; monitor with `nats stream info KOLDUN_LLM_REQUESTS`
+- Set appropriate `responseTimeout` in Ingress spec (default 2m may be insufficient for longer generations)
+- Avoid concurrent requests to single Root pod to prevent queue timeout cascades
 
 ## In Memoriam
 
