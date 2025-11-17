@@ -198,6 +198,10 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	if model.Spec.Conversion != nil {
 		weightsFloatType = strings.TrimSpace(model.Spec.Conversion.WeightsFloatType)
 	}
+	// PreConverted models use q80 as default weightsFloatType if not specified
+	if weightsFloatType == "" && model.Spec.PreConverted {
+		weightsFloatType = "q80"
+	}
 	if weightsFloatType == "" {
 		return fmt.Errorf("model %s/%s conversion.weightsFloatType is required", model.Namespace, model.Name)
 	}

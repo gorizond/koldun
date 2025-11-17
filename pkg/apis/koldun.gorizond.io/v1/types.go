@@ -234,6 +234,9 @@ type ModelSpec struct {
 	// PreConverted indicates the model files are already in dllama format in the object storage.
 	// When true, download and conversion jobs are skipped and the model is immediately marked Ready.
 	PreConverted bool `json:"preConverted,omitempty"`
+	// PreConvertedPVCName is the name of an existing PVC containing pre-converted model files.
+	// Required when PreConverted is true. This PVC will be mounted by Root and Worker pods.
+	PreConvertedPVCName string `json:"preConvertedPVCName,omitempty"`
 	// PreConvertedSizeBytes is the total size in bytes of pre-converted model files.
 	// Required when PreConverted is true for registry sync to work.
 	PreConvertedSizeBytes int64 `json:"preConvertedSizeBytes,omitempty"`

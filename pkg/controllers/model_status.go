@@ -82,7 +82,18 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		readyCond.Message = "Model is pre-converted and ready"
 
 		// Set fields required for registry sync
-		updated.Status.OutputPVCName = fmt.Sprintf("%s-preconverted", obj.Name)
+		if strings.TrimSpace(obj.Spec.PreConvertedPVCName) == "" {
+			readyCond.Status = metav1.ConditionFalse
+			readyCond.Reason = "ConfigurationMissing"
+			readyCond.Message = "PreConverted model requires preConvertedPVCName to be specified"
+			updated.Status.ObservedGeneration = obj.Generation
+			setCondition(&updated.Status.Conditions, downloadCond)
+			setCondition(&updated.Status.Conditions, conversionCond)
+			setCondition(&updated.Status.Conditions, sizeCond)
+			setCondition(&updated.Status.Conditions, readyCond)
+			return h.models.UpdateStatus(updated)
+		}
+		updated.Status.OutputPVCName = obj.Spec.PreConvertedPVCName
 		updated.Status.ConversionSizeBytes = obj.Spec.PreConvertedSizeBytes
 		if strings.TrimSpace(obj.Spec.PreConvertedSizeHuman) != "" {
 			updated.Status.ConversionSizeHuman = obj.Spec.PreConvertedSizeHuman

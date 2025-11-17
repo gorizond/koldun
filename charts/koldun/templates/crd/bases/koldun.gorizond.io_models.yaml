@@ -264,6 +264,11 @@ spec:
                   PreConverted indicates the model files are already in dllama format in the object storage.
                   When true, download and conversion jobs are skipped and the model is immediately marked Ready.
                 type: boolean
+              preConvertedPVCName:
+                description: |-
+                  PreConvertedPVCName is the name of an existing PVC containing pre-converted model files.
+                  Required when PreConverted is true. This PVC will be mounted by Root and Worker pods.
+                type: string
               preConvertedSizeBytes:
                 description: |-
                   PreConvertedSizeBytes is the total size in bytes of pre-converted model files.
