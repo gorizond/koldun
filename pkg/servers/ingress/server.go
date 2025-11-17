@@ -528,14 +528,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if !registryModelReady(&model) {
 			continue
 		}
-		data = append(data, map[string]any{
-			"id":         fmt.Sprintf("%s/%s", model.Namespace, model.Name),
-			"object":     "model",
-			"name":       firstNonEmpty(model.DisplayName, model.Name),
-			"namespace":  model.Namespace,
-			"size_bytes": model.ConversionSizeBytes,
-			"size_human": model.ConversionSizeHuman,
-		})
+		// OpenAI-compatible response with Koldun extensions
+		modelData := map[string]any{
+			"id":       fmt.Sprintf("%s/%s", model.Namespace, model.Name),
+			"object":   "model",
+			"created":  time.Now().Unix(), // OpenAI required field
+			"owned_by": "koldun",          // OpenAI required field
+		}
+		// Koldun extensions (non-standard but useful)
+		if model.DisplayName != "" && model.DisplayName != model.Name {
+			modelData["name"] = model.DisplayName
+		}
+		if model.Namespace != "" {
+			modelData["namespace"] = model.Namespace
+		}
+		if model.ConversionSizeBytes > 0 {
+			modelData["size_bytes"] = model.ConversionSizeBytes
+			modelData["size_human"] = model.ConversionSizeHuman
+		}
+		data = append(data, modelData)
 	}
 
 	sort.Slice(data, func(i, j int) bool {

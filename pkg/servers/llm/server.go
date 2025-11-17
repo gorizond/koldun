@@ -630,7 +630,10 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 		return err
 	}
 
-	if err := s.nc.Publish(target, trimmed); err != nil {
+	// Normalize response for OpenAI API compatibility
+	normalized := normalizeChatCompletionResponse(trimmed, payload.Request.Model)
+
+	if err := s.nc.Publish(target, normalized); err != nil {
 		return fmt.Errorf("publish response: %w", err)
 	}
 
@@ -931,6 +934,42 @@ func (s *Server) publishError(target, msg string) {
 	body, _ := json.Marshal(errPayload)
 	_ = s.nc.Publish(target, body)
 	_ = s.nc.Publish(target, []byte("[DONE]"))
+}
+
+// normalizeChatCompletionResponse fixes known dllama-api response issues
+// to improve OpenAI API compatibility.
+func normalizeChatCompletionResponse(data []byte, requestedModel string) []byte {
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return data // return as-is if unparseable
+	}
+
+	// Fix model field to match requested model
+	if requestedModel != "" {
+		resp["model"] = requestedModel
+	}
+
+	// Fix choices array
+	if choices, ok := resp["choices"].([]any); ok {
+		for i, choice := range choices {
+			if choiceMap, ok := choice.(map[string]any); ok {
+				// Fix index to be valid non-negative integer
+				if idx, ok := choiceMap["index"].(float64); ok && idx < 0 {
+					choiceMap["index"] = i
+				}
+				// Fix empty finish_reason to "stop"
+				if reason, ok := choiceMap["finish_reason"].(string); ok && reason == "" {
+					choiceMap["finish_reason"] = "stop"
+				}
+			}
+		}
+	}
+
+	normalized, err := json.Marshal(resp)
+	if err != nil {
+		return data // return original if re-encoding fails
+	}
+	return normalized
 }
 
 type consumerManager interface {
