@@ -1,7 +1,7 @@
 ARG DL_REPOSITORY=https://github.com/b4rtaz/distributed-llama.git
 ARG DL_VERSION=v0.16.3
 
-FROM alpine:latest AS dllama-builder
+FROM alpine:3.20 AS dllama-builder
 ARG DL_REPOSITORY
 ARG DL_VERSION
 ARG TARGETARCH
@@ -44,7 +44,7 @@ COPY pkg ./pkg
 RUN mkdir -p /out && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/koldun ./cmd/operator
 
 # Start a new stage from scratch
-FROM alpine:latest
+FROM alpine:3.20
 
 RUN apk add --no-cache libstdc++ libgcc
 # Copy the Pre-built binary file from the previous stage
