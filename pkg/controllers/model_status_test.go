@@ -1592,6 +1592,7 @@ func TestEnsureStatusPreConvertedModel(t *testing.T) {
 		},
 		Spec: v1.ModelSpec{
 			PreConverted:          true,
+			PreConvertedPVCName:   "prebuilt-model-pvc",
 			PreConvertedSizeBytes: 4294967296, // 4GiB
 			PreConvertedSizeHuman: "4 GiB",
 		},
@@ -1612,8 +1613,8 @@ func TestEnsureStatusPreConvertedModel(t *testing.T) {
 		if readyCond == nil || readyCond.Status != metav1.ConditionTrue || readyCond.Reason != "PreConverted" {
 			t.Errorf("expected Ready condition to be True with reason PreConverted")
 		}
-		if updated.Status.OutputPVCName != "prebuilt-preconverted" {
-			t.Errorf("expected OutputPVCName = prebuilt-preconverted, got %s", updated.Status.OutputPVCName)
+		if updated.Status.OutputPVCName != "prebuilt-model-pvc" {
+			t.Errorf("expected OutputPVCName = prebuilt-model-pvc, got %s", updated.Status.OutputPVCName)
 		}
 		if updated.Status.ConversionSizeBytes != 4294967296 {
 			t.Errorf("expected ConversionSizeBytes = 4294967296, got %d", updated.Status.ConversionSizeBytes)
@@ -1653,6 +1654,7 @@ func TestEnsureStatusPreConvertedModelWithoutHumanSize(t *testing.T) {
 		},
 		Spec: v1.ModelSpec{
 			PreConverted:          true,
+			PreConvertedPVCName:   "prebuilt-auto-pvc",
 			PreConvertedSizeBytes: 1073741824, // 1GiB
 			// PreConvertedSizeHuman not set - should be calculated automatically
 		},
@@ -1666,6 +1668,49 @@ func TestEnsureStatusPreConvertedModelWithoutHumanSize(t *testing.T) {
 		// humanizeBytes should calculate the human-readable size
 		if updated.Status.ConversionSizeHuman == "" {
 			t.Errorf("expected ConversionSizeHuman to be auto-calculated, got empty string")
+		}
+		return updated, nil
+	})
+
+	result, err := handler.ensureStatus(model)
+	if err != nil {
+		t.Fatalf("ensureStatus returned error: %v", err)
+	}
+	if result == nil {
+		t.Fatalf("ensureStatus returned nil result")
+	}
+}
+
+func TestEnsureStatusPreConvertedModelMissingPVCName(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+
+	handler := &modelHandler{
+		models: models,
+	}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "prebuilt-no-pvc",
+			Namespace: "models",
+		},
+		Spec: v1.ModelSpec{
+			PreConverted:          true,
+			PreConvertedSizeBytes: 1073741824,
+			// PreConvertedPVCName not set - should fail validation
+		},
+	}
+	model.Generation = 1
+
+	models.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Model{})).DoAndReturn(func(updated *v1.Model) (*v1.Model, error) {
+		readyCond := meta.FindStatusCondition(updated.Status.Conditions, conditionReady)
+		if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "ConfigurationMissing" {
+			t.Errorf("expected Ready condition to be False with reason ConfigurationMissing, got %v", readyCond)
+		}
+		if readyCond.Message != "PreConverted model requires preConvertedPVCName to be specified" {
+			t.Errorf("unexpected message: %s", readyCond.Message)
 		}
 		return updated, nil
 	})
