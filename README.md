@@ -321,6 +321,61 @@ curl http://localhost:8080/readyz   # "ready"
 - **No persistence**: MinIO and NATS use memory storage (data lost on restart)
 - **Resource constraints**: Lima VM may need memory increase for large models
 
+### ARM64 Requirements (Rosetta + VZ)
+
+For stable multi-worker distributed inference on Apple Silicon (M1/M2/M3), **Rosetta and VZ (Virtualization.framework)** are mandatory:
+
+**Rancher Desktop Settings:**
+1. Open Rancher Desktop Preferences
+2. Go to **Virtual Machine** section
+3. Enable **VZ (Virtualization.framework)** instead of QEMU
+4. Enable **Rosetta support** for x86_64 emulation
+5. Restart Rancher Desktop
+
+**Why this matters:**
+- Lima VM with VZ + Rosetta provides better CPU instruction compatibility
+- dllama uses advanced SIMD instructions (NEON, DOTPROD) that require proper emulation
+- Without Rosetta + VZ, you may see Exit Code 139 (SIGSEGV) or Exit Code 133 (SIGILL)
+- 3-worker distributed inference is stable with Rosetta + VZ enabled
+
+**Validation:**
+```bash
+# Check Rosetta support
+kubectl exec <any-pod> -- uname -m
+# Should return: aarch64 or x86_64 (with Rosetta)
+
+# Check CSI S3 (benefits from VZ)
+kubectl get pods -n koldun | grep csi-s3
+# Should show Running (not CrashLoopBackOff)
+```
+
+### CPU Inference Performance Warning
+
+**CRITICAL: CPU-based LLM inference is EXTREMELY slow!**
+
+- **Expect 2-5 minutes per token** for models like Qwen3 0.6B on ARM64 Lima VM
+- **Never send multiple concurrent requests** to the same Dllama instance
+- **Use NATS queues** for proper request management (they handle backpressure)
+- **Monitor system load** before sending requests
+
+**Pre-request checks:**
+```bash
+# 1. Check NATS backlog (should be empty or low)
+kubectl exec koldun-nats-0 -c nats -n koldun -- nats stream info
+
+# 2. Check LLM sidecar status
+kubectl logs <root-pod> -c llm -n koldun --tail=20
+
+# 3. Verify no active requests (dispatcher logs)
+kubectl logs <dispatcher-pod> -n koldun --tail=10
+```
+
+**Best practices:**
+- Send **one request at a time** and wait for completion
+- Set realistic `max_tokens` (10-50 for testing, not 1000+)
+- Use **smaller models** (TinyLlama 1.1B vs Qwen3 0.6B) for faster iteration
+- Consider **x86_64 production cluster** with GPU for real workloads
+
 ### Values File (values-dev.yaml)
 
 ```yaml
