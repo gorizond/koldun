@@ -208,8 +208,8 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	}
 
 	workerReplicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
-	if workerReplicas <= 0 {
-		workerReplicas = 1
+	if workerReplicas < 0 {
+		workerReplicas = 0
 	}
 
 	var override *float64

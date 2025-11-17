@@ -9,7 +9,9 @@ WORKDIR /src
 RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
 # TERMUX_VERSION disables -march=native to avoid AVX/AVX2/AVX512 instructions
 # that may not be supported in virtualized environments (like Rancher Desktop Lima VM)
-RUN TERMUX_VERSION=1 make dllama && TERMUX_VERSION=1 make dllama-api && \
+# Additional CXXFLAGS disable ARM NEON/DOTPROD for broader compatibility
+RUN TERMUX_VERSION=1 CXXFLAGS="-O3 -fno-tree-vectorize" make dllama && \
+    TERMUX_VERSION=1 CXXFLAGS="-O3 -fno-tree-vectorize" make dllama-api && \
     DLLAMA_BIN=$(find . -maxdepth 4 -type f -name dllama -perm /111 | head -n1) && \
     DLLAMA_API_BIN=$(find . -maxdepth 4 -type f -name dllama-api -perm /111 | head -n1) && \
     install -Dm755 "$DLLAMA_BIN" /out/dllama && \
