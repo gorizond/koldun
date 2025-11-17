@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gorizond/koldun/pkg/controllers"
+	"github.com/gorizond/koldun/pkg/metrics"
 	"github.com/sirupsen/logrus"
 )
 
@@ -54,6 +55,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleReady)
+	mux.Handle("/metrics", metrics.Handler())
 
 	s.httpServer = &http.Server{ //nolint:gosec // listen address is controlled via config/flags
 		Addr:    s.cfg.ListenAddress,

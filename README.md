@@ -180,6 +180,186 @@ spec:
 - Follow `AGENTS.md` for contributor expectations, code layout, testing, and security conventions.
 - Run `make help` to discover the canonical shortcuts (`test`, `controllers-smoke`, `compose-test`, `compose-update-baseline`) and reminders about compose coverage maintenance. Whenever the merged compose coverage exceeds the tracked value in `analytics/compose_coverage_baseline.json`, rerun `make compose-update-baseline`; the helper refreshes the JSON with the new percentage, timestamp, and commit hash so CI enforces the higher bar automatically.
 
+## Local Development with Rancher Desktop (E2E Testing)
+
+For full end-to-end testing with real CRDs, use the Helm chart in Rancher Desktop. This setup provides a production-like environment with NATS JetStream, MinIO, and the complete operator stack.
+
+### Quick Start
+
+```bash
+# 1. Switch to Rancher Desktop context
+kubectl config use-context rancher-desktop
+
+# 2. Create namespace
+kubectl create namespace koldun
+
+# 3. Build operator image
+docker build -t koldun:dev .
+
+# 4. Update Helm dependencies
+make helm-deps
+
+# 5. Install with local values
+helm install koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+
+# 6. Verify all components
+kubectl get pods -n koldun
+# Expected: operator, nats, minio all Running
+```
+
+### E2E Test Flow (Proven Working)
+
+The following flow has been validated with Qwen3 0.6B on ARM64:
+
+```
+HTTP Request → Ingress Backend → NATS → Dispatcher → Dllama (Root+Workers) → LLM Response
+```
+
+**1. Create MinIO credentials secret:**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: koldun
+type: Opaque
+stringData:
+  accessKey: minioadmin
+  secretKey: minioadmin
+```
+
+**2. Create Model CR (TinyLlama example):**
+```yaml
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: tinyllama
+  namespace: koldun
+spec:
+  sourceUrl: https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  localPath: /models/tinyllama
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-creds
+  launchOptions:
+    - "--buffer-float-type"
+    - "q80"
+```
+
+**3. Create Ingress CR:**
+```yaml
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: tinyllama-ingress
+  namespace: koldun
+spec:
+  backend:
+    image: koldun:dev
+    rootImage: koldun:dev
+    workerImage: koldun:dev
+    dispatcherImage: koldun:dev
+    replicaPower: 0  # 2^0 = 1 worker (stable on ARM64)
+    nats:
+      url: nats://koldun-nats:4222
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+      modelPrefix: model/
+      tokenPrefix: token/
+    conversationTTL: 10m
+    responseTimeout: 2m
+  service:
+    port: 8082
+  route:
+    host: tinyllama.local
+```
+
+**4. Test the API:**
+```bash
+# Port-forward the backend
+kubectl port-forward svc/tinyllama-ingress-backend 8082:8082 -n koldun
+
+# List models
+curl http://localhost:8082/v1/models
+
+# Chat completion
+curl -X POST http://localhost:8082/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "koldun/tinyllama",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 50
+  }'
+```
+
+### Development Workflow
+
+```bash
+# Rebuild after code changes
+docker build -t koldun:dev .
+
+# Upgrade Helm release
+helm upgrade koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+
+# Watch operator logs (may timeout due to Rancher Desktop TLS issue)
+kubectl logs -f deployment/koldun -n koldun
+
+# Check health
+kubectl port-forward deployment/koldun 8080:8080 -n koldun &
+curl http://localhost:8080/healthz  # "ok"
+curl http://localhost:8080/readyz   # "ready"
+```
+
+### Known Limitations
+
+- **kubectl logs timeout**: Rancher Desktop VM has TLS handshake issues; use `kubectl port-forward` or `kubectl exec` instead
+- **Multi-worker stability**: 1 worker is stable; 2+ workers may have race conditions on ARM64 Lima VM
+- **No persistence**: MinIO and NATS use memory storage (data lost on restart)
+- **Resource constraints**: Lima VM may need memory increase for large models
+
+### Values File (values-dev.yaml)
+
+```yaml
+image:
+  repository: koldun
+  tag: dev
+  pullPolicy: Never
+
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 1Gi
+
+minio:
+  enabled: true
+  mode: standalone
+  persistence:
+    enabled: false
+
+operator:
+  conversation:
+    natsUrl: "nats://koldun-nats:4222"
+    kvBucket: "koldun_ttl"
+  registry:
+    modelsBucket: "koldun_models"
+    tokensBucket: "koldun_tokens"
+
+csi-s3:
+  enabled: true
+  storageClass:
+    endpoint: "http://koldun-minio:9000"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"
+```
+
 ## Local Integration Stack (docker-compose)
 Run the NATS + MinIO + single-node k3s stack whenever you need a reproducible environment for ingress/dispatcher tests without depending on host networking quirks.
 
