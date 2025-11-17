@@ -1,0 +1,34 @@
+# Qwen3 0.6B Model - Lightweight model with reasoning capabilities
+# Proven working on ARM64 with distributed-llama
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: qwen3-0.6b
+  namespace: koldun
+spec:
+  # HuggingFace model URL
+  sourceUrl: https://huggingface.co/Qwen/Qwen3-0.6B
+
+  # Local path for model storage
+  localPath: /models/qwen3-0.6b
+
+  # S3/MinIO storage configuration
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-creds
+      namespace: koldun
+
+  # distributed-llama launch options for ARM64
+  launchOptions:
+    - "--buffer-float-type"
+    - "q80"
+
+  # Download configuration for larger model
+  download:
+    image: python:3.11-slim
+    memory: 4Gi
+    chunkMaxMiB: 512
+    concurrency: 6

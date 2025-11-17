@@ -67,6 +67,55 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	forceToken := normalizeForceToken(forceTokenRaw, forceAnnotationPresent, obj.ResourceVersion)
 	shouldClearForceAnnotation := false
 
+	// Handle pre-converted models - skip download/conversion, mark as ready immediately
+	if obj.Spec.PreConverted {
+		downloadCond.Status = metav1.ConditionTrue
+		downloadCond.Reason = "PreConverted"
+		downloadCond.Message = "Model is pre-converted, no download required"
+		downloadState = "Succeeded"
+		conversionCond.Status = metav1.ConditionFalse
+		conversionCond.Reason = "PreConverted"
+		conversionCond.Message = "Model is pre-converted, no conversion required"
+		conversionState = "NotRequested"
+		readyCond.Status = metav1.ConditionTrue
+		readyCond.Reason = "PreConverted"
+		readyCond.Message = "Model is pre-converted and ready"
+
+		// Set fields required for registry sync
+		if strings.TrimSpace(obj.Spec.PreConvertedPVCName) == "" {
+			readyCond.Status = metav1.ConditionFalse
+			readyCond.Reason = "ConfigurationMissing"
+			readyCond.Message = "PreConverted model requires preConvertedPVCName to be specified"
+			updated.Status.ObservedGeneration = obj.Generation
+			setCondition(&updated.Status.Conditions, downloadCond)
+			setCondition(&updated.Status.Conditions, conversionCond)
+			setCondition(&updated.Status.Conditions, sizeCond)
+			setCondition(&updated.Status.Conditions, readyCond)
+			return h.models.UpdateStatus(updated)
+		}
+		updated.Status.OutputPVCName = obj.Spec.PreConvertedPVCName
+		updated.Status.ConversionSizeBytes = obj.Spec.PreConvertedSizeBytes
+		if strings.TrimSpace(obj.Spec.PreConvertedSizeHuman) != "" {
+			updated.Status.ConversionSizeHuman = obj.Spec.PreConvertedSizeHuman
+		} else if obj.Spec.PreConvertedSizeBytes > 0 {
+			// Calculate human-readable size if not provided
+			updated.Status.ConversionSizeHuman = humanizeBytes(obj.Spec.PreConvertedSizeBytes)
+		}
+		updated.Status.ConversionSizeGeneration = obj.Generation
+
+		updated.Status.DownloadState = downloadState
+		updated.Status.ConversionState = conversionState
+		updated.Status.ConversionSizeState = sizeState
+		updated.Status.ObservedGeneration = obj.Generation
+		setCondition(&updated.Status.Conditions, downloadCond)
+		setCondition(&updated.Status.Conditions, conversionCond)
+		setCondition(&updated.Status.Conditions, sizeCond)
+		setCondition(&updated.Status.Conditions, readyCond)
+
+		// Update status in API server
+		return h.models.UpdateStatus(updated)
+	}
+
 	storage := obj.Spec.ObjectStorage
 	if storage == nil || strings.TrimSpace(storage.BucketForSource) == "" || obj.Spec.SourceURL == "" {
 		downloadCond.Reason = "ConfigurationMissing"
@@ -398,4 +447,27 @@ func hasCondition(conditions []metav1.Condition, condType string) bool {
 	}
 	return false
 
+}
+
+// humanizeBytes converts bytes to a human-readable string (e.g., "1.5 GB")
+func humanizeBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+		TB = GB * 1024
+	)
+
+	switch {
+	case bytes >= TB:
+		return fmt.Sprintf("%.2f TB", float64(bytes)/float64(TB))
+	case bytes >= GB:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.2f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.2f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }

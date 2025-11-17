@@ -200,6 +200,22 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		},
 	}
 
+	// Add volume for model PVC if modelRef is set
+	var volumes []corev1.Volume
+	if worker.Spec.ModelRef != "" {
+		volumes = []corev1.Volume{
+			{
+				Name: "model-output",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: worker.Spec.ModelRef,
+						ReadOnly:  true,
+					},
+				},
+			},
+		}
+	}
+
 	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: appsv1.SchemeGroupVersion.String(),
@@ -222,6 +238,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 				},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
+					Volumes:                       volumes,
 					Containers:                    []corev1.Container{h.workerContainer(worker, threads, workerResources)},
 				},
 			},
@@ -279,6 +296,18 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		}
 	}
 
+	// Add volume mount for model PVC if modelRef is set
+	var volumeMounts []corev1.VolumeMount
+	if worker.Spec.ModelRef != "" {
+		volumeMounts = []corev1.VolumeMount{
+			{
+				Name:      "model-output",
+				MountPath: "/model",
+				ReadOnly:  true,
+			},
+		}
+	}
+
 	container := corev1.Container{
 		Name:            "worker",
 		Image:           worker.Spec.Image,
@@ -287,6 +316,7 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		Args:            args,
 		Env:             env,
 		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
+		VolumeMounts:    volumeMounts,
 	}
 
 	if !isResourceRequirementsEmpty(resources) {

@@ -198,6 +198,10 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	if model.Spec.Conversion != nil {
 		weightsFloatType = strings.TrimSpace(model.Spec.Conversion.WeightsFloatType)
 	}
+	// PreConverted models use q80 as default weightsFloatType if not specified
+	if weightsFloatType == "" && model.Spec.PreConverted {
+		weightsFloatType = "q80"
+	}
 	if weightsFloatType == "" {
 		return fmt.Errorf("model %s/%s conversion.weightsFloatType is required", model.Namespace, model.Name)
 	}
@@ -208,8 +212,8 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	}
 
 	workerReplicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
-	if workerReplicas <= 0 {
-		workerReplicas = 1
+	if workerReplicas < 0 {
+		workerReplicas = 0
 	}
 
 	var override *float64
@@ -225,8 +229,15 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	if quantType == "" {
 		quantType = weightsFloatType
 	}
-	modelFile := fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, quantType)
-	tokenizerFile := fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
+
+	// Use launchOptions from Model if available, otherwise fallback to constructed paths
+	modelFile, tokenizerFile := parseLaunchOptions(model.Spec.LaunchOptions)
+	if modelFile == "" {
+		modelFile = fmt.Sprintf("model/dllama_model_%s_%s.m", model.Name, quantType)
+	}
+	if tokenizerFile == "" {
+		tokenizerFile = fmt.Sprintf("model/dllama_tokenizer_%s.t", model.Name)
+	}
 
 	if strings.TrimSpace(root.Spec.ModelRef) == "" {
 		return fmt.Errorf("root %s/%s missing spec.modelRef", root.Namespace, root.Name)
@@ -378,7 +389,8 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 		return false, 0, nil, nil
 	}
 	if len(root.Spec.WorkerSelector) == 0 {
-		return false, 0, nil, nil
+		// No worker selector means standalone mode - workers are ready (empty list)
+		return true, 0, nil, nil
 	}
 
 	dllama, err := h.resolveDllama(root)
@@ -391,7 +403,8 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 
 	replicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
 	if replicas <= 0 {
-		replicas = 1
+		// Standalone mode - no workers needed, always ready
+		return true, 0, nil, nil
 	}
 
 	workerName := workerResourceName(dllama.Name)
@@ -422,7 +435,9 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 }
 
 func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string, resources corev1.ResourceRequirements) corev1.Container {
-	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", weightsFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
+	// distributed-llama requires q80 sync type for inter-node communication regardless of weights type
+	bufferFloatType := "q80"
+	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", bufferFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
 	if len(workers) > 0 {
 		args = append(args, "--workers")
 		args = append(args, workers...)
@@ -690,4 +705,17 @@ func (h *rootHandler) ensureStatus(root *v1.Root) (*v1.Root, error) {
 	}
 
 	return h.roots.UpdateStatus(updated)
+}
+
+// parseLaunchOptions extracts --model and --tokenizer paths from launchOptions slice
+func parseLaunchOptions(opts []string) (modelPath, tokenizerPath string) {
+	for i := 0; i < len(opts)-1; i++ {
+		switch opts[i] {
+		case "--model":
+			modelPath = opts[i+1]
+		case "--tokenizer":
+			tokenizerPath = opts[i+1]
+		}
+	}
+	return
 }

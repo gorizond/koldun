@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "koldun.fullname" . }}-test-connection"
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox
+      command: ['wget']
+      args: ['{{ include "koldun.fullname" . }}:{{ .Values.service.port }}/healthz', '-O', '-', '-q']
+  restartPolicy: Never

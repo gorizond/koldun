@@ -410,15 +410,17 @@ func TestWorkerHandlerEnsureStatefulSetUsesModelMemoryPlan(t *testing.T) {
 		require.NotNil(t, sts.Spec.Replicas)
 		require.EqualValues(t, 3, *sts.Spec.Replicas)
 		require.Contains(t, sts.Spec.Template.Annotations, annotationMemoryPlan)
-		require.Contains(t, sts.Spec.Template.Annotations[annotationMemoryPlan], "worker=18Mi")
+		// 64Mi model / 4 nodes = 16Mi per worker * 2.50 overhead = 40Mi
+		require.Contains(t, sts.Spec.Template.Annotations[annotationMemoryPlan], "worker=40Mi")
 		require.Equal(t, "64Mi", sts.Spec.Template.Annotations[annotationConversionSizeHuman])
 
 		container := sts.Spec.Template.Spec.Containers[0]
 		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "4"}, container.Args)
 		requestMem := container.Resources.Requests[corev1.ResourceMemory]
 		limitMem := container.Resources.Limits[corev1.ResourceMemory]
-		require.Equal(t, "18Mi", requestMem.String())
-		require.Equal(t, "18Mi", limitMem.String())
+		// Memory request matches the calculated worker memory with overhead
+		require.Equal(t, "40Mi", requestMem.String())
+		require.Equal(t, "40Mi", limitMem.String())
 
 		return nil
 	})

@@ -1,0 +1,46 @@
+# Local Development Ingress - Single worker for testing
+# Use with TinyLlama or Qwen3-0.6B models
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: local-ingress
+  namespace: koldun
+spec:
+  backend:
+    # Use local dev image
+    image: koldun:dev
+    rootImage: koldun:dev
+    workerImage: koldun:dev
+    dispatcherImage: koldun:dev
+
+    # replicaPower=0 means 1 worker (2^0=1)
+    # Use 0 for stability on ARM64/Lima VM
+    replicaPower: 0
+
+    # NATS configuration
+    nats:
+      url: nats://koldun-nats:4222
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+      modelPrefix: model/
+      tokenPrefix: token/
+
+    # Session lifecycle
+    conversationTTL: 10m
+    responseTimeout: 2m
+
+    # Optional: Session scaling (for production)
+    # sessionScaling:
+    #   minDllamas: 1
+    #   maxDllamas: 4
+    #   scaleUpBacklog: 2
+    #   scaleDownIdleSeconds: 120
+
+  service:
+    port: 8082
+
+  route:
+    host: local.koldun.dev
+    # path: /
+    # ingressClassName: traefik

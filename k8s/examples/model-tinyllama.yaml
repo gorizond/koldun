@@ -1,0 +1,35 @@
+# TinyLlama Model - Small model for testing and development
+# Downloads from HuggingFace and prepares for distributed-llama
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: tinyllama
+  namespace: koldun
+spec:
+  # HuggingFace model URL
+  sourceUrl: https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+  # Local path where model files will be stored
+  localPath: /models/tinyllama
+
+  # S3/MinIO storage configuration
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-creds
+      namespace: koldun
+
+  # distributed-llama launch options
+  # --buffer-float-type q80 for ARM64 compatibility
+  launchOptions:
+    - "--buffer-float-type"
+    - "q80"
+
+  # Optional: Download configuration
+  download:
+    image: python:3.11-slim
+    memory: 2Gi
+    chunkMaxMiB: 256
+    concurrency: 4

@@ -100,6 +100,7 @@ func TestSessionReconciliationCreatesDllamaAndDispatcher(t *testing.T) {
 			RootImage:       "root:latest",
 			WorkerImage:     "worker:latest",
 			DispatcherImage: "dispatcher:latest",
+			ReplicaPower:    1, // Enable workers (non-zero)
 			Queue: &v1.SessionQueueSpec{
 				BacklogSubject:      "sessions.backlog",
 				AssignmentsBucket:   "sessions.assign",
