@@ -255,6 +255,10 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 }
 
 func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1.Worker {
+	// If replicaPower is 0, no workers are needed (standalone mode)
+	if dllama.Spec.ReplicaPower == 0 {
+		return nil
+	}
 	workerName := workerResourceName(dllama.Name)
 	workerLabels := map[string]string{
 		labelDllamaName:       sanitizeLabelValue(dllama.Name),

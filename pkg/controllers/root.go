@@ -385,7 +385,8 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 		return false, 0, nil, nil
 	}
 	if len(root.Spec.WorkerSelector) == 0 {
-		return false, 0, nil, nil
+		// No worker selector means standalone mode - workers are ready (empty list)
+		return true, 0, nil, nil
 	}
 
 	dllama, err := h.resolveDllama(root)
@@ -398,7 +399,8 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 
 	replicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
 	if replicas <= 0 {
-		replicas = 1
+		// Standalone mode - no workers needed, always ready
+		return true, 0, nil, nil
 	}
 
 	workerName := workerResourceName(dllama.Name)

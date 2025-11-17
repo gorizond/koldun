@@ -10,8 +10,11 @@ RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
 # TERMUX_VERSION disables -march=native to avoid AVX/AVX2/AVX512 instructions
 # that may not be supported in virtualized environments (like Rancher Desktop Lima VM)
 # Additional CXXFLAGS disable ARM NEON/DOTPROD for broader compatibility
-RUN TERMUX_VERSION=1 CXXFLAGS="-O3 -fno-tree-vectorize" make dllama && \
-    TERMUX_VERSION=1 CXXFLAGS="-O3 -fno-tree-vectorize" make dllama-api && \
+# -fno-tree-vectorize disables auto-vectorization
+# -DDISABLE_NEON_DOTPROD disables ARM NEON DOTPROD intrinsics (if supported by dllama)
+# -mno-outline-atomics avoids problematic atomic operations on older ARM
+RUN TERMUX_VERSION=1 CXXFLAGS="-O2 -fno-tree-vectorize -fno-slp-vectorize -mno-outline-atomics" make dllama && \
+    TERMUX_VERSION=1 CXXFLAGS="-O2 -fno-tree-vectorize -fno-slp-vectorize -mno-outline-atomics" make dllama-api && \
     DLLAMA_BIN=$(find . -maxdepth 4 -type f -name dllama -perm /111 | head -n1) && \
     DLLAMA_API_BIN=$(find . -maxdepth 4 -type f -name dllama-api -perm /111 | head -n1) && \
     install -Dm755 "$DLLAMA_BIN" /out/dllama && \
