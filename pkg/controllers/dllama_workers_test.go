@@ -37,7 +37,8 @@ func TestDesiredWorkersFallsBackToIngressNATS(t *testing.T) {
 			},
 		},
 		Spec: v1.DllamaSpec{
-			WorkerImage: "ghcr.io/example/worker:latest",
+			WorkerImage:  "ghcr.io/example/worker:latest",
+			ReplicaPower: 1, // Enable workers (non-zero)
 		},
 	}
 
@@ -62,7 +63,8 @@ func TestDesiredWorkersUsesExistingNATSConfigWhenURLPresent(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: v1.DllamaSpec{
-			WorkerImage: "ghcr.io/example/worker:latest",
+			WorkerImage:  "ghcr.io/example/worker:latest",
+			ReplicaPower: 1, // Enable workers (non-zero)
 			NATS: &v1.DllamaNATSConfig{
 				URL: "nats://explicit:4222",
 			},
@@ -104,8 +106,9 @@ func TestDesiredWorkersPopulatesAnnotationsFromIngressWhenAnnotationsEmpty(t *te
 			},
 		},
 		Spec: v1.DllamaSpec{
-			WorkerImage: "ghcr.io/example/worker:latest",
-			NATS:        &v1.DllamaNATSConfig{},
+			WorkerImage:  "ghcr.io/example/worker:latest",
+			ReplicaPower: 1, // Enable workers (non-zero)
+			NATS:         &v1.DllamaNATSConfig{},
 		},
 	}
 
