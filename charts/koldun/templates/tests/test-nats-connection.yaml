@@ -1,0 +1,27 @@
+{{- if .Values.nats.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "koldun.fullname" . }}-test-nats"
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: nats-test
+      image: natsio/nats-box:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Testing NATS connection..."
+          nats server check connection -s {{ .Values.operator.conversation.natsUrl }} || exit 1
+          echo "NATS connection OK"
+
+          echo "Checking JetStream..."
+          nats stream ls -s {{ .Values.operator.conversation.natsUrl }} || exit 1
+          echo "JetStream OK"
+  restartPolicy: Never
+{{- end }}

@@ -1,0 +1,42 @@
+{{- if .Values.minio.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "koldun.fullname" . }}-test-minio"
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: minio-test
+      image: minio/mc:latest
+      command:
+        - /bin/sh
+        - -c
+        - |
+          set -e
+          echo "Testing MinIO connection..."
+
+          # Configure mc alias
+          mc alias set koldun http://{{ include "koldun.fullname" . }}-minio:9000 {{ .Values.minio.rootUser }} {{ .Values.minio.rootPassword }} || exit 1
+
+          # Check if MinIO is accessible
+          mc admin info koldun || exit 1
+          echo "MinIO admin info OK"
+
+          # List buckets
+          mc ls koldun/ || exit 1
+          echo "MinIO buckets accessible"
+
+          # Check for koldun-models bucket
+          if mc ls koldun/koldun-models/ 2>/dev/null; then
+            echo "koldun-models bucket exists"
+          else
+            echo "Creating koldun-models bucket..."
+            mc mb koldun/koldun-models/ || exit 1
+          fi
+
+          echo "MinIO test PASSED"
+  restartPolicy: Never
+{{- end }}

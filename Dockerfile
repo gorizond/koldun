@@ -1,13 +1,25 @@
 ARG DL_REPOSITORY=https://github.com/b4rtaz/distributed-llama.git
-ARG DL_VERSION=v0.16.2
+ARG DL_VERSION=v0.16.3
 
 FROM alpine:latest AS dllama-builder
 ARG DL_REPOSITORY
 ARG DL_VERSION
+ARG TARGETARCH
 RUN apk add --no-cache git make build-base
 WORKDIR /src
 RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
-RUN make dllama && make dllama-api && \
+# TERMUX_VERSION disables -march=native to avoid AVX/AVX2/AVX512 instructions
+# that may not be supported in virtualized environments (like Rancher Desktop Lima VM)
+# Architecture-specific flags:
+# - ARM64: -mno-outline-atomics avoids problematic atomic operations on older ARM
+# - AMD64: standard flags only (SSE intrinsics are required for x86_64)
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      ARCH_FLAGS="-mno-outline-atomics"; \
+    else \
+      ARCH_FLAGS=""; \
+    fi && \
+    TERMUX_VERSION=1 CXXFLAGS="-O2 -fno-tree-vectorize -fno-slp-vectorize $ARCH_FLAGS" make dllama && \
+    TERMUX_VERSION=1 CXXFLAGS="-O2 -fno-tree-vectorize -fno-slp-vectorize $ARCH_FLAGS" make dllama-api && \
     DLLAMA_BIN=$(find . -maxdepth 4 -type f -name dllama -perm /111 | head -n1) && \
     DLLAMA_API_BIN=$(find . -maxdepth 4 -type f -name dllama-api -perm /111 | head -n1) && \
     install -Dm755 "$DLLAMA_BIN" /out/dllama && \

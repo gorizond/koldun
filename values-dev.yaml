@@ -1,0 +1,61 @@
+# Local development values for Rancher Desktop
+image:
+  repository: koldun
+  tag: dev
+  pullPolicy: Never
+
+# Enable NATS subchart
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 1Gi
+    cluster:
+      enabled: false
+
+# Enable MinIO subchart
+minio:
+  enabled: true
+  mode: standalone
+  replicas: 1
+  persistence:
+    enabled: false  # Disable persistence for local dev
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+  rootUser: "minioadmin"
+  rootPassword: "minioadmin"
+  buckets:
+    - name: koldun-models
+      policy: none
+      purge: false
+
+# Configure operator to use subchart services
+operator:
+  conversation:
+    natsUrl: "nats://koldun-nats:4222"
+    kvBucket: "koldun_ttl"
+    ttlPrefix: "nats_ttl_"
+    pollInterval: 10s
+  registry:
+    modelsBucket: "koldun_models"
+    tokensBucket: "koldun_tokens"
+    modelPrefix: "model/"
+    tokenPrefix: "token/"
+  health:
+    port: 8080
+
+# Enable CSI S3 driver for model conversion
+csi-s3:
+  enabled: true
+  storageClass:
+    name: csi-s3
+    singleBucket: koldun-models
+    mounter: geesefs
+    endpoint: "http://koldun-minio:9000"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"

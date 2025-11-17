@@ -995,7 +995,7 @@ func sanitizeIdentifier(value string) string {
 }
 
 func replicaPowerOrDefault(power int32) int32 {
-	if power <= 0 {
+	if power < 0 {
 		return 1
 	}
 	return power

@@ -203,7 +203,8 @@ func TestRootHandlerWorkerStatus(t *testing.T) {
 		h := &rootHandler{}
 		ready, count, endpoints, err := h.workerStatus(&v1.Root{})
 		require.NoError(t, err)
-		require.False(t, ready)
+		// Empty WorkerSelector means standalone mode - workers are ready (no workers needed)
+		require.True(t, ready)
 		require.Zero(t, count)
 		require.Nil(t, endpoints)
 	})
@@ -870,16 +871,6 @@ func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
 	}
 	modelCache.EXPECT().Get("models", "mistral").Return(model, nil).AnyTimes()
 
-	workerCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
-	workers.EXPECT().Cache().Return(workerCache).AnyTimes()
-	workerName := workerResourceName("mistral")
-	worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"}}
-	workerCache.EXPECT().Get("models", workerName).Return(worker, nil)
-
-	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
-	statefulsets.EXPECT().Cache().Return(stsCache).AnyTimes()
-	stsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{Status: appsv1.StatefulSetStatus{ReadyReplicas: 1}}, nil)
-
 	maxRatio := 1.8
 	root := &v1.Root{
 		ObjectMeta: metav1.ObjectMeta{
@@ -891,7 +882,7 @@ func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
 		},
 		Spec: v1.RootSpec{
 			ModelRef:       "mistral-model-pvc",
-			WorkerSelector: map[string]string{"app": "dllama"},
+			WorkerSelector: map[string]string{}, // Empty selector for standalone mode
 			Memory:         &v1.RootMemorySpec{OverheadMaxRatio: &maxRatio},
 		},
 	}
@@ -914,7 +905,7 @@ func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
 
 	annotations := sts.Spec.Template.ObjectMeta.Annotations
 	require.Contains(t, annotations, annotationMemoryPlan)
-	require.Contains(t, annotations[annotationMemoryPlan], "nodes=2", "worker replica fallback should influence memory plan annotation")
+	require.Contains(t, annotations[annotationMemoryPlan], "nodes=1", "standalone mode (zero replica power) should have nodes=1")
 }
 
 func TestRootHandlerEnsureStatefulSetDeletesLegacyDeployment(t *testing.T) {

@@ -8,9 +8,9 @@ import (
 )
 
 const (
-	workerMemoryOverheadRatio = 1.10
-	rootOverheadMaxRatio      = 1.50
-	rootOverheadMinRatio      = 1.20
+	workerMemoryOverheadRatio = 2.50
+	rootOverheadMaxRatio      = 3.00
+	rootOverheadMinRatio      = 2.50
 )
 
 func rootMemoryOverheadRatio(workerReplicas int32, override *float64) float64 {
