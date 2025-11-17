@@ -721,7 +721,28 @@ func (s *Server) ensureQueueSubscription(queueName string, ackWait time.Duration
 	case err == nil:
 		cfg := info.Config
 		if strings.TrimSpace(cfg.FilterSubject) != s.inSubject {
-			return nil, fmt.Errorf("existing consumer %s has unexpected filter %s", queueName, cfg.FilterSubject)
+			// Filter subject mismatch - delete old consumer and recreate
+			s.log.WithFields(logrus.Fields{
+				"consumer":        queueName,
+				"stream":          s.streamName,
+				"old_filter":      cfg.FilterSubject,
+				"expected_filter": s.inSubject,
+			}).Warn("consumer has mismatched filter subject, recreating")
+			if deleteErr := s.js.DeleteConsumer(s.streamName, queueName); deleteErr != nil {
+				return nil, fmt.Errorf("delete consumer %s with mismatched filter: %w", queueName, deleteErr)
+			}
+			// Fall through to create new consumer
+			opts := []nats.SubOpt{
+				nats.ManualAck(),
+				nats.Durable(queueName),
+				nats.BindStream(s.streamName),
+				nats.AckWait(ackWait),
+				nats.MaxAckPending(32),
+			}
+			if inactiveConsumerGrace > 0 {
+				opts = append(opts, nats.InactiveThreshold(inactiveConsumerGrace))
+			}
+			return s.js.QueueSubscribe(s.inSubject, queueName, s.handleMessage, opts...)
 		}
 
 		updated := false
