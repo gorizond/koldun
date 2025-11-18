@@ -1316,9 +1316,9 @@
 
 ---
 
-**Всего сессий**: 45
-**Последнее обновление**: 2025-11-18 12:33
-**Обновлено автоматически**: ✅ (Session 45)
+**Всего сессий**: 49
+**Последнее обновление**: 2025-11-18 13:35
+**Обновлено автоматически**: ✅ (Session 49)
 
 ---
 
@@ -1355,3 +1355,15 @@
 - ⏳ **CPU inference in progress** - request processing (minutes expected)
 - ✅ **Commit**: 2d1704e docs(context): update INDEX.md with Session 47 entry
 - 🎯 **Result**: Complete E2E pipeline working perfectly!
+
+### [2025-11-18_16-10_session_49](2025-11-18_16-10_session_49.md)
+**Session 49 (optimize) — E2E Testing Infrastructure & Documentation**
+- ✅ **Testing guide created** - guides/testing.md (15KB, comprehensive E2E workflow)
+- ✅ **E2E test script** - hack/test-e2e.sh (automated testing, configurable, cleanup)
+- ✅ **E2E CI workflow** - .github/workflows/e2e-test.yaml (k3d + NATS + MinIO)
+- ✅ **Skip inference mode** - fast testing without waiting for CPU (for CI)
+- ✅ **10-step E2E workflow** - documented from prerequisites to cleanup
+- ✅ **CI integration** - automated E2E tests on code/chart changes
+- ✅ **Testing coverage** - Unit ✅ + Integration ✅ + E2E ✅ (complete!)
+- ✅ **Commit**: f1914a9 feat(ci): add E2E testing infrastructure
+- 🎯 **Result**: Complete automated testing infrastructure!
