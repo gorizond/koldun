@@ -121,6 +121,31 @@ actions:
   - Продолжить с того места где остановились
   - Убедиться, что в `next_session.todo` первой строкой стоит задача по тестированию/покрытию
 
+agor_session_history:
+  ВАЖНО: Для понимания полной истории работы можно использовать Agor MCP tools:
+  - mcp__agor__agor_sessions_list(worktreeId="optimize") - список всех Agor сессий в worktree
+  - mcp__agor__agor_sessions_get(sessionId="...") - детали конкретной сессии
+  - mcp__agor__agor_sessions_get_current() - информация о текущей сессии
+
+  Это полезно для:
+  - Понимания genealogy (кто от кого форкнут)
+  - Проверки статуса параллельных сессий
+  - Поиска root session для правильного fork
+  - Отладки проблем с сессиями
+
+  Примеры использования:
+  ```
+  # Получить список последних сессий
+  mcp__agor__agor_sessions_list({worktreeId: "optimize", limit: 10})
+
+  # Проверить текущую сессию и её родителя
+  current = mcp__agor__agor_sessions_get_current()
+  parent = mcp__agor__agor_sessions_get({sessionId: current.forked_from_session_id})
+
+  # Найти все активные сессии
+  mcp__agor__agor_sessions_list({worktreeId: "optimize", status: "running"})
+  ```
+
 outputs:
   - Решение: продолжить существующую сессию ИЛИ начать новую
   - Контекст незавершённой работы (если есть)
