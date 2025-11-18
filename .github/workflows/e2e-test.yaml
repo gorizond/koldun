@@ -152,7 +152,7 @@ jobs:
 
       - name: Install Koldun operator
         run: |
-          # Update values to use test image
+          # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
           operator:
             image:
@@ -167,6 +167,16 @@ jobs:
               tokensBucket: koldun_tokens
 
             minioEndpoint: "http://koldun-minio:9000"
+
+          # Disable chart dependencies (NATS and MinIO already installed manually)
+          nats:
+            enabled: false
+
+          minio:
+            enabled: false
+
+          csi-s3:
+            enabled: false
           EOF
 
           helm upgrade --install koldun charts/koldun/ \
