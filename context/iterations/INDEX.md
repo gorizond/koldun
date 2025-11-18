@@ -1316,9 +1316,9 @@
 
 ---
 
-**Всего сессий**: 50
-**Последнее обновление**: 2025-11-18 16:28
-**Обновлено автоматически**: ✅ (Session 50)
+**Всего сессий**: 51
+**Последнее обновление**: 2025-11-18 19:58
+**Обновлено автоматически**: ✅ (Session 51)
 
 ---
 
@@ -1379,3 +1379,15 @@
 - ✅ **conversationTTL** - 10m auto-cleanup confirmed working
 - ✅ **Commit**: 27a407d fix(ci): correct MinIO mc command in E2E workflow
 - 🎯 **Result**: Post-E2E validation complete, all systems operational!
+
+### [2025-11-18_19-40_session_51](2025-11-18_19-40_session_51.md)
+**Session 51 (optimize) — E2E Tests Debugging: MinIO Bucket Creation Issues**
+- ⚠️ **3 fix attempts** - namespace issue → shell wrapper → inline credentials
+- ✅ **Pushed Session 50 commits** - 3 commits that were missing on GitHub
+- ✅ **Fixed namespace** - minio-mc pod now runs in `koldun` namespace
+- ✅ **Removed shell wrapper** - mc commands called directly (no sh -c)
+- ⚠️ **E2E tests still failing** - root cause unknown after 3 attempts
+- ⚠️ **Logs unavailable** - gh CLI cannot fetch run logs (need web UI)
+- ✅ **Commits**: c2b07f7 (namespace fix), 5f9348a (shell wrapper removal)
+- 🔍 **Blocker**: Need manual inspection via GitHub web UI
+- 🎯 **Next**: Debug via https://github.com/gorizond/koldun/actions/runs/19465227030
