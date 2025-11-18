@@ -152,6 +152,9 @@ jobs:
 
       - name: Install Koldun operator
         run: |
+          # Ensure helm dependencies are available (even if disabled)
+          helm dependency build charts/koldun/ || true
+
           # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
           operator:
@@ -178,6 +181,10 @@ jobs:
           csi-s3:
             enabled: false
           EOF
+
+          # Debug: show what will be installed
+          echo "=== Helm template dry-run ==="
+          helm template koldun charts/koldun/ -n koldun -f /tmp/values-e2e.yaml | grep "kind:" | sort -u
 
           helm upgrade --install koldun charts/koldun/ \
             -n koldun \
