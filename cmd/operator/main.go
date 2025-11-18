@@ -173,8 +173,8 @@ func main() {
 	fs.DurationVar(&llmSidecarTimeout, "llm-sidecar-timeout", 2*time.Minute, "Timeout for sidecar HTTP calls")
 	fs.BoolVar(&llmHealthOnly, "llm-health-only", false, "Disable health server (useful for tests)")
 	fs.StringVar(&llmNamespace, "llm-namespace", os.Getenv("POD_NAMESPACE"), "Namespace containing the dllama resource (defaults to pod namespace when available)")
-	fs.DurationVar(&llmSidecarMonitorInterval, "llm-sidecar-monitor-interval", 15*time.Second, "Interval between dllama-api health probes")
-	fs.IntVar(&llmSidecarFailureThreshold, "llm-sidecar-failure-threshold", 4, "Consecutive failed dllama-api probes before the worker evicts itself")
+	fs.DurationVar(&llmSidecarMonitorInterval, "llm-sidecar-monitor-interval", 60*time.Second, "Interval between dllama-api health probes")
+	fs.IntVar(&llmSidecarFailureThreshold, "llm-sidecar-failure-threshold", 10, "Consecutive failed dllama-api probes before the worker evicts itself")
 
 	fs.StringVar(&dispatcherHash, "dispatcher-hash", "", "Conversation hash this dispatcher serves")
 	fs.StringVar(&dispatcherNATSURL, "dispatcher-nats-url", "nats://nats.default:4222", "NATS endpoint for dispatcher")
