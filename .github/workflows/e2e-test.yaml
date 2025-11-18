@@ -191,18 +191,26 @@ jobs:
             enabled: false
           EOF
 
-          # Debug: show what will be installed
-          echo "=== Helm template dry-run ==="
-          helm template koldun . -n koldun -f /tmp/values-e2e.yaml | grep "kind:" | sort -u
+          # Step 1: Install CRDs separately (avoids rate limiting)
+          echo "=== Installing CRDs ==="
+          for crd in charts/koldun/templates/crds/*.yaml; do
+            kubectl apply -f "$crd"
+          done
 
+          # Wait for CRDs to be established
+          sleep 3
+
+          # Step 2: Install operator without CRDs (faster, fewer API calls)
+          echo "=== Installing operator ==="
           helm upgrade --install koldun . \
             -n koldun \
             -f /tmp/values-e2e.yaml \
             --set operator.image.repository=koldun \
             --set operator.image.tag=test \
             --set operator.image.pullPolicy=Never \
+            --skip-crds \
             --wait \
-            --timeout 5m
+            --timeout 3m
 
           kubectl get pods -n koldun
 
