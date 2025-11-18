@@ -2310,3 +2310,192 @@ func TestStartConsumerCleanupWithEmptyStreamName(t *testing.T) {
 	// Should return immediately
 	srv.startConsumerCleanup(ctx)
 }
+
+func TestNormalizeChatCompletionResponseFixesNegativeIndex(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-123",
+		"object": "chat.completion",
+		"model": "Distributed Model",
+		"choices": [
+			{
+				"index": -386723160,
+				"message": {
+					"role": "assistant",
+					"content": "Hello!"
+				},
+				"finish_reason": "stop"
+			}
+		]
+	}`
+
+	result := normalizeChatCompletionResponse([]byte(input), "koldun/qwen3-0.6b")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	require.Equal(t, "koldun/qwen3-0.6b", resp["model"])
+
+	choices := resp["choices"].([]any)
+	require.Len(t, choices, 1)
+
+	choice := choices[0].(map[string]any)
+	require.Equal(t, float64(0), choice["index"])
+	require.Equal(t, "stop", choice["finish_reason"])
+}
+
+func TestNormalizeChatCompletionResponseFixesEmptyFinishReason(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-456",
+		"object": "chat.completion",
+		"model": "Distributed Model",
+		"choices": [
+			{
+				"index": 0,
+				"message": {
+					"role": "assistant",
+					"content": "World!"
+				},
+				"finish_reason": ""
+			}
+		]
+	}`
+
+	result := normalizeChatCompletionResponse([]byte(input), "test-model")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	require.Equal(t, "test-model", resp["model"])
+
+	choices := resp["choices"].([]any)
+	choice := choices[0].(map[string]any)
+	require.Equal(t, "stop", choice["finish_reason"])
+}
+
+func TestNormalizeChatCompletionResponsePreservesValidData(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-789",
+		"object": "chat.completion",
+		"model": "original-model",
+		"choices": [
+			{
+				"index": 0,
+				"message": {
+					"role": "assistant",
+					"content": "Valid response"
+				},
+				"finish_reason": "length"
+			}
+		],
+		"usage": {
+			"prompt_tokens": 10,
+			"completion_tokens": 5,
+			"total_tokens": 15
+		}
+	}`
+
+	// When requestedModel is empty, model field should remain unchanged
+	result := normalizeChatCompletionResponse([]byte(input), "")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	require.Equal(t, "original-model", resp["model"])
+
+	choices := resp["choices"].([]any)
+	choice := choices[0].(map[string]any)
+	require.Equal(t, float64(0), choice["index"])
+	require.Equal(t, "length", choice["finish_reason"])
+}
+
+func TestNormalizeChatCompletionResponseHandlesMultipleChoices(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-multi",
+		"object": "chat.completion",
+		"model": "Distributed Model",
+		"choices": [
+			{
+				"index": -100,
+				"message": {"role": "assistant", "content": "First"},
+				"finish_reason": ""
+			},
+			{
+				"index": -200,
+				"message": {"role": "assistant", "content": "Second"},
+				"finish_reason": ""
+			},
+			{
+				"index": 2,
+				"message": {"role": "assistant", "content": "Third"},
+				"finish_reason": "stop"
+			}
+		]
+	}`
+
+	result := normalizeChatCompletionResponse([]byte(input), "multi-model")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	choices := resp["choices"].([]any)
+	require.Len(t, choices, 3)
+
+	// First choice: negative index fixed to 0, empty finish_reason fixed to "stop"
+	choice0 := choices[0].(map[string]any)
+	require.Equal(t, float64(0), choice0["index"])
+	require.Equal(t, "stop", choice0["finish_reason"])
+
+	// Second choice: negative index fixed to 1
+	choice1 := choices[1].(map[string]any)
+	require.Equal(t, float64(1), choice1["index"])
+	require.Equal(t, "stop", choice1["finish_reason"])
+
+	// Third choice: valid index preserved, valid finish_reason preserved
+	choice2 := choices[2].(map[string]any)
+	require.Equal(t, float64(2), choice2["index"])
+	require.Equal(t, "stop", choice2["finish_reason"])
+}
+
+func TestNormalizeChatCompletionResponseHandlesInvalidJSON(t *testing.T) {
+	input := []byte("not valid json")
+
+	result := normalizeChatCompletionResponse(input, "model")
+
+	// Should return original data unchanged
+	require.Equal(t, input, result)
+}
+
+func TestNormalizeChatCompletionResponseHandlesMissingChoices(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-no-choices",
+		"object": "chat.completion",
+		"model": "Distributed Model"
+	}`
+
+	result := normalizeChatCompletionResponse([]byte(input), "new-model")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	// Model should still be updated
+	require.Equal(t, "new-model", resp["model"])
+}
+
+func TestNormalizeChatCompletionResponseHandlesNonArrayChoices(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-bad-choices",
+		"object": "chat.completion",
+		"model": "Distributed Model",
+		"choices": "not an array"
+	}`
+
+	result := normalizeChatCompletionResponse([]byte(input), "model")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+
+	// Should still update model
+	require.Equal(t, "model", resp["model"])
+	// Choices remain as-is (invalid type)
+	require.Equal(t, "not an array", resp["choices"])
+}
