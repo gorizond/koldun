@@ -1333,3 +1333,13 @@
 - ⚠️ Root pod перезапустился из-за health check timeout
 - 🎯 Fix: увеличить health check interval или добавить lightweight endpoint
 - 📝 **Important**: CPU inference rules добавлены в 0_REASONING_TASK.md (строки 338-348)
+
+### [2025-11-18_15-09_session_47](2025-11-18_15-09_session_47.md)
+**Session 47 (optimize) — Post-v0.1.0 Architecture Review and Test Fixes**
+- ✅ **Fixed 3 failing tests** after model field addition to response payloads
+- ✅ Architecture verified - clean separation, 109 Go files, 64 tests
+- ✅ GitHub Actions green - all workflows passing
+- ✅ Repository cleanup - no temp files or stale containers
+- ✅ **All tests passing** (100% success rate)
+- ✅ **Commit**: dc2609a test(llm): fix 3 tests after model field addition
+- 🎯 Next: Continue E2E testing work (Qwen3 0.6B, 1 root + 3 workers)
