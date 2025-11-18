@@ -35,8 +35,8 @@ const (
 	defaultSidecarURL              = "http://127.0.0.1:8080"
 	defaultInPrefix                = "in."
 	defaultOutPrefix               = "out."
-	defaultSidecarMonitorInterval  = 15 * time.Second
-	defaultSidecarFailureThreshold = 4
+	defaultSidecarMonitorInterval  = 60 * time.Second  // Increased from 15s for CPU inference tolerance
+	defaultSidecarFailureThreshold = 10                // Increased from 4 to give ~10min grace period
 
 	sidecarModelsPath          = "/v1/models"
 	sidecarChatCompletionsPath = "/v1/chat/completions"

@@ -18,9 +18,11 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -88,7 +90,11 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 	t.Cleanup(ctrl.Finish)
 
 	mockApply := newGomockApply(ctrl)
-	reconciler := &conversationReconciler{apply: mockApply}
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get(gomock.Any(), gomock.Any()).Return(nil, apierrors.NewNotFound(schema.GroupResource{}, "")).AnyTimes()
+	reconciler := &conversationReconciler{apply: mockApply, sessions: sessions}
 
 	const secretName = "nats-credentials"
 	hash := strings.Repeat("abc", 30)
@@ -172,7 +178,11 @@ func TestEnsureSessionDefaultsOptionalFields(t *testing.T) {
 	t.Cleanup(ctrl.Finish)
 
 	applyMock := newGomockApply(ctrl)
-	reconciler := &conversationReconciler{apply: applyMock}
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get(gomock.Any(), gomock.Any()).Return(nil, apierrors.NewNotFound(schema.GroupResource{}, "")).AnyTimes()
+	reconciler := &conversationReconciler{apply: applyMock, sessions: sessions}
 
 	record := &conversation.Record{
 		Hash:        "hash",
@@ -609,6 +619,11 @@ func TestConversationReconcilerSyncCreatesAndDeletesSessions(t *testing.T) {
 		List("", gomock.AssignableToTypeOf(labels.Everything())).
 		Return([]*v1.Session{stale, existing}, nil)
 
+	// ensureSession will check if Session exists before applying
+	cache.EXPECT().
+		Get("tenant-a", "active").
+		Return(existing, nil)
+
 	sessions.EXPECT().
 		Delete("tenant-a", "stale", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).
 		Return(nil)
@@ -744,7 +759,7 @@ func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *
 
 	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
 	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
-	sessions.EXPECT().Cache().Return(cache)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
 
 	matching := &v1.Session{
 		ObjectMeta: metav1.ObjectMeta{
@@ -772,6 +787,11 @@ func TestConversationReconcilerSyncSkipsInvalidRecordsAndHandlesDeleteErrors(t *
 	cache.EXPECT().
 		List("", gomock.AssignableToTypeOf(labels.Everything())).
 		Return([]*v1.Session{matching, stale, noHash}, nil)
+
+	// ensureSession will check if Session exists before applying
+	cache.EXPECT().
+		Get("tenant-b", "envtest-session").
+		Return(matching, nil)
 
 	sessions.EXPECT().
 		Delete("tenant-b", "stale-session", gomock.AssignableToTypeOf(&metav1.DeleteOptions{})).

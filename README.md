@@ -376,6 +376,14 @@ kubectl logs <dispatcher-pod> -n koldun --tail=10
 - Use **smaller models** (TinyLlama 1.1B vs Qwen3 0.6B) for faster iteration
 - Consider **x86_64 production cluster** with GPU for real workloads
 
+**Health Check Tolerance (since v0.1.0):**
+- LLM sidecar health checks now tolerate slow CPU inference:
+  - Check interval: `60s` (previously 15s)
+  - Failure threshold: `10` (previously 4)
+  - Grace period: **~10 minutes** before pod restart
+- This prevents premature evictions when dllama-api blocks during inference
+- See `pkg/servers/llm/server.go` for configuration details
+
 ### Values File (values-dev.yaml)
 
 ```yaml
