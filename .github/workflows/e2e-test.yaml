@@ -199,7 +199,7 @@ jobs:
             --set operator.image.tag=test \
             --set operator.image.pullPolicy=Never \
             --wait \
-            --timeout 3m
+            --timeout 5m
 
           kubectl get pods -n koldun
 
