@@ -1,0 +1,290 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "pkg/**"
+      - "cmd/**"
+      - "charts/**"
+      - "hack/test-e2e.sh"
+      - ".github/workflows/e2e-test.yaml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "pkg/**"
+      - "cmd/**"
+      - "charts/**"
+      - "hack/test-e2e.sh"
+  workflow_dispatch:
+    inputs:
+      skip_inference:
+        description: "Skip CPU inference test (faster)"
+        type: boolean
+        default: true
+
+jobs:
+  e2e-resource-creation:
+    name: E2E Resource Creation Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d version
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Build operator image
+        run: |
+          docker build -t koldun:test .
+
+      - name: Create k3d cluster
+        run: |
+          k3d cluster create koldun-e2e \
+            --image rancher/k3s:v1.28.5-k3s1 \
+            --wait \
+            --timeout 3m
+
+          # Import image to k3d
+          k3d image import koldun:test -c koldun-e2e
+
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Install NATS Helm chart
+        run: |
+          helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+          helm repo update
+
+          kubectl create namespace koldun
+
+          helm install koldun-nats nats/nats \
+            --namespace koldun \
+            --set nats.jetstream.enabled=true \
+            --set nats.jetstream.memoryStore.enabled=true \
+            --set nats.jetstream.memoryStore.maxSize=1Gi \
+            --wait \
+            --timeout 5m
+
+      - name: Install MinIO (minimal setup)
+        run: |
+          kubectl apply -n koldun -f - <<EOF
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: minio-credentials
+          type: Opaque
+          stringData:
+            accessKey: minioadmin
+            secretKey: minioadmin
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: koldun-minio
+          spec:
+            selector:
+              matchLabels:
+                app: minio
+            template:
+              metadata:
+                labels:
+                  app: minio
+              spec:
+                containers:
+                - name: minio
+                  image: minio/minio:RELEASE.2024-01-01T16-36-33Z
+                  args:
+                  - server
+                  - /data
+                  env:
+                  - name: MINIO_ROOT_USER
+                    value: minioadmin
+                  - name: MINIO_ROOT_PASSWORD
+                    value: minioadmin
+                  ports:
+                  - containerPort: 9000
+                  readinessProbe:
+                    httpGet:
+                      path: /minio/health/ready
+                      port: 9000
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: koldun-minio
+          spec:
+            selector:
+              app: minio
+            ports:
+            - port: 9000
+              targetPort: 9000
+          EOF
+
+          kubectl wait --for=condition=available deployment/koldun-minio -n koldun --timeout=2m
+
+      - name: Create test model bucket
+        run: |
+          kubectl run minio-mc --rm -i --restart=Never --image=minio/mc -- \
+            /bin/sh -c "
+              mc alias set myminio http://koldun-minio.koldun:9000 minioadmin minioadmin &&
+              mc mb myminio/koldun-models || true
+            "
+
+      - name: Install Koldun operator
+        run: |
+          # Update values to use test image
+          cat > /tmp/values-e2e.yaml <<EOF
+          operator:
+            image:
+              repository: koldun
+              tag: test
+              pullPolicy: Never
+
+            nats:
+              url: "nats://koldun-nats:4222"
+              kvBucket: koldun_ttl
+              modelsBucket: koldun_models
+              tokensBucket: koldun_tokens
+
+            minioEndpoint: "http://koldun-minio:9000"
+          EOF
+
+          helm upgrade --install koldun charts/koldun/ \
+            -n koldun \
+            -f /tmp/values-e2e.yaml \
+            --set operator.image.repository=koldun \
+            --set operator.image.tag=test \
+            --set operator.image.pullPolicy=Never \
+            --wait \
+            --timeout 3m
+
+          kubectl get pods -n koldun
+
+      - name: Create tiny test Model CR (no actual model download)
+        run: |
+          kubectl apply -n koldun -f - <<EOF
+          apiVersion: koldun.gorizond.io/v1
+          kind: Model
+          metadata:
+            name: test-model
+          spec:
+            localPath: test-model
+            preConverted: true
+            preConvertedSizeBytes: 1000000
+            preConvertedSizeHuman: "1 MB"
+            launchOptions:
+              - "--model"
+              - "/model/test_model.m"
+              - "--tokenizer"
+              - "/model/test_tokenizer.t"
+            objectStorage:
+              endpoint: http://koldun-minio:9000
+              bucketForSource: koldun-models
+              bucketForConvert: koldun-models
+              secretRef:
+                name: minio-credentials
+                namespace: koldun
+            conversion:
+              weightsFloatType: q40
+          EOF
+
+          # Mark as Ready manually (no actual model file)
+          kubectl patch model test-model -n koldun --type=merge -p '{"status":{"conditions":[{"type":"Ready","status":"True","reason":"TestModel","message":"Test model for E2E"}],"downloadState":"Succeeded"}}'
+
+      - name: Create test Ingress CR
+        run: |
+          kubectl apply -n koldun -f - <<EOF
+          apiVersion: koldun.gorizond.io/v1
+          kind: Ingress
+          metadata:
+            name: test-ingress
+          spec:
+            backend:
+              image: koldun:test
+              imagePullPolicy: Never
+              dispatcherImage: koldun:test
+              rootImage: koldun:test
+              workerImage: koldun:test
+              allowAnonymous: true
+              conversationTTL: 5m
+              responseTimeout: 1m
+              replicaPower: 1
+              sessionScaling:
+                minDllamas: 1
+                maxDllamas: 1
+                scaleUpBacklog: 1
+                scaleDownIdleSeconds: 60
+              nats:
+                url: "nats://koldun-nats:4222"
+                kvBucket: koldun_ttl
+                modelsBucket: koldun_models
+                tokensBucket: koldun_tokens
+                modelPrefix: "model/"
+                tokenPrefix: "token/"
+            route:
+              host: test.koldun.local
+            service:
+              port: 8082
+          EOF
+
+          kubectl wait --for=condition=Ready ingress.koldun.gorizond.io/test-ingress -n koldun --timeout=2m
+
+      - name: Run E2E test (resource creation only)
+        env:
+          NAMESPACE: koldun
+          MODEL_NAME: test-model
+          INGRESS_NAME: test-ingress
+          SKIP_INFERENCE: ${{ github.event.inputs.skip_inference || 'true' }}
+          TIMEOUT: "120"
+          CLEANUP: "false"
+        run: |
+          chmod +x hack/test-e2e.sh
+          ./hack/test-e2e.sh
+
+      - name: Collect debug info on failure
+        if: failure()
+        run: |
+          echo "=== Pods ==="
+          kubectl get pods -n koldun -o wide
+
+          echo "=== CRDs ==="
+          kubectl get sessions,dllamas,roots,workers -n koldun || true
+
+          echo "=== Operator logs ==="
+          kubectl logs -n koldun deployment/koldun --tail=100 || true
+
+          echo "=== Backend logs ==="
+          kubectl logs -n koldun deployment/test-ingress-backend --tail=100 || true
+
+          echo "=== Events ==="
+          kubectl get events -n koldun --sort-by='.lastTimestamp' | tail -30
+
+          echo "=== k3d logs ==="
+          docker logs k3d-koldun-e2e-server-0 2>&1 | tail -100 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          k3d cluster delete koldun-e2e || true
