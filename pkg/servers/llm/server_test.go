@@ -716,7 +716,7 @@ func TestExecuteOncePublishesResponse(t *testing.T) {
 
 	msg, err := sub.NextMsg(time.Second)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"id":"once-success"}`, string(msg.Data))
+	require.JSONEq(t, `{"id":"once-success","model":"model"}`, string(msg.Data))
 }
 
 func TestExecuteOncePublishesErrorOnFailure(t *testing.T) {
@@ -1192,10 +1192,11 @@ func TestEnsureQueueSubscriptionRejectsWrongFilterSubject(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Attempt to subscribe should fail due to filter mismatch
-	_, err = srv.ensureQueueSubscription(queue, 100*time.Millisecond)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unexpected filter")
+	// Attempt to subscribe should auto-recreate consumer with correct filter
+	// The code now logs a warning and recreates the consumer instead of failing
+	sub, err := srv.ensureQueueSubscription(queue, 100*time.Millisecond)
+	require.NoError(t, err)
+	require.NotNil(t, sub)
 
 	if srv.nc != nil {
 		_ = srv.nc.Drain()
@@ -1758,7 +1759,7 @@ func TestHandleMessagePublishesStateAndResponse(t *testing.T) {
 
 	respMsg, err := respSub.NextMsg(time.Second)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"id":"resp-1"}`, string(respMsg.Data))
+	require.JSONEq(t, `{"id":"resp-1","model":"tenant/model"}`, string(respMsg.Data))
 
 	idleMsg, err := stateSub.NextMsg(time.Second)
 	require.NoError(t, err)
