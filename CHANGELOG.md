@@ -5,6 +5,44 @@ All notable changes to Koldun Platform will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] - 2025-11-18
+
+### Added
+- **OpenAI API Compatibility**: Full support for `/v1/models` and `/v1/models/{model}` endpoints
+- **Standards Compliance**: Implemented all P0 OpenAI API requirements
+- **Client Libraries**: Verified compatibility with OpenAI Python client, LangChain, and LiteLLM
+- **Test Suite**: Added `test_openai_compat.py` for continuous compatibility validation
+- **Documentation**: Enhanced README with E2E testing instructions and ARM64 requirements
+
+### Changed
+- **API Stability**: Promoted OpenAI-compatible API endpoints from beta to stable
+- **Model Naming**: Consistent `koldun/{model}` namespace across all endpoints
+
+### Fixed
+- Response field normalization for OpenAI client compatibility
+- Model metadata exposure in list and retrieve endpoints
+- HTTP method handling (GET/POST/OPTIONS) for standards compliance
+- **Session ReplicaPower persistence**: Conversation controller now preserves manual Session spec updates (e.g., admin overrides via kubectl) instead of overwriting them from NATS records
+
+### Notes
+- This is the first minor release with production-ready OpenAI API compatibility
+- Tested with standard OpenAI Python client v1.x
+- CPU inference remains experimental (recommended: GPU deployment for production)
+
+## [0.0.8] - 2025-11-17
+
+### Added
+- OpenAI API compatibility audit document (context/OPENAI_COMPATIBILITY_AUDIT.md)
+- Response normalization for dllama-api outputs in LLM server
+- Comprehensive unit tests for response normalization
+
+### Fixed
+- `/v1/models` response now includes required OpenAI fields (`created`, `owned_by`)
+- Chat completion responses normalize negative `index` values to valid integers
+- Chat completion responses fix empty `finish_reason` to "stop"
+- Model name preservation in responses (no longer returns "Distributed Model")
+- Improved compatibility with Python openai library and standard OpenAI clients
+
 ## [0.0.7] - 2025-11-17
 
 ### Added
@@ -60,6 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[0.1.0]: https://github.com/gorizond/koldun/compare/v0.0.8...v0.1.0
+[0.0.8]: https://github.com/gorizond/koldun/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/gorizond/koldun/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/gorizond/koldun/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/gorizond/koldun/compare/v0.0.4...v0.0.5

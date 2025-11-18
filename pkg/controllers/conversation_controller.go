@@ -253,6 +253,20 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 		return fmt.Errorf("images missing for hash %s", record.Hash)
 	}
 
+	// Check if Session already exists
+	existing, err := r.sessions.Cache().Get(record.Namespace, record.SessionName())
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	// If Session exists and has different ReplicaPower than record, keep Session's value
+	// This allows admin to override replicaPower via kubectl without being overwritten
+	desiredReplicaPower := record.ReplicaPower
+	if existing != nil && existing.Spec.ReplicaPower > 0 && existing.Spec.ReplicaPower != record.ReplicaPower {
+		// Session was manually updated or has different config - preserve it
+		desiredReplicaPower = existing.Spec.ReplicaPower
+	}
+
 	hashLabelValue := truncateName(record.Hash, validation.LabelValueMaxLength)
 	labels := map[string]string{
 		labelConversationHash: hashLabelValue,
@@ -275,7 +289,7 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 				Kind:     "Model",
 				Name:     modelName,
 			},
-			ReplicaPower:            record.ReplicaPower,
+			ReplicaPower:            desiredReplicaPower,
 			RootImage:               record.RootImage,
 			WorkerImage:             record.WorkerImage,
 			DispatcherImage:         record.DispatcherImage,
