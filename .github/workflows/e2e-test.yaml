@@ -161,6 +161,9 @@ jobs:
           cd charts/koldun/
           helm dependency build
 
+          # Pre-install CRDs separately (avoids rate limiting during helm upgrade --wait)
+          kubectl apply -f crds/
+
           # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
           operator:
