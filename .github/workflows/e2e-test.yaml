@@ -147,7 +147,7 @@ jobs:
       - name: Create test model bucket
         run: |
           kubectl run minio-mc --rm -i --restart=Never --image=minio/mc -- \
-            /bin/sh -c "
+            sh -c "
               mc alias set myminio http://koldun-minio.koldun:9000 minioadmin minioadmin &&
               mc mb myminio/koldun-models || true
             "
