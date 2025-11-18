@@ -1291,6 +1291,31 @@
 
 ---
 
-**Всего сессий**: 43
-**Последнее обновление**: 2025-11-18 11:48
-**Обновлено автоматически**: ✅ (Session 43)
+### [2025-11-18_14-02_session_44](2025-11-18_14-02_session_44.md)
+**Session 44 — v0.1.0 Release - Merge and Tag**
+- ✅ **Git Merge**: optimize → main (merge commit b9f0e92)
+- ✅ **Git Tag**: v0.1.0 created and pushed to origin
+- ✅ **Helm Chart**: Updated version to 0.1.0 (commit 247e4db)
+- ✅ **Cleanup**: Removed 5 old session files, 1 K8s ReplicaSet
+- ⏳ **Docker Build**: v0.1.0 image building (PID 12835)
+- 📝 **Files Changed**: 8 files in merge, 1976 insertions, 10 deletions
+- 🎯 Next: Push Docker images, create GitHub Release, test deployment
+
+---
+
+### [2025-11-18_12-33_session_45](2025-11-18_12-33_session_45.md)
+**Session 45 — v0.1.0 Docker Images and Local Deployment Test**
+- ✅ **Docker Build**: Verified successful (image: 2034e4a236e5, size: 73.8MB)
+- ✅ **Local Deployment**: Helm upgrade to v0.1.0 successful (revision 13)
+- ✅ **OpenAI API Test**: /v1/models endpoint validated (Qwen3 0.6B detected)
+- ✅ **Health Checks**: All endpoints responding (healthz, readyz)
+- ⚠️ **Docker Push**: BLOCKED - requires GitHub authentication
+- ⚠️ **GitHub Release**: BLOCKED - requires GitHub authentication
+- 📝 **Manual Steps**: Documented authentication and push procedures
+- 🎯 Next: User authenticates, push images, create GitHub Release
+
+---
+
+**Всего сессий**: 45
+**Последнее обновление**: 2025-11-18 12:33
+**Обновлено автоматически**: ✅ (Session 45)
