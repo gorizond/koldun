@@ -152,6 +152,11 @@ jobs:
 
       - name: Install Koldun operator
         run: |
+          # Add helm repos for dependencies
+          helm repo add minio https://charts.min.io/
+          helm repo add yandex-cloud https://yandex-cloud.github.io/k8s-csi-s3/charts
+          helm repo update
+
           # Build helm dependencies (required for Chart.yaml validation)
           cd charts/koldun/
           helm dependency build
