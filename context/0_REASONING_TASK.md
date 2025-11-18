@@ -346,6 +346,12 @@ curl http://localhost:8080/healthz
 - **Один запрос за раз** на локальной машине - дождаться завершения перед следующим
 - При timeout ошибке - НЕ повторять запрос сразу, проверить состояние системы
 
+**ВАЖНОЕ ОТКРЫТИЕ (Session 17):**
+- **LLM sidecar health check timeout** - dllama-api не отвечает на health checks во время CPU inference
+- Health check слишком агрессивный (4 failures → evict attempt → fatal error)
+- Решение: увеличить interval или добавить lightweight health endpoint
+- Ссылка: context/iterations/2025-11-18_12-48_session_17.md
+
 **Критерии успеха:**
 - [ ] Model CR скачивает модель в MinIO
 - [ ] Ingress CR создаёт работающий dispatcher

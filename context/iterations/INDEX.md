@@ -1319,3 +1319,17 @@
 **Всего сессий**: 45
 **Последнее обновление**: 2025-11-18 12:33
 **Обновлено автоматически**: ✅ (Session 45)
+
+---
+
+## Optimize Branch (Post-v0.1.0 Development)
+
+### [2025-11-18_12-48_session_17](2025-11-18_12-48_session_17.md)
+**Session 17 (optimize) — Scheduled Run: 3 Workers Success + Health Check Issue**
+- ✅ **MULTI-WORKER PROBLEM SOLVED!** 3 workers стабильно работают (replicaPower=2)
+- ✅ Full topology: 1 Root + 3 Workers + 1 Dispatcher (все Running)
+- ✅ Session автоматически создаётся через Ingress API
+- ⚠️ **NEW ISSUE**: LLM sidecar health check too aggressive для CPU inference (>3 мин на запрос)
+- ⚠️ Root pod перезапустился из-за health check timeout
+- 🎯 Fix: увеличить health check interval или добавить lightweight endpoint
+- 📝 **Important**: CPU inference rules добавлены в 0_REASONING_TASK.md (строки 338-348)
