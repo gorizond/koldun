@@ -407,6 +407,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		metrics.Handler().ServeHTTP(w, r)
 	})
+	mux.HandleFunc("/v1/models/", s.handleModel) // Single model (must be before /v1/models)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/chat/completions", s.handleChatCompletions)
 
@@ -559,6 +560,49 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   data,
 	})
+}
+
+func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET, OPTIONS")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract model ID from path: /v1/models/{model}
+	modelID := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	if modelID == "" || modelID == "/" {
+		http.Error(w, "model ID required", http.StatusBadRequest)
+		return
+	}
+
+	model, err := s.resolveModel(modelID)
+	if err != nil {
+		s.log.WithError(err).WithField("model", modelID).Warn("resolve model")
+		writeError(w, http.StatusNotFound, fmt.Sprintf("model %s not found", modelID))
+		return
+	}
+
+	// OpenAI-compatible response with Koldun extensions
+	modelData := map[string]any{
+		"id":       fmt.Sprintf("%s/%s", model.Namespace, model.Name),
+		"object":   "model",
+		"created":  time.Now().Unix(), // OpenAI required field
+		"owned_by": "koldun",          // OpenAI required field
+	}
+	// Koldun extensions (non-standard but useful)
+	if model.DisplayName != "" && model.DisplayName != model.Name {
+		modelData["name"] = model.DisplayName
+	}
+	if model.Namespace != "" {
+		modelData["namespace"] = model.Namespace
+	}
+	if model.ConversionSizeBytes > 0 {
+		modelData["size_bytes"] = model.ConversionSizeBytes
+		modelData["size_human"] = model.ConversionSizeHuman
+	}
+
+	writeJSON(w, http.StatusOK, modelData)
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
