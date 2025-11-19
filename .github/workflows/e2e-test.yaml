@@ -209,9 +209,9 @@ jobs:
           helm upgrade --install koldun . \
             -n koldun \
             -f /tmp/values-e2e.yaml \
-            --set operator.image.repository=koldun \
-            --set operator.image.tag=test \
-            --set operator.image.pullPolicy=Never \
+            --set image.repository=koldun \
+            --set image.tag=test \
+            --set image.pullPolicy=Never \
             --skip-crds \
             --wait \
             --timeout 3m
