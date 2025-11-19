@@ -221,6 +221,17 @@ jobs:
       - name: Create tiny test Model CR (no actual model download)
         run: |
           kubectl apply -n koldun -f - <<EOF
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-model-pvc
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 1Gi
+          ---
           apiVersion: koldun.gorizond.io/v1
           kind: Model
           metadata:
@@ -229,6 +240,7 @@ jobs:
             sourceUrl: https://example.com/test-model.bin
             localPath: test-model
             preConverted: true
+            preConvertedPVCName: test-model-pvc
             preConvertedSizeBytes: 1000000
             preConvertedSizeHuman: "1 MB"
             launchOptions:
@@ -246,9 +258,6 @@ jobs:
             conversion:
               weightsFloatType: q40
           EOF
-
-          # Mark as Ready manually (no actual model file)
-          kubectl patch model test-model -n koldun --type=merge -p '{"status":{"conditions":[{"type":"Ready","status":"True","reason":"TestModel","message":"Test model for E2E"}],"downloadState":"Succeeded"}}'
 
       - name: Create test Ingress CR
         run: |
