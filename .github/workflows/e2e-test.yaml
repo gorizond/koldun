@@ -194,6 +194,11 @@ jobs:
           # CRDs live under templates/crd/bases when --skip-crds is set
           for crd in templates/crd/bases/*.yaml; do
             kubectl apply -f "$crd"
+            # Tag CRDs with Helm metadata so --skip-crds installs succeed
+            kubectl annotate --overwrite -f "$crd" \
+              meta.helm.sh/release-name=koldun \
+              meta.helm.sh/release-namespace=koldun
+            kubectl label --overwrite -f "$crd" app.kubernetes.io/managed-by=Helm
           done
 
           # Wait for CRDs to be established
