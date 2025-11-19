@@ -146,9 +146,10 @@ jobs:
 
       - name: Create test model bucket
         run: |
-          # Use mc with inline credentials (no alias needed for simple operations)
+          # Configure mc alias once per pod and create bucket idempotently
           kubectl run minio-mc -n koldun --rm -i --restart=Never --image=minio/mc -- \
-            mb --ignore-existing http://minioadmin:minioadmin@koldun-minio:9000/koldun-models || true
+            /bin/sh -c "mc alias set local http://koldun-minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/koldun-models" \
+            || true
 
       - name: Install Koldun operator
         run: |
@@ -160,9 +161,6 @@ jobs:
           # Build helm dependencies (required for Chart.yaml validation)
           cd charts/koldun/
           helm dependency build
-
-          # Pre-install CRDs separately (avoids rate limiting during helm upgrade --wait)
-          kubectl apply -f crds/
 
           # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
@@ -193,7 +191,8 @@ jobs:
 
           # Step 1: Install CRDs separately (avoids rate limiting)
           echo "=== Installing CRDs ==="
-          for crd in charts/koldun/templates/crds/*.yaml; do
+          # CRDs live under templates/crd/bases when --skip-crds is set
+          for crd in templates/crd/bases/*.yaml; do
             kubectl apply -f "$crd"
           done
 
