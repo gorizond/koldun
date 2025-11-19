@@ -150,11 +150,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// 14GiB / 4 nodes = 3.5GiB per node
 			// Root: 3.5GiB * 2.9167 (decay for 3 workers) ≈ 10.2GiB
 			// Worker: 3.5GiB * 2.50 = 8.75GiB
-			wantRootMiMin:       10000,
-			wantRootMiMax:       10500,
-			wantWorkerMiMin:     8700,
-			wantWorkerMiMax:     9000,
-			wantOk:              true,
+			wantRootMiMin:   10000,
+			wantRootMiMax:   10500,
+			wantWorkerMiMin: 8700,
+			wantWorkerMiMax: 9000,
+			wantOk:          true,
 		},
 		{
 			name:                "small model with 1 worker",
@@ -164,11 +164,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// 1GiB / 2 nodes = 512Mi per node
 			// Root: 512Mi * 3.00 = 1536Mi
 			// Worker: 512Mi * 2.50 = 1280Mi
-			wantRootMiMin:       1500,
-			wantRootMiMax:       1600,
-			wantWorkerMiMin:     1250,
-			wantWorkerMiMax:     1350,
-			wantOk:              true,
+			wantRootMiMin:   1500,
+			wantRootMiMax:   1600,
+			wantWorkerMiMin: 1250,
+			wantWorkerMiMax: 1350,
+			wantOk:          true,
 		},
 		{
 			name:                "large model 70B with 7 workers",
@@ -178,11 +178,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// 140GiB / 8 nodes = 17.5GiB per node
 			// Root: 17.5GiB * 2.50 (min ratio) = 43.75GiB
 			// Worker: 17.5GiB * 2.50 = 43.75GiB
-			wantRootMiMin:       44000,
-			wantRootMiMax:       45000,
-			wantWorkerMiMin:     44000,
-			wantWorkerMiMax:     45000,
-			wantOk:              true,
+			wantRootMiMin:   44000,
+			wantRootMiMax:   45000,
+			wantWorkerMiMin: 44000,
+			wantWorkerMiMax: 45000,
+			wantOk:          true,
 		},
 		{
 			name:                "zero size returns not ok",
@@ -220,11 +220,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// Standalone mode: 1GiB / 1 node = 1GiB per node
 			// Root: 1GiB * 3.00 = 3072Mi
 			// Worker: 1GiB * 2.50 = 2560Mi
-			wantRootMiMin:       3000,
-			wantRootMiMax:       3200,
-			wantWorkerMiMin:     2500,
-			wantWorkerMiMax:     2700,
-			wantOk:              true,
+			wantRootMiMin:   3000,
+			wantRootMiMax:   3200,
+			wantWorkerMiMin: 2500,
+			wantWorkerMiMax: 2700,
+			wantOk:          true,
 		},
 		{
 			name:                "tiny model rounds up to minimum",
@@ -245,11 +245,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// 8GiB / 3 nodes = 2.67GiB per node
 			// Root: 2.67GiB * 5.0 (override) = 13.35GiB
 			// Worker: 2.67GiB * 2.50 = 6.675GiB (but clamped to root)
-			wantRootMiMin:       13000,
-			wantRootMiMax:       14000,
-			wantWorkerMiMin:     6600,
-			wantWorkerMiMax:     6900,
-			wantOk:              true,
+			wantRootMiMin:   13000,
+			wantRootMiMax:   14000,
+			wantWorkerMiMin: 6600,
+			wantWorkerMiMax: 6900,
+			wantOk:          true,
 		},
 		{
 			name:                "root memory not less than worker",
@@ -260,11 +260,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// Override 1.1 < minRatio 2.50, so clamped to 2.50
 			// Root: 341Mi * 2.50 = 853Mi
 			// Worker: 341Mi * 2.50 = 853Mi
-			wantRootMiMin:       850,
-			wantRootMiMax:       860,
-			wantWorkerMiMin:     850,
-			wantWorkerMiMax:     860,
-			wantOk:              true,
+			wantRootMiMin:   850,
+			wantRootMiMax:   860,
+			wantWorkerMiMin: 850,
+			wantWorkerMiMax: 860,
+			wantOk:          true,
 		},
 		{
 			name:                "override smaller than worker ratio clamps root",
@@ -275,11 +275,11 @@ func TestCalculateMemoryRequests(t *testing.T) {
 			// 1.9Mi / 2 nodes = 0.95Mi per node
 			// Root: 0.95Mi * 2.50 = 2.375Mi -> 3Mi
 			// Worker: 0.95Mi * 2.50 = 2.375Mi -> 3Mi
-			wantRootMiMin:       2,
-			wantRootMiMax:       4,
-			wantWorkerMiMin:     2,
-			wantWorkerMiMax:     4,
-			wantOk:              true,
+			wantRootMiMin:   2,
+			wantRootMiMax:   4,
+			wantWorkerMiMin: 2,
+			wantWorkerMiMax: 4,
+			wantOk:          true,
 		},
 		{
 			name:                "max worker replicas uses minimum allocations",
