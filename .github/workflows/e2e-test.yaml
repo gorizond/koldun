@@ -164,19 +164,21 @@ jobs:
 
           # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
-          operator:
-            image:
-              repository: koldun
-              tag: test
-              pullPolicy: Never
+          image:
+            repository: koldun
+            tag: test
+            pullPolicy: Never
 
-            nats:
-              url: "nats://koldun-nats:4222"
+          operator:
+            conversation:
+              natsUrl: "nats://koldun-nats:4222"
               kvBucket: koldun_ttl
+              ttlPrefix: "nats_ttl_"
+            registry:
               modelsBucket: koldun_models
               tokensBucket: koldun_tokens
-
-            minioEndpoint: "http://koldun-minio:9000"
+              modelPrefix: "model/"
+              tokenPrefix: "token/"
 
           # Disable chart dependencies (NATS and MinIO already installed manually)
           nats:
