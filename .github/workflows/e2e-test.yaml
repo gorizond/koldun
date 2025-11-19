@@ -226,6 +226,7 @@ jobs:
           metadata:
             name: test-model
           spec:
+            sourceUrl: https://example.com/test-model.bin
             localPath: test-model
             preConverted: true
             preConvertedSizeBytes: 1000000
