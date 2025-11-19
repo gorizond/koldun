@@ -79,9 +79,9 @@ jobs:
 
           helm install koldun-nats nats/nats \
             --namespace koldun \
-            --set nats.jetstream.enabled=true \
-            --set nats.jetstream.memoryStore.enabled=true \
-            --set nats.jetstream.memoryStore.maxSize=1Gi \
+            --set jetstream.enabled=true \
+            --set jetstream.memoryStore.enabled=true \
+            --set jetstream.memoryStore.maxSize=1Gi \
             --wait \
             --timeout 5m
 
