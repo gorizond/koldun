@@ -20,7 +20,6 @@ bin/
 
 /reasoning
 context/
-!context/iterations/
 /CLAUDE.md
 hack/localstack/kubeconfig/kubeconfig
 charts/koldun/charts/*.tgz
