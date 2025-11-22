@@ -19,7 +19,11 @@ koldun.test
 bin/
 
 /reasoning
-/context
+context/
+!context/iterations/
 /CLAUDE.md
 hack/localstack/kubeconfig/kubeconfig
 charts/koldun/charts/*.tgz
+
+# Local secrets (should use k8s/examples/secret-minio.yaml template instead)
+minio-secret.yaml

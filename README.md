@@ -423,6 +423,302 @@ csi-s3:
     secretKey: "minioadmin"
 ```
 
+## CI/CD End-to-End Testing (GitHub Actions)
+
+Koldun includes an automated E2E test workflow that validates the complete stack on every push/PR. This workflow tests the critical path: CRD installation → NATS/MinIO setup → Model creation → Ingress backend → resource reconciliation.
+
+### Workflow Overview
+
+The E2E test (`.github/workflows/e2e-test.yaml`) runs on Ubuntu with k3d and validates:
+- CRD installation with split Helm install (avoids rate limiting)
+- NATS JetStream enablement
+- MinIO object storage setup
+- Model CR with pre-converted artifacts
+- Ingress CR creation and backend deployment
+- Session/Dllama resource auto-creation
+- Operator NATS registry synchronization
+
+**Key Features:**
+- Fast execution (~7 minutes)
+- Split CRD installation (separate from Helm chart)
+- Pre-converted model support (skips download/conversion)
+- Optional CPU inference test (`SKIP_INFERENCE=true` by default)
+
+### How It Works
+
+1. **Cluster Setup**: Creates k3d cluster with k3s v1.28.5
+2. **Infrastructure**: Installs NATS with JetStream + MinIO manually (not via Helm deps)
+3. **CRD Installation**: Applies CRDs separately with Helm annotations
+4. **Operator Install**: Helm install with `--skip-crds` flag (faster, fewer API calls)
+5. **Resource Creation**: Creates test Model CR with `preConverted: true` and Ingress CR
+6. **Validation**: Runs `hack/test-e2e.sh` to verify resource reconciliation
+
+### Running E2E Tests Locally
+
+You can run the same E2E workflow locally with k3d:
+
+```bash
+# 1. Create k3d cluster
+k3d cluster create koldun-e2e \
+  --image rancher/k3s:v1.28.5-k3s1 \
+  --wait \
+  --timeout 3m
+
+# 2. Build and import operator image
+docker build -t koldun:test .
+k3d image import koldun:test -c koldun-e2e
+
+# 3. Install NATS with JetStream
+helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+kubectl create namespace koldun
+helm install koldun-nats nats/nats \
+  --namespace koldun \
+  --set config.jetstream.enabled=true \
+  --set config.jetstream.memoryStore.enabled=true \
+  --set config.jetstream.memoryStore.maxSize=1Gi \
+  --wait
+
+# 4. Install MinIO
+kubectl apply -n koldun -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: koldun-minio
+spec:
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2024-01-01T16-36-33Z
+        args: [server, /data]
+        env:
+        - name: MINIO_ROOT_USER
+          value: minioadmin
+        - name: MINIO_ROOT_PASSWORD
+          value: minioadmin
+        ports:
+        - containerPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: koldun-minio
+spec:
+  selector:
+    app: minio
+  ports:
+  - port: 9000
+EOF
+
+kubectl wait --for=condition=available deployment/koldun-minio -n koldun --timeout=2m
+
+# 5. Create MinIO bucket
+kubectl run minio-mc -n koldun --rm -i --restart=Never --image=minio/mc -- \
+  /bin/sh -c "mc alias set local http://koldun-minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/koldun-models"
+
+# 6. Install Koldun operator (split CRD install)
+cd charts/koldun/
+helm dependency build
+
+# Apply CRDs first
+for crd in templates/crd/bases/*.yaml; do
+  kubectl apply -f "$crd"
+  kubectl annotate --overwrite -f "$crd" \
+    meta.helm.sh/release-name=koldun \
+    meta.helm.sh/release-namespace=koldun
+  kubectl label --overwrite -f "$crd" app.kubernetes.io/managed-by=Helm
+done
+
+# Create values for E2E
+cat > /tmp/values-e2e.yaml <<EOF
+image:
+  repository: koldun
+  tag: test
+  pullPolicy: Never
+
+operator:
+  conversation:
+    natsUrl: "nats://koldun-nats:4222"
+    kvBucket: koldun_ttl
+  registry:
+    modelsBucket: koldun_models
+    tokensBucket: koldun_tokens
+
+nats:
+  enabled: false
+minio:
+  enabled: false
+csi-s3:
+  enabled: false
+EOF
+
+# Install operator without CRDs
+helm upgrade --install koldun . \
+  -n koldun \
+  -f /tmp/values-e2e.yaml \
+  --skip-crds \
+  --wait
+
+# 7. Create test resources
+kubectl apply -n koldun -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-model-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: test-model
+spec:
+  sourceUrl: https://example.com/test-model.bin
+  localPath: test-model
+  preConverted: true
+  preConvertedPVCName: test-model-pvc
+  preConvertedSizeBytes: 1000000
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-credentials
+---
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+spec:
+  backend:
+    image: koldun:test
+    imagePullPolicy: Never
+    allowAnonymous: true
+    conversationTTL: 5m
+    replicaPower: 1
+    nats:
+      url: "nats://koldun-nats:4222"
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+  service:
+    port: 8082
+EOF
+
+# 8. Run E2E validation script
+NAMESPACE=koldun \
+MODEL_NAME=test-model \
+INGRESS_NAME=test-ingress \
+SKIP_INFERENCE=true \
+  ./hack/test-e2e.sh
+
+# 9. Cleanup
+k3d cluster delete koldun-e2e
+```
+
+### Pre-Converted Model Requirements
+
+The E2E workflow uses `preConverted: true` to skip model download/conversion. This requires:
+
+1. **PVC with model artifacts**: Create a PVC containing the converted model files
+2. **Model CR configuration**:
+   ```yaml
+   spec:
+     preConverted: true
+     preConvertedPVCName: my-model-pvc
+     preConvertedSizeBytes: 1000000  # Actual model size
+     preConvertedSizeHuman: "1 MB"   # Optional human-readable size
+   ```
+3. **Launch options**: Specify model and tokenizer paths:
+   ```yaml
+   spec:
+     launchOptions:
+       - "--model"
+       - "/model/model.m"
+       - "--tokenizer"
+       - "/model/tokenizer.t"
+   ```
+
+**When to use pre-converted models:**
+- CI/CD pipelines (faster tests)
+- Models already converted outside Koldun
+- Testing without Hugging Face access
+- Airgapped environments
+
+### E2E Test Success Criteria
+
+The workflow passed successfully (run `19503997082`) with these validations:
+- ✅ All CRDs installed without errors
+- ✅ NATS JetStream enabled and healthy
+- ✅ MinIO bucket created and accessible
+- ✅ Model CR reaches `Ready` condition (pre-converted)
+- ✅ Ingress CR creates backend Deployment
+- ✅ Backend pod starts and reports healthy
+- ✅ Operator synchronizes NATS configuration
+- ✅ Session/Dllama resources auto-created
+- ✅ No crash loops or reconciliation errors
+
+### Troubleshooting E2E Tests
+
+**CRD installation fails with "too many requests"**:
+- Use split install: apply CRDs first, then `helm install --skip-crds`
+- The workflow already implements this fix
+
+**Backend pod crashes with "nats: no responders available"**:
+- Ensure JetStream is enabled in NATS Helm values:
+  ```yaml
+  config:
+    jetstream:
+      enabled: true
+  ```
+
+**Operator pod logs "registry sync disabled"**:
+- Check `operator.conversation.natsUrl` and `operator.registry.*` in Helm values
+- Must match the chart schema (not the old `backend.*` path)
+
+**Model CR stuck in Pending**:
+- For E2E tests, use `preConverted: true` with a stub PVC
+- For real models, ensure MinIO credentials and network connectivity
+
+**E2E script timeout**:
+- Increase `TIMEOUT` env var (default: 120 seconds)
+- Check `kubectl get events -n koldun` for reconciliation errors
+
+### CI Workflow Triggers
+
+The E2E workflow runs on:
+- Every push to any branch (if paths match)
+- Pull requests targeting `main`
+- Manual dispatch via GitHub Actions UI
+
+**Workflow dispatch options:**
+- `skip_inference`: Skip slow CPU inference test (default: `true`)
+
+Example manual run:
+```bash
+gh workflow run e2e-test.yaml \
+  --ref optimize \
+  -f skip_inference=true
+```
+
+### Next Steps After E2E Pass
+
+Once E2E tests pass, you can:
+1. Add real model examples to `k8s/examples/`
+2. Enable CPU inference test (`SKIP_INFERENCE=false`)
+3. Add integration tests for dispatcher state management
+4. Document troubleshooting steps in this README
+5. Create production-ready Helm values examples
+
 ## Local Integration Stack (docker-compose)
 Run the NATS + MinIO + single-node k3s stack whenever you need a reproducible environment for ingress/dispatcher tests without depending on host networking quirks.
 

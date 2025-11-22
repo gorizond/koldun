@@ -33,3 +33,10 @@ spec:
     memory: 2Gi
     chunkMaxMiB: 256
     concurrency: 4
+  conversion:
+    converterVersion: v0.16.2
+    image: python:3.11-slim
+    memory: 4Gi # Increased memory for conversion
+    convertWeights: q40
+    outputPath: s3://koldun-models/tinyllama-converted
+    toolsImage: alpine:3.18
