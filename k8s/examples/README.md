@@ -32,10 +32,23 @@ curl http://localhost:8082/v1/models
 | `secret-minio.yaml` | MinIO credentials | Required for Model CRs |
 | `model-tinyllama.yaml` | TinyLlama 1.1B model | Small model for testing (~500MB) |
 | `model-qwen3-0.6b.yaml` | Qwen3 0.6B model | Lightweight model with reasoning (~1GB) |
+| `model-e2e-test.yaml` | E2E test model (pre-converted) | CI/CD pipelines, fast validation |
 | `ingress-local.yaml` | Local development ingress | 1 worker, no scaling |
 | `ingress-production.yaml` | Production ingress | Multi-worker with auto-scaling |
 
 ## Model Selection
+
+### E2E Test Model (Pre-Converted)
+- **File**: `model-e2e-test.yaml`
+- **Size**: Minimal (stub PVC)
+- **Download**: None (pre-converted mode)
+- **Good for**: CI/CD pipelines, GitHub Actions, fast validation
+- **Features**:
+  - Skips Hugging Face download
+  - No conversion jobs
+  - Instant Ready status
+  - Works in airgapped environments
+- **Use when**: Testing infrastructure without real models
 
 ### TinyLlama (Recommended for Testing)
 - Size: ~500MB

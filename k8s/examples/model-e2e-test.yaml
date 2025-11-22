@@ -1,0 +1,136 @@
+# E2E Test Model - Pre-Converted Stub for CI/CD Testing
+#
+# This manifest demonstrates using pre-converted models for fast E2E testing
+# without requiring actual model download/conversion from Hugging Face.
+#
+# Use case: CI/CD pipelines, quick validation, airgapped environments
+#
+# Steps:
+# 1. Create a PVC with model artifacts (or use stub PVC for testing)
+# 2. Apply this Model CR with preConverted: true
+# 3. Model controller will mark it Ready without download/conversion jobs
+#
+# For real pre-converted models, the PVC should contain:
+#   - Converted model file (*.m)
+#   - Tokenizer file (*.t)
+#   - Any additional model-specific files
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-model-pvc
+  namespace: koldun
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # storageClassName: local-path  # Uncomment for k3s/k3d clusters
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: koldun
+type: Opaque
+stringData:
+  accessKey: minioadmin
+  secretKey: minioadmin
+---
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: test-model
+  namespace: koldun
+  annotations:
+    description: "E2E test model with pre-converted artifacts"
+    use-case: "CI/CD testing, validation without Hugging Face access"
+spec:
+  # Dummy source URL (not used when preConverted=true)
+  sourceUrl: https://example.com/test-model.bin
+  localPath: test-model
+
+  # Pre-converted mode - skip download and conversion
+  preConverted: true
+  preConvertedPVCName: test-model-pvc
+
+  # Size metadata (used for resource planning)
+  # For real models, get these from actual converted files
+  preConvertedSizeBytes: 1000000
+  preConvertedSizeHuman: "1 MB"
+
+  # Launch options for dllama-api
+  # Paths must match files in the PVC
+  launchOptions:
+    - "--model"
+    - "/model/test_model.m"
+    - "--tokenizer"
+    - "/model/test_tokenizer.t"
+    - "--buffer-float-type"
+    - "q80"
+
+  # Object storage config (still required for metadata)
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-credentials
+      namespace: koldun
+
+  # Conversion settings (ignored when preConverted=true)
+  conversion:
+    weightsFloatType: q40
+
+---
+# Example Ingress CR that uses this model
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+  namespace: koldun
+spec:
+  backend:
+    image: koldun:test
+    imagePullPolicy: Never
+    dispatcherImage: koldun:test
+    rootImage: koldun:test
+    workerImage: koldun:test
+
+    # Allow anonymous access for testing
+    allowAnonymous: true
+
+    # Short TTL for CI/CD
+    conversationTTL: 5m
+    responseTimeout: 1m
+
+    # Single worker for stable E2E
+    replicaPower: 1  # 2^1 = 2 workers
+
+    # Session scaling (minimal for E2E)
+    sessionScaling:
+      minDllamas: 1
+      maxDllamas: 1
+      scaleUpBacklog: 1
+      scaleDownIdleSeconds: 60
+
+    # NATS configuration
+    nats:
+      url: "nats://koldun-nats:4222"
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+      modelPrefix: "model/"
+      tokenPrefix: "token/"
+
+  # Service configuration
+  service:
+    port: 8082
+    # type: ClusterIP  # Default
+
+  # Route configuration (for Ingress resource)
+  route:
+    host: test.koldun.local
+    path: /
+    # ingressClassName: nginx  # Optional
