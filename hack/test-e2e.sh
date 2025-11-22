@@ -213,6 +213,7 @@ verify_session_creation() {
     # Wait up to 30 seconds for Session to be created
     for i in {1..30}; do
         local sessions=$(kubectl get sessions.koldun.gorizond.io -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l)
+        sessions=$(echo "$sessions" | tr -d ' ')  # Remove whitespace
         if [ "$sessions" -gt 0 ]; then
             log_info "Session CR created successfully"
             kubectl get sessions.koldun.gorizond.io -n "$NAMESPACE"
@@ -233,6 +234,7 @@ verify_dllama_creation() {
     # Wait up to 30 seconds for Dllama to be created
     for i in {1..30}; do
         local dllamas=$(kubectl get dllamas.koldun.gorizond.io -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l)
+        dllamas=$(echo "$dllamas" | tr -d ' ')  # Remove whitespace
         if [ "$dllamas" -gt 0 ]; then
             log_info "Dllama CR created successfully"
             kubectl get dllamas.koldun.gorizond.io -n "$NAMESPACE"
@@ -258,7 +260,8 @@ verify_pods_creation() {
 
     # Wait up to 60 seconds for pods to be created
     for i in {1..60}; do
-        local session_pods=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep -c "^session-" || echo "0")
+        local session_pods=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep "^session-" | wc -l || echo "0")
+        session_pods=$(echo "$session_pods" | tr -d ' ')  # Remove whitespace
         if [ "$session_pods" -ge 5 ]; then  # 1 dispatcher + 1 root + 3 workers = 5
             log_info "All expected pods created ($session_pods pods)"
             kubectl get pods -n "$NAMESPACE" | grep "^session-" || true
@@ -267,7 +270,9 @@ verify_pods_creation() {
         sleep 1
     done
 
-    log_warn "Expected 5 pods (dispatcher + root + 3 workers), found: $(kubectl get pods -n "$NAMESPACE" --no-headers | grep -c "^session-" || echo "0")"
+    local final_count=$(kubectl get pods -n "$NAMESPACE" --no-headers 2>/dev/null | grep "^session-" | wc -l || echo "0")
+    final_count=$(echo "$final_count" | tr -d ' ')  # Remove whitespace
+    log_warn "Expected 5 pods (dispatcher + root + 3 workers), found: $final_count"
     kubectl get pods -n "$NAMESPACE" | grep "^session-" || true
     return 0  # Don't fail, just warn
 }
@@ -276,7 +281,9 @@ verify_topology() {
     log_info "Verifying topology: 1 root + 3 workers..."
 
     local roots=$(kubectl get roots.koldun.gorizond.io -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l)
+    roots=$(echo "$roots" | tr -d ' ')  # Remove whitespace
     local workers=$(kubectl get workers.koldun.gorizond.io -n "$NAMESPACE" --no-headers 2>/dev/null | wc -l)
+    workers=$(echo "$workers" | tr -d ' ')  # Remove whitespace
 
     log_info "Found: $roots root(s), $workers worker(s)"
 
