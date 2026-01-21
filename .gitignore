@@ -27,3 +27,4 @@ charts/koldun/charts/*.tgz
 
 # Local secrets (should use k8s/examples/secret-minio.yaml template instead)
 minio-secret.yaml
+.DS_Store
