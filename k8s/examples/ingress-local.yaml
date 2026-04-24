@@ -8,10 +8,10 @@ metadata:
 spec:
   backend:
     # Use local dev image
-    image: koldun:dev
-    rootImage: koldun:dev
-    workerImage: koldun:dev
-    dispatcherImage: koldun:dev
+    image: ghcr.io/gorizond/koldun:latest
+    rootImage: ghcr.io/gorizond/koldun:latest
+    workerImage: ghcr.io/gorizond/koldun:latest
+    dispatcherImage: ghcr.io/gorizond/koldun:latest
 
     # replicaPower=0 means 1 worker (2^0=1)
     # Use 0 for stability on ARM64/Lima VM
@@ -26,21 +26,24 @@ spec:
       modelPrefix: model/
       tokenPrefix: token/
 
+    # Allow anonymous requests (no API token required)
+    allowAnonymous: true
+
     # Session lifecycle
     conversationTTL: 10m
     responseTimeout: 2m
 
-    # Optional: Session scaling (for production)
-    # sessionScaling:
-    #   minDllamas: 1
-    #   maxDllamas: 4
-    #   scaleUpBacklog: 2
-    #   scaleDownIdleSeconds: 120
+    # Session scaling configuration for Session 4 testing
+    sessionScaling:
+      minDllamas: 1
+      maxDllamas: 3
+      scaleUpBacklog: 2
+      scaleDownIdleSeconds: 120
 
   service:
     port: 8082
 
   route:
-    host: local.koldun.dev
+    host: local.localtest.me
     # path: /
     # ingressClassName: traefik
