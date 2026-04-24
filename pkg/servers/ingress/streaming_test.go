@@ -277,3 +277,28 @@ func TestConsumeStateEvent(t *testing.T) {
 	require.Equal(t, "Idle", entry.state)
 	require.Equal(t, int32(0), entry.active)
 }
+
+type mockFlusherWriter struct {
+	http.ResponseWriter
+	flushed bool
+}
+
+func (m *mockFlusherWriter) Flush() {
+	m.flushed = true
+}
+
+func TestResponseWriterWrapperDelegatesFlush(t *testing.T) {
+	t.Parallel()
+
+	inner := &mockFlusherWriter{ResponseWriter: httptest.NewRecorder()}
+	wrapper := &responseWriterWrapper{ResponseWriter: inner, statusCode: http.StatusOK}
+
+	// Verify wrapper implements http.Flusher
+	var rw http.ResponseWriter = wrapper
+	flusher, ok := rw.(http.Flusher)
+	require.True(t, ok, "responseWriterWrapper should implement http.Flusher")
+
+	// Verify Flush delegates to inner writer
+	flusher.Flush()
+	require.True(t, inner.flushed, "Flush should be delegated to inner ResponseWriter")
+}
