@@ -31,7 +31,7 @@ spec:
 
     # Session lifecycle
     conversationTTL: 10m
-    responseTimeout: 2m
+    responseTimeout: 10m
 
     # Session scaling configuration for Session 4 testing
     sessionScaling:
