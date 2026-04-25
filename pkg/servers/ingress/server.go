@@ -122,6 +122,8 @@ type Config struct {
 
 	ReplicaPower int32
 
+	DisableThinkFilter bool
+
 	Logger *logrus.Entry
 }
 
@@ -1376,11 +1378,10 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
 	writeChunk := func(payload string) {
-		payload = strings.TrimSpace(payload)
 		if payload == "" {
 			_, _ = fmt.Fprint(w, "data: \n\n")
 		} else {
@@ -1403,7 +1404,7 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 		writeChunk(string(payload))
 	}
 
-	state := streamingNormaliserState{}
+	state := streamingNormaliserState{disableThink: s.cfg.DisableThinkFilter}
 	keepalive := time.NewTicker(10 * time.Second)
 	defer keepalive.Stop()
 
@@ -1651,8 +1652,9 @@ func eventTimestamp(ts int64) time.Time {
 }
 
 type streamingNormaliserState struct {
-	roleSent bool
-	think    thinkRedactor
+	roleSent     bool
+	think        thinkRedactor
+	disableThink bool
 }
 
 type thinkRedactor struct {
@@ -1680,7 +1682,7 @@ type streamingChunkDelta struct {
 }
 
 func (s *streamingNormaliserState) scrubContent(content string) string {
-	if s == nil || content == "" {
+	if s == nil || content == "" || s.disableThink {
 		return content
 	}
 	return s.think.filter(content)
@@ -1779,7 +1781,7 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 				state.roleSent = true
 			}
 		}
-		if strings.TrimSpace(choice.Delta.Role) == "" {
+		if choice.Delta.Role == "" {
 			choice.Delta.Role = ""
 		}
 
@@ -1787,7 +1789,7 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 		if state != nil {
 			content = state.scrubContent(content)
 		}
-		if strings.TrimSpace(content) == "" {
+		if content == "" {
 			choice.Delta.Content = ""
 		} else {
 			choice.Delta.Content = content
@@ -1814,7 +1816,7 @@ func isEmptyDeltaChunk(payload string) bool {
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			return false
 		}
-		if strings.TrimSpace(choice.Delta.Role) != "" || strings.TrimSpace(choice.Delta.Content) != "" {
+		if choice.Delta.Role != "" || choice.Delta.Content != "" {
 			return false
 		}
 	}
@@ -1956,11 +1958,23 @@ func minVal(a, b int) int {
 type responseWriterWrapper struct {
 	http.ResponseWriter
 	statusCode int
+	written    bool
 }
 
 func (w *responseWriterWrapper) WriteHeader(statusCode int) {
+	if w.written {
+		return
+	}
 	w.statusCode = statusCode
+	w.written = true
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseWriterWrapper) Write(p []byte) (int, error) {
+	if !w.written {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 func (w *responseWriterWrapper) Flush() {

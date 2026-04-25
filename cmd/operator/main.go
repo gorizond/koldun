@@ -132,6 +132,7 @@ func main() {
 		backendAllowAnonymous                 bool
 		backendRootImage                      string
 		backendWorkerImage                    string
+		backendDisableThinkFilter             bool
 
 		// Dispatcher flags
 		dispatcherHash              string
@@ -209,6 +210,7 @@ func main() {
 	fs.BoolVar(&backendAllowAnonymous, "backend-allow-anonymous", false, "Allow ingress backend to accept requests without API tokens")
 	fs.StringVar(&backendRootImage, "backend-root-image", "", "Container image for Dllama root pods")
 	fs.StringVar(&backendWorkerImage, "backend-worker-image", "", "Container image for Dllama worker pods")
+	fs.BoolVar(&backendDisableThinkFilter, "backend-disable-think-filter", false, "Disable think tag redaction in streaming responses")
 	fs.IntVar(&backendReplicaPower, "backend-replica-power", 0, "Override replica power for Sessions created by the backend (0 uses model setting)")
 
 	fs.StringVar(&operatorNATSURL, "operator-nats-url", "", "NATS endpoint used by the operator to reconcile conversations and publish registry data")
@@ -302,6 +304,7 @@ func main() {
 			SessionDispatcherMetricsListen: backendSessionDispatcherMetricsListen,
 			HashSecret:                     hashSecret,
 			AllowAnonymous:                 backendAllowAnonymous,
+			DisableThinkFilter:             backendDisableThinkFilter,
 			ReplicaPower:                   int32(backendReplicaPower),
 		})
 	case "dispatcher":
