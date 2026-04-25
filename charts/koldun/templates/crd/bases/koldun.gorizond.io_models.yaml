@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.5
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: models.koldun.gorizond.io
 spec:
   group: koldun.gorizond.io
@@ -71,10 +71,21 @@ spec:
                     items:
                       type: string
                     type: array
+                  convertWeights:
+                    description: ConvertWeights controls execution of HF weight conversion
+                      (handled by convert-hf.py).
+                    type: string
                   converterVersion:
                     description: 'ConverterVersion selects the distributed-llama converter
                       release tag (default: v0.16.2).'
                     type: string
+                  dependencies:
+                    additionalProperties:
+                      type: string
+                    description: Dependencies enumerates additional Python packages
+                      required for conversion, keyed by package name with optional
+                      version.
+                    type: object
                   image:
                     description: Image is the container image used for the conversion
                       Job.
@@ -99,14 +110,16 @@ spec:
                     description: WeightsFloatType dictates the target precision (for
                       example, "q40").
                     type: string
-                  convertWeights:
-                    description: ConvertWeights selects quantization preset for convert-hf.py (e.g. "q80"); use values like "skip" to disable conversion.
+                  writerConfigMap:
+                    description: |-
+                      WriterConfigMap references a ConfigMap that contains a custom writer.py script.
+                      When set, the script is mounted from the ConfigMap instead of downloading.
                     type: string
-                  dependencies:
-                    description: Dependencies lists additional Python packages (name; version) to install before conversion.
-                    type: object
-                    additionalProperties:
-                      type: string
+                  writerURL:
+                    description: |-
+                      WriterURL overrides the URL used to fetch writer.py during conversion.
+                      Defaults to the koldun repository's optimized writer.py.
+                    type: string
                 type: object
               download:
                 description: Download contains configuration for how the model artifacts
@@ -199,6 +212,27 @@ spec:
                 description: PipProxy optionally sets HTTP proxy used by pip inside
                   python containers (e.g., Dragonfly dfdaemon HTTP proxy)
                 type: string
+              preConverted:
+                description: |-
+                  PreConverted indicates the model files are already in dllama format in the object storage.
+                  When true, download and conversion jobs are skipped and the model is immediately marked Ready.
+                type: boolean
+              preConvertedPVCName:
+                description: |-
+                  PreConvertedPVCName is the name of an existing PVC containing pre-converted model files.
+                  Required when PreConverted is true. This PVC will be mounted by Root and Worker pods.
+                type: string
+              preConvertedSizeBytes:
+                description: |-
+                  PreConvertedSizeBytes is the total size in bytes of pre-converted model files.
+                  Required when PreConverted is true for registry sync to work.
+                format: int64
+                type: integer
+              preConvertedSizeHuman:
+                description: |-
+                  PreConvertedSizeHuman is a human-readable size (e.g., "805 MB") for pre-converted models.
+                  If not provided, it will be calculated from PreConvertedSizeBytes.
+                type: string
               pv:
                 description: PV optionally describes a template for PersistentVolume/PersistentVolumeClaim
                   used to mount S3 via CSI
@@ -259,27 +293,6 @@ spec:
                   of two) for Dllama instances referencing this model.
                 format: int32
                 type: integer
-              preConverted:
-                description: |-
-                  PreConverted indicates the model files are already in dllama format in the object storage.
-                  When true, download and conversion jobs are skipped and the model is immediately marked Ready.
-                type: boolean
-              preConvertedPVCName:
-                description: |-
-                  PreConvertedPVCName is the name of an existing PVC containing pre-converted model files.
-                  Required when PreConverted is true. This PVC will be mounted by Root and Worker pods.
-                type: string
-              preConvertedSizeBytes:
-                description: |-
-                  PreConvertedSizeBytes is the total size in bytes of pre-converted model files.
-                  Required when PreConverted is true for registry sync to work.
-                format: int64
-                type: integer
-              preConvertedSizeHuman:
-                description: |-
-                  PreConvertedSizeHuman is a human-readable size (e.g., "805 MB") for pre-converted models.
-                  If not provided, it will be calculated from PreConvertedSizeBytes.
-                type: string
               sourceUrl:
                 description: |-
                   SourceURL points to the upstream model source. For Hugging Face, this is the

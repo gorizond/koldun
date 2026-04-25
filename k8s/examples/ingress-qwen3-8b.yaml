@@ -1,0 +1,52 @@
+# Qwen3 8B Ingress - Single DLLama (maxDllamas=1) for focused testing
+# Routes to qwen3-8b-q40 model
+apiVersion: koldun.gorizond.io/v1
+kind: Ingress
+metadata:
+  name: qwen3-8b-ingress
+  namespace: koldun
+spec:
+  backend:
+    # Use same images as local ingress
+    image: ghcr.io/gorizond/koldun:latest
+    rootImage: ghcr.io/gorizond/koldun:latest
+    workerImage: ghcr.io/gorizond/koldun:latest
+    dispatcherImage: ghcr.io/gorizond/koldun:latest
+
+    # Single worker (replicaPower=0 means 1 worker)
+    replicaPower: 0
+
+    # NATS configuration (same as local ingress)
+    nats:
+      url: nats://koldun-nats:4222
+      kvBucket: koldun_ttl
+      modelsBucket: koldun_models
+      tokensBucket: koldun_tokens
+      modelPrefix: model/
+      tokenPrefix: token/
+
+    # Allow anonymous requests
+    allowAnonymous: true
+
+    # Session lifecycle
+    conversationTTL: 10m
+    responseTimeout: 10m
+
+    # Scaling configuration: MAX 1 DLLAMA
+    sessionScaling:
+      minDllamas: 1
+      maxDllamas: 1
+      scaleUpBacklog: 2
+      scaleDownIdleSeconds: 120
+
+    # Disable think filter for Qwen3 models (required for proper output)
+    extraArgs:
+      - --backend-disable-think-filter=true
+
+  service:
+    port: 8082
+
+  route:
+    host: qwen3-8b.local.localtest.me
+    # path: /
+    # ingressClassName: traefik

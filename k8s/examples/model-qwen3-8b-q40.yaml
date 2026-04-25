@@ -1,0 +1,44 @@
+# Qwen3 8B Model - Q40 quantization for high quality inference
+# Compatible with distributed-llama v0.16.5+
+apiVersion: koldun.gorizond.io/v1
+kind: Model
+metadata:
+  name: qwen3-8b-q40
+  namespace: koldun
+spec:
+  # HuggingFace model URL
+  sourceUrl: https://huggingface.co/Qwen/Qwen3-8B
+
+  # Local path for model storage
+  localPath: /models/qwen3-8b
+
+  # S3/MinIO storage configuration
+  objectStorage:
+    endpoint: http://koldun-minio:9000
+    bucketForSource: koldun-models
+    bucketForConvert: koldun-models
+    secretRef:
+      name: minio-creds
+      namespace: koldun
+
+  # distributed-llama launch options
+  launchOptions:
+    - "--buffer-float-type"
+    - "q40"
+
+  # Download configuration for 8B model (~16GB raw)
+  download:
+    image: python:3.11-slim
+    memory: 8Gi
+    chunkMaxMiB: 512
+    concurrency: 6
+
+  # Conversion configuration for distributed-llama Q40
+  conversion:
+    converterVersion: v0.16.5
+    image: python:3.11-slim
+    memory: 8Gi
+    weightsFloatType: q40
+    convertWeights: q40
+    outputPath: s3://koldun-models/qwen3-8b-q40-converted
+    toolsImage: alpine:3.18

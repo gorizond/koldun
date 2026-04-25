@@ -16,6 +16,8 @@ import (
 	"k8s.io/utils/pointer"
 )
 
+const defaultWriterURL = "https://raw.githubusercontent.com/gorizond/koldun/main/converter/writer.py"
+
 // model_jobs.go
 // Contains functions for managing Kubernetes Jobs related to Model operations.
 // This includes download jobs, conversion jobs, sizing jobs, and their lifecycle management.
@@ -653,16 +655,26 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 
 	// Init container: fetch converter scripts from GitHub
 	converterVersion := spec.ConverterVersion
-	fetchCmd := strings.Join([]string{
+	writerURL := spec.WriterURL
+	if writerURL == "" {
+		writerURL = defaultWriterURL
+	}
+
+	fetchLines := []string{
 		"set -euo pipefail",
 		"apk add --no-cache wget curl",
 		"mkdir -p /workspace/converter",
 		"cd /workspace/converter",
 		fmt.Sprintf("wget -q -O convert-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-hf.py", converterVersion),
-		fmt.Sprintf("wget -q -O writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/writer.py", converterVersion),
+	}
+	if spec.WriterConfigMap == "" {
+		fetchLines = append(fetchLines, fmt.Sprintf("wget -q -O writer.py %s", writerURL))
+	}
+	fetchLines = append(fetchLines,
 		fmt.Sprintf("wget -q -O convert-tokenizer-hf.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/convert-tokenizer-hf.py", converterVersion),
 		fmt.Sprintf("wget -q -O tokenizer-writer.py https://raw.githubusercontent.com/b4rtaz/distributed-llama/%s/converter/tokenizer-writer.py", converterVersion),
-	}, "\n")
+	)
+	fetchCmd := strings.Join(fetchLines, "\n")
 
 	fetchScripts := corev1.Container{
 		Name:         "fetch-converter",
@@ -679,6 +691,21 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	mainContainer := h.buildConversionContainer(obj, spec, s3WorkDir, inputKey, convBucket, convKey, convURI, weightsType, expectedGeneration)
 	// mount S3 PVC into main with read-only access
 	mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3", MountPath: "/mnt/s3"})
+	if spec.WriterConfigMap != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: "writer-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: spec.WriterConfigMap},
+				},
+			},
+		})
+		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{
+			Name:      "writer-config",
+			MountPath: "/workspace/converter/writer.py",
+			SubPath:   "writer.py",
+		})
+	}
 	if outputPVCName != "" {
 		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, corev1.VolumeMount{Name: "s3-output", MountPath: "/mnt/s3-output"})
 		mainContainer.Env = append(mainContainer.Env,

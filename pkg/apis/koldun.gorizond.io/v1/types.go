@@ -1485,6 +1485,12 @@ type ModelConversionSpec struct {
 	ToolsImage string `json:"toolsImage,omitempty"`
 	// ConverterVersion selects the distributed-llama converter release tag (default: v0.16.2).
 	ConverterVersion string `json:"converterVersion,omitempty"`
+	// WriterURL overrides the URL used to fetch writer.py during conversion.
+	// Defaults to the koldun repository's optimized writer.py.
+	WriterURL string `json:"writerURL,omitempty"`
+	// WriterConfigMap references a ConfigMap that contains a custom writer.py script.
+	// When set, the script is mounted from the ConfigMap instead of downloading.
+	WriterConfigMap string `json:"writerConfigMap,omitempty"`
 	// Dependencies enumerates additional Python packages required for conversion, keyed by package name with optional version.
 	Dependencies map[string]string `json:"dependencies,omitempty"`
 }
