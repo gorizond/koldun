@@ -1683,8 +1683,9 @@ type streamingChunkChoice struct {
 }
 
 type streamingChunkDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string            `json:"role,omitempty"`
+	Content   string            `json:"content,omitempty"`
+	ToolCalls []openai.ToolCall `json:"tool_calls,omitempty"`
 }
 
 func (s *streamingNormaliserState) scrubContent(content string) string {
@@ -1881,7 +1882,7 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 			choice.Delta.Content = content
 		}
 
-		if choice.Delta.Role == "" && choice.Delta.Content == "" {
+		if choice.Delta.Role == "" && choice.Delta.Content == "" && len(choice.Delta.ToolCalls) == 0 {
 			choice.Delta = streamingChunkDelta{}
 		}
 	}
@@ -1902,7 +1903,7 @@ func isEmptyDeltaChunk(payload string) bool {
 		if choice.FinishReason != nil && *choice.FinishReason != "" {
 			return false
 		}
-		if choice.Delta.Role != "" || choice.Delta.Content != "" {
+		if choice.Delta.Role != "" || choice.Delta.Content != "" || len(choice.Delta.ToolCalls) > 0 {
 			return false
 		}
 	}

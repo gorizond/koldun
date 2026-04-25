@@ -166,6 +166,37 @@ func TestNormaliseStreamingChunk(t *testing.T) {
 	require.Equal(t, rawInvalid, invalid)
 }
 
+func TestNormaliseStreamingChunkWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	state := &streamingNormaliserState{}
+	raw := `{"choices":[{"delta":{"role":"assistant","tool_calls":[{"id":"call_123","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Moscow\"}"}}]}}]}`
+	normalised, err := normaliseStreamingChunk(raw, state)
+	require.NoError(t, err)
+
+	var chunk streamingChunk
+	require.NoError(t, json.Unmarshal([]byte(normalised), &chunk))
+	require.Len(t, chunk.Choices, 1)
+	require.Equal(t, "assistant", chunk.Choices[0].Delta.Role)
+	require.Len(t, chunk.Choices[0].Delta.ToolCalls, 1)
+	require.Equal(t, "call_123", chunk.Choices[0].Delta.ToolCalls[0].ID)
+	require.Equal(t, "function", chunk.Choices[0].Delta.ToolCalls[0].Type)
+	require.Equal(t, "get_weather", chunk.Choices[0].Delta.ToolCalls[0].Function.Name)
+	require.Equal(t, `{"location":"Moscow"}`, chunk.Choices[0].Delta.ToolCalls[0].Function.Arguments)
+
+	// Second chunk with additional tool call should preserve it
+	nextRaw := `{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_456","type":"function","function":{"name":"get_time","arguments":"{}"}}]}}]}`
+	nextNormalised, err := normaliseStreamingChunk(nextRaw, state)
+	require.NoError(t, err)
+
+	chunk = streamingChunk{}
+	require.NoError(t, json.Unmarshal([]byte(nextNormalised), &chunk))
+	require.Len(t, chunk.Choices, 1)
+	require.Empty(t, chunk.Choices[0].Delta.Role, "role should be cleared after first emission")
+	require.Len(t, chunk.Choices[0].Delta.ToolCalls, 1)
+	require.Equal(t, "call_456", chunk.Choices[0].Delta.ToolCalls[0].ID)
+}
+
 func TestEventTimestamp(t *testing.T) {
 	t.Parallel()
 
