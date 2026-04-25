@@ -1,5 +1,9 @@
 # TinyLlama Model - Small model for testing and development
 # Downloads from HuggingFace and prepares for distributed-llama
+#
+# IMPORTANT: Requires csi-s3-secret in kube-system namespace with keys:
+#   accessKeyID, secretAccessKey, endpoint
+# See k8s/examples/secret-minio.yaml for minio-creds format.
 apiVersion: koldun.gorizond.io/v1
 kind: Model
 metadata:
@@ -36,7 +40,7 @@ spec:
   conversion:
     converterVersion: v0.16.2
     image: python:3.11-slim
-    memory: 4Gi # Increased memory for conversion
+    memory: 2Gi # Reduced for smaller nodes; increase to 4Gi if available
     convertWeights: q40
     outputPath: s3://koldun-models/tinyllama-converted
     toolsImage: alpine:3.18

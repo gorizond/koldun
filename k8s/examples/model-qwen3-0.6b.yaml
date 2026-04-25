@@ -32,3 +32,13 @@ spec:
     memory: 4Gi
     chunkMaxMiB: 512
     concurrency: 6
+
+  # Conversion configuration for distributed-llama
+  conversion:
+    converterVersion: v0.16.2
+    image: python:3.11-slim
+    memory: 4Gi
+    weightsFloatType: q40
+    convertWeights: q40
+    outputPath: s3://koldun-models/qwen3-0.6b-converted
+    toolsImage: alpine:3.18
