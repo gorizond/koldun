@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.5
+    controller-gen.kubebuilder.io/version: v0.20.1
   name: ingresses.koldun.gorizond.io
 spec:
   group: koldun.gorizond.io
@@ -62,7 +62,15 @@ spec:
                 description: IngressBackendSpec defines runtime configuration for
                   the backend deployment.
                 properties:
+                  allowAnonymous:
+                    type: boolean
                   conversationTTL:
+                    type: string
+                  dispatcherImage:
+                    type: string
+                  dispatcherMetricsListen:
+                    description: DispatcherMetricsListen configures --dispatcher-metrics-listen
+                      for session-managed dispatchers.
                     type: string
                   extraArgs:
                     items:
@@ -70,8 +78,6 @@ spec:
                     type: array
                   hashSecret:
                     type: string
-                  allowAnonymous:
-                    type: boolean
                   image:
                     type: string
                   imagePullPolicy:
@@ -97,6 +103,11 @@ spec:
                     required:
                     - url
                     type: object
+                  replicaPower:
+                    description: ReplicaPower overrides the replica power configured
+                      on models when ensuring Sessions.
+                    format: int32
+                    type: integer
                   resources:
                     description: ResourceRequirements describes the compute resource
                       requirements.
@@ -157,15 +168,19 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  responseTimeout:
+                    type: string
+                  rootImage:
+                    type: string
                   rootMemory:
-                    description: RootMemory customizes the memory overhead used when planning root pods.
+                    description: IngressRootMemorySpec customises root memory calculation.
                     properties:
                       overheadMaxRatio:
                         type: number
                     type: object
-                  responseTimeout:
-                    type: string
                   sessionScaling:
+                    description: IngressSessionScalingSpec controls auto-scaling behaviour
+                      for Session-managed Dllamas.
                     properties:
                       maxDllamas:
                         format: int32
@@ -180,14 +195,7 @@ spec:
                         format: int32
                         type: integer
                     type: object
-                  rootImage:
-                    type: string
-                  replicaPower:
-                    format: int32
-                    type: integer
                   workerImage:
-                    type: string
-                  dispatcherImage:
                     type: string
                 required:
                 - image

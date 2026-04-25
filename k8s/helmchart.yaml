@@ -1,0 +1,27 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: koldun
+  namespace: kube-system
+spec:
+  chart: koldun
+  repo: https://gorizond.github.io/koldun/charts
+  targetNamespace: koldun
+  version: 0.1.0
+  valuesContent: |
+    image:
+      tag: v0.1.0
+    nats:
+      enabled: true
+    minio:
+      enabled: true
+      persistence:
+        enabled: true
+        size: 50Gi
+    csi-s3:
+      enabled: true
+    operator:
+      extraArgs:
+        - --backend-disable-think-filter=true
+    ingressDefaults:
+      dispatcherMetricsListen: ":9090"
