@@ -2,6 +2,29 @@ apiVersion: v1
 entries:
   koldun:
   - apiVersion: v2
+    appVersion: 0.1.2
+    created: "2026-04-25T14:07:39.304287291Z"
+    dependencies:
+    - condition: nats.enabled
+      name: nats
+      repository: https://nats-io.github.io/k8s/helm/charts/
+      version: 1.2.8
+    - condition: minio.enabled
+      name: minio
+      repository: https://charts.min.io/
+      version: 5.4.0
+    - condition: csi-s3.enabled
+      name: csi-s3
+      repository: https://yandex-cloud.github.io/k8s-csi-s3/charts
+      version: 0.41.0
+    description: Operator for distributed-llama
+    digest: ced516104365b5e01f00033b758137137e8967d059fa7ba87fe5e99beff11d56
+    name: koldun
+    type: application
+    urls:
+    - https://github.com/gorizond/koldun/releases/download/koldun-0.1.2/koldun-0.1.2.tgz
+    version: 0.1.2
+  - apiVersion: v2
     appVersion: 0.1.1
     created: "2026-04-25T13:17:21.309022817Z"
     dependencies:
@@ -107,4 +130,4 @@ entries:
     urls:
     - https://gorizond.github.io/koldun/koldun-0.0.1.tgz
     version: 0.0.1
-generated: "2026-04-25T13:17:21.309884053Z"
+generated: "2026-04-25T14:07:39.304338316Z"
