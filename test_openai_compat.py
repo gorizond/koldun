@@ -15,7 +15,7 @@ def test_basic_openai_client():
         from openai import OpenAI
 
         client = OpenAI(
-            base_url="http://local.localtest.me:8082/v1",
+            base_url="http://local.localtest.me:80/v1",
             api_key="dummy-key",  # Koldun doesn't require auth for now
         )
 
@@ -51,7 +51,7 @@ def test_langchain():
         from langchain_openai import ChatOpenAI
 
         llm = ChatOpenAI(
-            base_url="http://local.localtest.me:8082/v1",
+            base_url="http://local.localtest.me:80/v1",
             api_key="dummy-key",
             model="koldun/qwen3-0.6b",
             temperature=0.7,
@@ -95,7 +95,7 @@ def test_streaming():
     try:
         from openai import OpenAI
 
-        client = OpenAI(base_url="http://local.localtest.me:8082/v1", api_key="dummy-key")
+        client = OpenAI(base_url="http://local.localtest.me:80/v1", api_key="dummy-key")
 
         print("Testing streaming chat completion...")
         stream = client.chat.completions.create(
@@ -147,7 +147,7 @@ def test_litellm():
         response = litellm.completion(
             model="openai/koldun/qwen3-0.6b",
             messages=[{"role": "user", "content": "Hello"}],
-            api_base="http://local.localtest.me:8082/v1",
+            api_base="http://local.localtest.me:80/v1",
             api_key="dummy-key",
             max_tokens=10,
             timeout=60,
@@ -181,7 +181,7 @@ def main():
     print("Koldun OpenAI API Compatibility Test Suite")
     print("=================================================")
     print("\nPrerequisites:")
-    print("- kubectl port-forward -n koldun svc/qwen3-ingress-backend 8082:8082")
+    print("- kubectl port-forward -n koldun svc/qwen3-ingress-backend 80:8082")
     print("- pip install openai langchain-openai litellm")
     print()
 

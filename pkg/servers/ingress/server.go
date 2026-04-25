@@ -1404,6 +1404,8 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 	}
 
 	state := streamingNormaliserState{}
+	keepalive := time.NewTicker(10 * time.Second)
+	defer keepalive.Stop()
 
 	for {
 		select {
@@ -1436,6 +1438,9 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 			errorChunk(ctx.Err().Error())
 			writeChunk("[DONE]")
 			return
+		case <-keepalive.C:
+			_, _ = fmt.Fprint(w, ": \n\n")
+			flusher.Flush()
 		}
 	}
 }
