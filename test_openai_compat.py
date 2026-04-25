@@ -7,6 +7,7 @@ Tests with LangChain and standard OpenAI client
 import os
 import sys
 
+
 def test_basic_openai_client():
     """Test with standard OpenAI Python client"""
     print("\n=== Test 1: Standard OpenAI Client ===")
@@ -14,8 +15,8 @@ def test_basic_openai_client():
         from openai import OpenAI
 
         client = OpenAI(
-            base_url="http://localhost:8082/v1",
-            api_key="dummy-key"  # Koldun doesn't require auth for now
+            base_url="http://local.localtest.me:8082/v1",
+            api_key="dummy-key",  # Koldun doesn't require auth for now
         )
 
         # Test 1: List models
@@ -38,6 +39,7 @@ def test_basic_openai_client():
     except Exception as e:
         print(f"❌ FAILED: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -49,12 +51,12 @@ def test_langchain():
         from langchain_openai import ChatOpenAI
 
         llm = ChatOpenAI(
-            base_url="http://localhost:8082/v1",
+            base_url="http://local.localtest.me:8082/v1",
             api_key="dummy-key",
             model="koldun/qwen3-0.6b",
             temperature=0.7,
             max_tokens=50,
-            timeout=120
+            timeout=120,
         )
 
         print("Testing LangChain invoke...")
@@ -66,7 +68,9 @@ def test_langchain():
             # Expected on CPU-only inference
             if "timeout" in str(e).lower() or "502" in str(e):
                 print(f"⚠️  Expected timeout on CPU inference: {e}")
-                print("✅ LangChain client configured correctly (timeout is normal on CPU)")
+                print(
+                    "✅ LangChain client configured correctly (timeout is normal on CPU)"
+                )
             else:
                 raise
 
@@ -80,13 +84,60 @@ def test_langchain():
     except Exception as e:
         print(f"❌ FAILED: {e}")
         import traceback
+
+        traceback.print_exc()
+        return False
+
+
+def test_streaming():
+    """Test streaming with standard OpenAI client"""
+    print("\n=== Test 3: Streaming ===")
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(base_url="http://local.localtest.me:8082/v1", api_key="dummy-key")
+
+        print("Testing streaming chat completion...")
+        stream = client.chat.completions.create(
+            model="koldun/qwen3-0.6b",
+            messages=[{"role": "user", "content": "Say hello"}],
+            stream=True,
+        )
+
+        chunks = []
+        has_finish_reason = False
+        for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    chunks.append(delta.content)
+                    print(f"  chunk: {delta.content!r}")
+                if chunk.choices[0].finish_reason:
+                    has_finish_reason = True
+
+        content = "".join(chunks)
+        print(f"✅ Streaming complete, content: {content[:50]!r}")
+        print(f"✅ Has finish_reason: {has_finish_reason}")
+
+        # Streaming works even if content is empty due to think tags
+        if not has_finish_reason:
+            print("❌ FAILED: Streaming missing finish_reason")
+            return False
+
+        print("\n✅ Streaming tests PASSED")
+        return True
+
+    except Exception as e:
+        print(f"❌ FAILED: {e}")
+        import traceback
+
         traceback.print_exc()
         return False
 
 
 def test_litellm():
     """Test with LiteLLM"""
-    print("\n=== Test 3: LiteLLM Integration ===")
+    print("\n=== Test 4: LiteLLM Integration ===")
     try:
         import litellm
 
@@ -96,10 +147,10 @@ def test_litellm():
         response = litellm.completion(
             model="openai/koldun/qwen3-0.6b",
             messages=[{"role": "user", "content": "Hello"}],
-            api_base="http://localhost:8082/v1",
+            api_base="http://local.localtest.me:8082/v1",
             api_key="dummy-key",
             max_tokens=10,
-            timeout=60
+            timeout=60,
         )
 
         print(f"✅ LiteLLM completion successful")
@@ -120,6 +171,7 @@ def test_litellm():
             return True
         print(f"❌ FAILED: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -138,6 +190,7 @@ def main():
     # Run tests
     results.append(("Standard OpenAI Client", test_basic_openai_client()))
     results.append(("LangChain Integration", test_langchain()))
+    results.append(("Streaming", test_streaming()))
     results.append(("LiteLLM Integration", test_litellm()))
 
     # Summary

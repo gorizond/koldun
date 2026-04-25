@@ -239,7 +239,9 @@ func TestNewEnsuresTrailingDotInInPrefix(t *testing.T) {
 func TestServerWaitForSidecarSuccess(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/v1/models", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[{"id":"qwen3-0.6b"}]}`))
 	}
 	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
 	defer ts.Close()
@@ -260,6 +262,36 @@ func TestServerWaitForSidecarSuccess(t *testing.T) {
 	defer cancel()
 
 	require.NoError(t, server.waitForSidecar(ctx))
+}
+
+func TestServerWaitForSidecarEmptyModels(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/models", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(handler))
+	defer ts.Close()
+
+	client := ts.Client()
+	client.Timeout = 500 * time.Millisecond
+
+	server := &Server{
+		cfg: Config{
+			SidecarURL:     ts.URL,
+			SidecarTimeout: 500 * time.Millisecond,
+		},
+		client: client,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	err := server.waitForSidecar(ctx)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "timeout waiting for dllama-api sidecar")
 }
 
 func TestServerWaitForSidecarTimeout(t *testing.T) {
@@ -928,7 +960,9 @@ func TestRunStartsAndStops(t *testing.T) {
 
 	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"test"}]}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -986,7 +1020,9 @@ func TestRunStartsHealthServer(t *testing.T) {
 
 	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sidecarModelsPath {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"data":[{"id":"test"}]}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -2499,4 +2535,57 @@ func TestNormalizeChatCompletionResponseHandlesNonArrayChoices(t *testing.T) {
 	require.Equal(t, "model", resp["model"])
 	// Choices remain as-is (invalid type)
 	require.Equal(t, "not an array", resp["choices"])
+}
+
+func TestNormalizeStreamingChunkFixesModel(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-stream",
+		"object": "chat.completion.chunk",
+		"model": "Distributed Model",
+		"choices": [{"index":0,"delta":{"content":"Hello"}}]
+	}`
+
+	result := normalizeStreamingChunk([]byte(input), "koldun/qwen3-0.6b")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+	require.Equal(t, "koldun/qwen3-0.6b", resp["model"])
+	require.Equal(t, "chatcmpl-stream", resp["id"])
+}
+
+func TestNormalizeStreamingChunkPreservesValidData(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-stream",
+		"object": "chat.completion.chunk",
+		"model": "original-model",
+		"choices": [{"index":0,"delta":{"role":"assistant"}}]
+	}`
+
+	result := normalizeStreamingChunk([]byte(input), "requested-model")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+	require.Equal(t, "requested-model", resp["model"])
+	require.Equal(t, "chatcmpl-stream", resp["id"])
+}
+
+func TestNormalizeStreamingChunkHandlesInvalidJSON(t *testing.T) {
+	input := []byte("not valid json")
+
+	result := normalizeStreamingChunk(input, "model")
+
+	require.Equal(t, input, result)
+}
+
+func TestNormalizeStreamingChunkHandlesEmptyModel(t *testing.T) {
+	input := `{
+		"id": "chatcmpl-stream",
+		"model": "Distributed Model"
+	}`
+
+	result := normalizeStreamingChunk([]byte(input), "")
+
+	var resp map[string]any
+	require.NoError(t, json.Unmarshal(result, &resp))
+	require.Equal(t, "Distributed Model", resp["model"])
 }

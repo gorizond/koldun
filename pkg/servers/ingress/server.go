@@ -1428,6 +1428,9 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 				writeChunk(line)
 				continue
 			}
+			if isEmptyDeltaChunk(normalised) {
+				continue
+			}
 			writeChunk(normalised)
 		case <-ctx.Done():
 			errorChunk(ctx.Err().Error())
@@ -1795,6 +1798,22 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 		return raw, err
 	}
 	return string(payload), nil
+}
+
+func isEmptyDeltaChunk(payload string) bool {
+	var chunk streamingChunk
+	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+		return false
+	}
+	for _, choice := range chunk.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			return false
+		}
+		if strings.TrimSpace(choice.Delta.Role) != "" || strings.TrimSpace(choice.Delta.Content) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func sha256Hex(value string) string {

@@ -302,3 +302,23 @@ func TestResponseWriterWrapperDelegatesFlush(t *testing.T) {
 	flusher.Flush()
 	require.True(t, inner.flushed, "Flush should be delegated to inner ResponseWriter")
 }
+
+func TestIsEmptyDeltaChunk(t *testing.T) {
+	t.Parallel()
+
+	// Empty delta (no role, no content, no finish_reason)
+	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{}}]}`))
+	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"","content":""}}]}`))
+
+	// Has content
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"content":"hello"}}]}`))
+
+	// Has role
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"assistant"}}]}`))
+
+	// Has finish_reason
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+
+	// Invalid JSON should not be considered empty (pass through)
+	require.False(t, isEmptyDeltaChunk(`not-json`))
+}

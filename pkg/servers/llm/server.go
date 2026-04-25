@@ -368,13 +368,28 @@ func (s *Server) waitForSidecar(ctx context.Context) error {
 		cancel()
 
 		if err == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1<<20))
-			res.Body.Close()
-			if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
-				s.log.WithField("endpoint", endpoint.String()).Info("dllama-api sidecar is ready")
-				return nil
+			var modelsResp struct {
+				Data []struct {
+					Id string `json:"id"`
+				} `json:"data"`
 			}
-			err = fmt.Errorf("unexpected status %d", res.StatusCode)
+			decodeErr := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&modelsResp)
+			res.Body.Close()
+
+			if decodeErr != nil {
+				err = fmt.Errorf("decode models response: %w", decodeErr)
+			} else if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+				if len(modelsResp.Data) > 0 {
+					s.log.WithFields(logrus.Fields{
+						"endpoint": endpoint.String(),
+						"model":    modelsResp.Data[0].Id,
+					}).Info("dllama-api sidecar is ready")
+					return nil
+				}
+				err = fmt.Errorf("dllama-api returned no models")
+			} else {
+				err = fmt.Errorf("unexpected status %d", res.StatusCode)
+			}
 		} else if ctx.Err() != nil {
 			return nil
 		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -550,7 +565,8 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-		if err := s.nc.Publish(target, []byte(line)); err != nil {
+		normalized := normalizeStreamingChunk([]byte(line), payload.Request.Model)
+		if err := s.nc.Publish(target, normalized); err != nil {
 			s.log.WithError(err).Warn("publish chunk")
 		}
 	}
@@ -963,6 +979,25 @@ func normalizeChatCompletionResponse(data []byte, requestedModel string) []byte 
 				}
 			}
 		}
+	}
+
+	normalized, err := json.Marshal(resp)
+	if err != nil {
+		return data // return original if re-encoding fails
+	}
+	return normalized
+}
+
+// normalizeStreamingChunk fixes known dllama-api streaming response issues.
+func normalizeStreamingChunk(data []byte, requestedModel string) []byte {
+	var resp map[string]any
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return data // return as-is if unparseable
+	}
+
+	// Fix model field to match requested model
+	if requestedModel != "" {
+		resp["model"] = requestedModel
 	}
 
 	normalized, err := json.Marshal(resp)
