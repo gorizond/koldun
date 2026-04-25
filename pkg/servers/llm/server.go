@@ -1003,9 +1003,7 @@ func normalizeChatCompletionResponse(data []byte, requestedModel string) []byte 
 // parseToolCallsFromContent scans for markdown code blocks containing JSON with
 // "tool_calls" and extracts them into OpenAI-compatible format.
 func parseToolCallsFromContent(content string) ([]map[string]any, string) {
-	// Look for ```json ... ``` code blocks
 	const codeBlockStart = "```json"
-	const codeBlockEnd = "```"
 
 	var toolCalls []map[string]any
 	var cleanContent strings.Builder
@@ -1020,53 +1018,68 @@ func parseToolCallsFromContent(content string) ([]map[string]any, string) {
 		// Write text before code block
 		cleanContent.WriteString(content[:start])
 
-		// Find end of code block
-		end := strings.Index(content[start+len(codeBlockStart):], codeBlockEnd)
+		// Find end of code block (```) after the opening ```json
+		rest := content[start+len(codeBlockStart):]
+		end := strings.Index(rest, "```")
 		if end == -1 {
-			// Unclosed code block, keep as-is
-			cleanContent.WriteString(content[start:])
+			// Unclosed code block at end of content — try to parse the remainder as JSON
+			codeBlock := strings.TrimSpace(rest)
+			parsedToolCalls := extractToolCallsFromJSON(codeBlock)
+			if len(parsedToolCalls) > 0 {
+				toolCalls = append(toolCalls, parsedToolCalls...)
+			} else {
+				// No tool calls found, keep the unclosed block as content
+				cleanContent.WriteString(content[start:])
+			}
 			break
 		}
 
-		codeBlock := content[start+len(codeBlockStart) : start+len(codeBlockStart)+end]
-		codeBlock = strings.TrimSpace(codeBlock)
+		codeBlock := strings.TrimSpace(rest[:end])
 
 		// Try to parse JSON with tool_calls
-		var parsed map[string]any
-		if err := json.Unmarshal([]byte(codeBlock), &parsed); err == nil {
-			if calls, ok := parsed["tool_calls"].([]any); ok {
-				for _, call := range calls {
-					if callMap, ok := call.(map[string]any); ok {
-						// Convert arguments from object to JSON string if needed
-						if fn, ok := callMap["function"].(map[string]any); ok {
-							if args, ok := fn["arguments"]; ok {
-								switch a := args.(type) {
-								case string:
-									// Already a string, keep as-is
-								case map[string]any:
-									// Convert map to JSON string
-									argBytes, _ := json.Marshal(a)
-									fn["arguments"] = string(argBytes)
-								}
-							}
-						}
-						toolCalls = append(toolCalls, callMap)
-					}
+		parsedToolCalls := extractToolCallsFromJSON(codeBlock)
+		toolCalls = append(toolCalls, parsedToolCalls...)
+
+		// Continue after code block
+		content = rest[end+len("```"):]
+	}
+
+	result := strings.TrimSpace(cleanContent.String())
+	return toolCalls, result
+}
+
+// extractToolCallsFromJSON attempts to unmarshal a JSON snippet and extract
+// any tool_calls into OpenAI-compatible map[string]any.
+func extractToolCallsFromJSON(codeBlock string) []map[string]any {
+	var toolCalls []map[string]any
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(codeBlock), &parsed); err != nil {
+		return toolCalls
+	}
+	calls, ok := parsed["tool_calls"].([]any)
+	if !ok {
+		return toolCalls
+	}
+	for _, call := range calls {
+		callMap, ok := call.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Convert arguments from object to JSON string if needed
+		if fn, ok := callMap["function"].(map[string]any); ok {
+			if args, ok := fn["arguments"]; ok {
+				switch a := args.(type) {
+				case string:
+					// Already a string, keep as-is
+				case map[string]any:
+					argBytes, _ := json.Marshal(a)
+					fn["arguments"] = string(argBytes)
 				}
 			}
 		}
-
-		// Continue after code block
-		content = content[start+len(codeBlockStart)+end+len(codeBlockEnd):]
+		toolCalls = append(toolCalls, callMap)
 	}
-
-	// Trim any trailing whitespace
-	result := strings.TrimSpace(cleanContent.String())
-	if result == "" {
-		result = ""
-	}
-
-	return toolCalls, result
+	return toolCalls
 }
 
 // normalizeStreamingChunk fixes known dllama-api streaming response issues.
