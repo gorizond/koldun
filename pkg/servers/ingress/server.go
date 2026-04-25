@@ -1654,12 +1654,18 @@ func eventTimestamp(ts int64) time.Time {
 type streamingNormaliserState struct {
 	roleSent     bool
 	think        thinkRedactor
+	details      detailsRedactor
 	disableThink bool
 }
 
 type thinkRedactor struct {
 	buffer  string
 	inThink bool
+}
+
+type detailsRedactor struct {
+	buffer    string
+	inDetails bool
 }
 
 type streamingChunk struct {
@@ -1685,7 +1691,9 @@ func (s *streamingNormaliserState) scrubContent(content string) string {
 	if s == nil || content == "" || s.disableThink {
 		return content
 	}
-	return s.think.filter(content)
+	content = s.think.filter(content)
+	content = s.details.filter(content)
+	return content
 }
 
 func (r *thinkRedactor) filter(content string) string {
@@ -1739,7 +1747,7 @@ func (r *thinkRedactor) filter(content string) string {
 }
 
 func longestThinkSuffix(lower string) int {
-	patterns := []string{"<think>", "</think>"}
+	patterns := []string{"<thinking>", "</thinking>"}
 	max := 0
 	length := len(lower)
 	for _, pattern := range patterns {
@@ -1752,6 +1760,84 @@ func longestThinkSuffix(lower string) int {
 		}
 		for i := 1; i <= limit; i++ {
 			if strings.HasSuffix(lower, pattern[:i]) && i > max {
+				max = i
+			}
+		}
+	}
+	return max
+}
+
+func (r *detailsRedactor) filter(content string) string {
+	if content == "" {
+		return ""
+	}
+
+	r.buffer += content
+	var out strings.Builder
+
+	for {
+		if r.inDetails {
+			closeIdx := strings.Index(r.buffer, "</details>")
+			if closeIdx == -1 {
+				if len(r.buffer) > len("</details>")-1 {
+					r.buffer = r.buffer[len(r.buffer)-(len("</details>")-1):]
+				}
+				return out.String()
+			}
+			r.buffer = r.buffer[closeIdx+len("</details>"):]
+			r.inDetails = false
+			continue
+		}
+
+		openIdx := strings.Index(r.buffer, `<details type="reasoning"`)
+		if openIdx == -1 {
+			openIdx = strings.Index(r.buffer, `<details type='reasoning'`)
+		}
+		closeIdx := strings.Index(r.buffer, "</details>")
+
+		if closeIdx != -1 && (openIdx == -1 || closeIdx < openIdx) {
+			r.buffer = r.buffer[closeIdx+len("</details>"):]
+			continue
+		}
+
+		if openIdx == -1 {
+			emitLen := len(r.buffer) - longestDetailsSuffix(r.buffer)
+			if emitLen <= 0 {
+				return out.String()
+			}
+			out.WriteString(r.buffer[:emitLen])
+			r.buffer = r.buffer[emitLen:]
+			return out.String()
+		}
+
+		if openIdx > 0 {
+			out.WriteString(r.buffer[:openIdx])
+		}
+
+		tagEnd := strings.Index(r.buffer[openIdx:], ">")
+		if tagEnd == -1 {
+			r.buffer = r.buffer[openIdx:]
+			return out.String()
+		}
+		r.buffer = r.buffer[openIdx+tagEnd+1:]
+		r.inDetails = true
+	}
+}
+
+func longestDetailsSuffix(s string) int {
+	patterns := []string{`<details type="reasoning"`, `<details type='reasoning'`, "</details>"}
+	max := 0
+	length := len(s)
+	for _, pattern := range patterns {
+		limit := len(pattern) - 1
+		if limit <= 0 {
+			continue
+		}
+		if limit > length {
+			limit = length
+		}
+		for i := 1; i <= limit; i++ {
+			if strings.HasSuffix(s, pattern[:i]) && i > max {
 				max = i
 			}
 		}

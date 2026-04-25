@@ -72,6 +72,46 @@ func TestThinkRedactorFilter(t *testing.T) {
 		var redactor thinkRedactor
 		require.Equal(t, "payload", redactor.filter("</think>payload"))
 	})
+
+	t.Run("details reasoning block", func(t *testing.T) {
+		t.Parallel()
+		var redactor detailsRedactor
+
+		require.Equal(t, "prefix ", redactor.filter("prefix <details type=\"reasoning\">secret"))
+		require.Equal(t, "", redactor.filter(" plan"))
+		require.Equal(t, " visible", redactor.filter("</details> visible"))
+	})
+
+	t.Run("details with attributes", func(t *testing.T) {
+		t.Parallel()
+		var redactor detailsRedactor
+
+		result := redactor.filter("before <details type=\"reasoning\" done=\"true\" duration=\"1\">thinking")
+		require.Equal(t, "before ", result)
+
+		result = redactor.filter(" here</details> after")
+		require.Equal(t, " after", result)
+	})
+
+	t.Run("details across chunks", func(t *testing.T) {
+		t.Parallel()
+		var redactor detailsRedactor
+
+		// Chunk 1: partial opening tag
+		require.Equal(t, "", redactor.filter("<detail"))
+
+		// Chunk 2: rest of opening tag + content + partial closing tag
+		require.Equal(t, "", redactor.filter(`s type="reasoning">secret plan</detail`))
+
+		// Chunk 3: rest of closing tag + visible content
+		require.Equal(t, " visible", redactor.filter("s> visible"))
+	})
+
+	t.Run("details stray closing tag", func(t *testing.T) {
+		t.Parallel()
+		var redactor detailsRedactor
+		require.Equal(t, "payload", redactor.filter("</details>payload"))
+	})
 }
 
 func TestLongestThinkSuffix(t *testing.T) {
