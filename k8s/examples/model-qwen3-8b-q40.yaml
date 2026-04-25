@@ -29,7 +29,7 @@ spec:
   # Download configuration for 8B model (~16GB raw)
   download:
     image: python:3.11-slim
-    memory: 8Gi
+    memory: 6Gi
     chunkMaxMiB: 512
     concurrency: 6
 
@@ -37,7 +37,7 @@ spec:
   conversion:
     converterVersion: v0.16.5
     image: python:3.11-slim
-    memory: 8Gi
+    memory: 6Gi
     weightsFloatType: q40
     convertWeights: q40
     outputPath: s3://koldun-models/qwen3-8b-q40-converted

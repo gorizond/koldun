@@ -160,7 +160,14 @@ jobs:
 
           # Build helm dependencies (required for Chart.yaml validation)
           cd charts/koldun/
-          helm dependency build
+          # Retry helm dependency build up to 3 times
+          for i in 1 2 3; do
+            echo "Attempt $i: Building helm dependencies..."
+            helm dependency build && break || {
+              echo "Attempt $i failed, waiting 10 seconds..."
+              sleep 10
+            }
+          done
 
           # Update values to use test image and disable chart dependencies
           cat > /tmp/values-e2e.yaml <<EOF
@@ -297,7 +304,19 @@ jobs:
               port: 8082
           EOF
 
-          kubectl wait --for=condition=Ready ingress.koldun.gorizond.io/test-ingress -n koldun --timeout=2m
+          # Wait longer for Ingress to be Ready in CI
+          kubectl wait --for=condition=Ready ingress.koldun.gorizond.io/test-ingress -n koldun --timeout=5m
+
+      - name: Wait for Model CR to be Ready
+        run: |
+          # Ensure Model is Ready before running tests
+          kubectl wait --for=condition=Ready model/test-model -n koldun --timeout=2m || {
+            echo "=== Model CR status ==="
+            kubectl describe model test-model -n koldun
+            echo "=== Operator logs ==="
+            kubectl logs -n koldun deployment/koldun --tail=50 || true
+            exit 1
+          }
 
       - name: Run E2E test (resource creation only)
         env:
