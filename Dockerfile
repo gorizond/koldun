@@ -1,5 +1,5 @@
 ARG DL_REPOSITORY=https://github.com/b4rtaz/distributed-llama.git
-ARG DL_VERSION=v0.16.4
+ARG DL_VERSION=v0.16.5
 
 FROM alpine:3.20 AS dllama-builder
 ARG DL_REPOSITORY

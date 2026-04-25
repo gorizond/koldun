@@ -977,6 +977,18 @@ func normalizeChatCompletionResponse(data []byte, requestedModel string) []byte 
 				if reason, ok := choiceMap["finish_reason"].(string); ok && reason == "" {
 					choiceMap["finish_reason"] = "stop"
 				}
+
+				// Parse tool calls from markdown code blocks in content
+				if message, ok := choiceMap["message"].(map[string]any); ok {
+					if content, ok := message["content"].(string); ok {
+						toolCalls, cleanContent := parseToolCallsFromContent(content)
+						if len(toolCalls) > 0 {
+							message["tool_calls"] = toolCalls
+							message["content"] = cleanContent
+							choiceMap["finish_reason"] = "tool_calls"
+						}
+					}
+				}
 			}
 		}
 	}
@@ -986,6 +998,75 @@ func normalizeChatCompletionResponse(data []byte, requestedModel string) []byte 
 		return data // return original if re-encoding fails
 	}
 	return normalized
+}
+
+// parseToolCallsFromContent scans for markdown code blocks containing JSON with
+// "tool_calls" and extracts them into OpenAI-compatible format.
+func parseToolCallsFromContent(content string) ([]map[string]any, string) {
+	// Look for ```json ... ``` code blocks
+	const codeBlockStart = "```json"
+	const codeBlockEnd = "```"
+
+	var toolCalls []map[string]any
+	var cleanContent strings.Builder
+
+	for {
+		start := strings.Index(content, codeBlockStart)
+		if start == -1 {
+			cleanContent.WriteString(content)
+			break
+		}
+
+		// Write text before code block
+		cleanContent.WriteString(content[:start])
+
+		// Find end of code block
+		end := strings.Index(content[start+len(codeBlockStart):], codeBlockEnd)
+		if end == -1 {
+			// Unclosed code block, keep as-is
+			cleanContent.WriteString(content[start:])
+			break
+		}
+
+		codeBlock := content[start+len(codeBlockStart) : start+len(codeBlockStart)+end]
+		codeBlock = strings.TrimSpace(codeBlock)
+
+		// Try to parse JSON with tool_calls
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(codeBlock), &parsed); err == nil {
+			if calls, ok := parsed["tool_calls"].([]any); ok {
+				for _, call := range calls {
+					if callMap, ok := call.(map[string]any); ok {
+						// Convert arguments from object to JSON string if needed
+						if fn, ok := callMap["function"].(map[string]any); ok {
+							if args, ok := fn["arguments"]; ok {
+								switch a := args.(type) {
+								case string:
+									// Already a string, keep as-is
+								case map[string]any:
+									// Convert map to JSON string
+									argBytes, _ := json.Marshal(a)
+									fn["arguments"] = string(argBytes)
+								}
+							}
+						}
+						toolCalls = append(toolCalls, callMap)
+					}
+				}
+			}
+		}
+
+		// Continue after code block
+		content = content[start+len(codeBlockStart)+end+len(codeBlockEnd):]
+	}
+
+	// Trim any trailing whitespace
+	result := strings.TrimSpace(cleanContent.String())
+	if result == "" {
+		result = ""
+	}
+
+	return toolCalls, result
 }
 
 // normalizeStreamingChunk fixes known dllama-api streaming response issues.
