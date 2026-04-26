@@ -492,7 +492,25 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		Command:         []string{"dllama-api"},
 		Args:            args,
 		Env:             env,
-		StartupProbe: &corev1.Probe{
+		// NOTE: Startup probe disabled due to distributed-llama blocking during inference.
+		// The /v1/models endpoint becomes unresponsive during CPU inference, causing
+		// Kubernetes to kill the pod.		// TODO: Patch distributed-llama to add a non-blocking /healthz endpoint.
+		// See: https://github.com/gorizond/koldun/issues/XXX
+		// Liveness probe uses TCP socket check which is more tolerant than HTTP during inference
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromInt(9999),
+				},
+			},
+			InitialDelaySeconds: 60,
+			PeriodSeconds:       30,
+			FailureThreshold:    10,
+		},
+		// Readiness probe checks if model is loaded via HTTP
+		// This may fail during inference but that's expected - the pod stays alive
+		// but won't receive traffic until ready again
+		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
 					Path:   "/v1/models",
@@ -500,8 +518,9 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 					Scheme: corev1.URISchemeHTTP,
 				},
 			},
-			PeriodSeconds:    dllamaStartupProbePeriodSeconds,
-			FailureThreshold: dllamaStartupProbeFailureSeconds,
+			InitialDelaySeconds: 60,
+			PeriodSeconds:       10,
+			FailureThreshold:    3,
 		},
 		Ports: []corev1.ContainerPort{{ContainerPort: 9999}},
 		VolumeMounts: []corev1.VolumeMount{
