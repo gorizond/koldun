@@ -22,10 +22,11 @@ func TestDesiredWorkersFallsBackToIngressNATS(t *testing.T) {
 	handler := &dllamaHandler{ingresses: ingressController}
 
 	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
-	ingressCache.EXPECT().List("default", gomock.Any()).Return([]*v1.Ingress{}, nil)
+	// Expect multiple List calls from both getIngressNatsURL and getIngressNThreads
+	ingressCache.EXPECT().List("default", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
 	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{{
 		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{NATS: v1.IngressNATSConfig{URL: "nats://shared:4222"}}},
-	}}, nil)
+	}}, nil).AnyTimes()
 
 	dllama := &v1.Dllama{
 		ObjectMeta: metav1.ObjectMeta{
@@ -93,9 +94,11 @@ func TestDesiredWorkersPopulatesAnnotationsFromIngressWhenAnnotationsEmpty(t *te
 	handler := &dllamaHandler{ingresses: ingressController}
 
 	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+	// Expect multiple List calls from both getIngressNatsURL and getIngressNThreads
 	ingressCache.EXPECT().List("default", gomock.Any()).Return([]*v1.Ingress{{
 		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{NATS: v1.IngressNATSConfig{URL: "nats://ns-only:4222"}}},
-	}}, nil)
+	}}, nil).AnyTimes()
+	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
 
 	dllama := &v1.Dllama{
 		ObjectMeta: metav1.ObjectMeta{

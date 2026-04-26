@@ -299,8 +299,8 @@ func TestDesiredRootPrefersExplicitNATSAndLabelHash(t *testing.T) {
 	ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
 	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
 	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
-	ingressCache.EXPECT().List("models", gomock.Any()).Return([]*v1.Ingress{}, nil)
-	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{}, nil)
+	ingressCache.EXPECT().List("models", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
+	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
 
 	handler := &dllamaHandler{ingresses: ingressController}
 

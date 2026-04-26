@@ -101,7 +101,7 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 		require.Len(t, pod.Containers, 1)
 		container := pod.Containers[0]
 		require.Equal(t, "dllama", strings.Join(container.Command, " "))
-		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2", "--foo", "bar"}, container.Args)
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "1", "--foo", "bar"}, container.Args)
 		require.Equal(t, int32(9999), container.Ports[0].ContainerPort)
 
 		roleEnv := envVarValue(container.Env, "DLLAMA_ROLE")
@@ -397,8 +397,9 @@ func TestWorkerHandlerEnsureStatefulSetUsesModelMemoryPlan(t *testing.T) {
 			},
 		},
 		Spec: v1.WorkerSpec{
-			Image: "ghcr.io/gorizond/dllama:latest",
-			Slot:  3,
+			Image:    "ghcr.io/gorizond/dllama:latest",
+			Slot:     3,
+			NThreads: 4,
 		},
 	}
 
@@ -935,7 +936,7 @@ func TestWorkerHandlerEnsureStatefulSetWithoutDllamaLabel(t *testing.T) {
 		sts := objs[1].(*appsv1.StatefulSet)
 		require.EqualValues(t, 1, *sts.Spec.Replicas)
 		container := sts.Spec.Template.Spec.Containers[0]
-		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "1"}, container.Args)
 		return nil
 	})
 
@@ -989,7 +990,7 @@ func TestWorkerHandlerEnsureStatefulSetReplicasZeroOrNegative(t *testing.T) {
 		sts := objs[1].(*appsv1.StatefulSet)
 		require.EqualValues(t, 1, *sts.Spec.Replicas)
 		container := sts.Spec.Template.Spec.Containers[0]
-		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "1"}, container.Args)
 		return nil
 	})
 
@@ -1042,7 +1043,7 @@ func TestWorkerHandlerEnsureStatefulSetThreadsZeroOrNegative(t *testing.T) {
 	).DoAndReturn(func(objs ...interface{}) error {
 		sts := objs[1].(*appsv1.StatefulSet)
 		container := sts.Spec.Template.Spec.Containers[0]
-		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "2"}, container.Args)
+		require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "1"}, container.Args)
 		return nil
 	})
 

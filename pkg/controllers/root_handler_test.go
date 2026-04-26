@@ -901,7 +901,7 @@ func TestRootHandlerEnsureStatefulSetHandlesZeroReplicaPower(t *testing.T) {
 			break
 		}
 	}
-	require.Equal(t, "2", threadsArg, "zero replica power should default to two root threads")
+	require.Equal(t, "1", threadsArg, "zero replica power should default to one root thread")
 
 	annotations := sts.Spec.Template.ObjectMeta.Annotations
 	require.Contains(t, annotations, annotationMemoryPlan)

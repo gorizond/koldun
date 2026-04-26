@@ -409,6 +409,9 @@ func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float
 // It first checks ingresses in the same namespace, then falls back to cluster-wide.
 // Returns 0 if no Ingress has NThreads configured (use default).
 func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
+	if h.ingresses == nil {
+		return 0
+	}
 	lookup := func(ings []*v1.Ingress) int32 {
 		for _, ing := range ings {
 			if ing.Spec.Backend.NThreads > 0 {
