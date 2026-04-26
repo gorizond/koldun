@@ -7,10 +7,10 @@ spec:
   chart: koldun
   repo: https://gorizond.github.io/koldun
   targetNamespace: koldun
-  version: 0.1.6
-  valuesContent: |
-    image:
-      tag: v0.1.6
+  version: 0.1.7
+    valuesContent: |
+      image:
+        tag: v0.1.7
     nats:
       enabled: true
     minio:
