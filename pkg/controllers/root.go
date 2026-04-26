@@ -492,34 +492,18 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		Command:         []string{"dllama-api"},
 		Args:            args,
 		Env:             env,
-		// NOTE: Health checks simplified for distributed-llama architecture.
+		// NOTE: No health probes configured for root container.
 		//
-		// 1. StartupProbe: Disabled - not needed as TCP liveness is sufficient
-		// 2. ReadinessProbe: Removed - the LLM sidecar handles readiness via NATS
-		// 3. LivenessProbe: TCP socket check only - tolerates inference blocking
+		// The root container (dllama-api) runs a single-threaded HTTP server on port 9999.
+		// During CPU inference, the /v1/models endpoint becomes unresponsive.
+		// Any HTTP or TCP probe would cause Kubernetes to kill the pod mid-inference.
 		//
-		// The /v1/models endpoint becomes unresponsive during CPU inference.
-		// HTTP probes would cause Kubernetes to kill the pod mid-inference.
-		// TCP socket check only verifies the process is listening, not HTTP response.
-		//
-		// Readiness is managed by the LLM sidecar which:
-		// - Checks /v1/models before subscribing to NATS
-		// - Unsubscribes from NATS during inference (handles readiness)
-		// - Re-subscribes when model is ready for next request
+		// Health management is delegated to:
+		// 1. Kubernetes: Restarts container if process exits
+		// 2. LLM sidecar: Manages readiness via NATS subscription (pulls work when ready)
 		//
 		// TODO: Patch distributed-llama to add a non-blocking /healthz endpoint.
 		// See: https://github.com/gorizond/koldun/issues/XXX
-		LivenessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{
-				TCPSocket: &corev1.TCPSocketAction{
-					Port: intstr.FromInt(9999),
-				},
-			},
-			InitialDelaySeconds: 60,
-			PeriodSeconds:       30,
-			FailureThreshold:    10,
-			TimeoutSeconds:      5,
-		},
 		Ports: []corev1.ContainerPort{{ContainerPort: 9999}},
 		VolumeMounts: []corev1.VolumeMount{
 			{
