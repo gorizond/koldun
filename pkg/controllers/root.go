@@ -206,9 +206,11 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		return fmt.Errorf("model %s/%s conversion.weightsFloatType is required", model.Namespace, model.Name)
 	}
 
-	// Default to 1 thread for single-core inference.
-	// NThreads can be customized via spec.args on the Root CR.
-	threads := int32(1)
+	// Use NThreads from Root spec, default to 1 for single-core inference.
+	threads := root.Spec.NThreads
+	if threads <= 0 {
+		threads = 1
+	}
 
 	workerReplicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
 	if workerReplicas < 0 {

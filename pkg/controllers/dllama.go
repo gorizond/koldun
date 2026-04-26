@@ -251,6 +251,12 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	if ratio := h.getIngressRootOverheadMaxRatio(dllama); ratio != nil {
 		root.Spec.Memory = &v1.RootMemorySpec{OverheadMaxRatio: pointer.Float64(*ratio)}
 	}
+	// Set NThreads from Ingress CR, default to 1 if not specified
+	if nthreads := h.getIngressNThreads(dllama); nthreads > 0 {
+		root.Spec.NThreads = nthreads
+	} else {
+		root.Spec.NThreads = 1
+	}
 	return root
 }
 
@@ -287,6 +293,12 @@ func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1
 		}
 	}
 
+	// Get NThreads from Ingress CR, default to 1
+	nthreads := int32(1)
+	if ingressNThreads := h.getIngressNThreads(dllama); ingressNThreads > 0 {
+		nthreads = ingressNThreads
+	}
+
 	worker := &v1.Worker{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: v1.SchemeGroupVersion.String(),
@@ -304,6 +316,7 @@ func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1
 			RootRef:  fmt.Sprintf("%s-root", dllama.Name),
 			Slot:     0,
 			NATS:     natsConfig,
+			NThreads: nthreads,
 		},
 	}
 
@@ -390,6 +403,32 @@ func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float
 		}
 	}
 	return nil
+}
+
+// getIngressNThreads retrieves the NThreads value from Ingress CR.
+// It first checks ingresses in the same namespace, then falls back to cluster-wide.
+// Returns 0 if no Ingress has NThreads configured (use default).
+func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
+	lookup := func(ings []*v1.Ingress) int32 {
+		for _, ing := range ings {
+			if ing.Spec.Backend.NThreads > 0 {
+				return ing.Spec.Backend.NThreads
+			}
+		}
+		return 0
+	}
+
+	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
+		if v := lookup(ingresses); v > 0 {
+			return v
+		}
+	}
+	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
+		if v := lookup(allIngresses); v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {

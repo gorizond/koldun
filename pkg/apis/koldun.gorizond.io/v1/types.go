@@ -309,6 +309,9 @@ type RootSpec struct {
 	NATS *RootNATSConfig `json:"nats,omitempty"`
 	// Memory allows overriding root memory planning parameters.
 	Memory *RootMemorySpec `json:"memory,omitempty"`
+	// NThreads configures the number of threads for dllama-api.
+	// Defaults to 1. This controls the --nthreads flag.
+	NThreads int32 `json:"nThreads,omitempty"`
 }
 
 // RootMemorySpec customizes root memory calculations.
@@ -374,6 +377,9 @@ type WorkerSpec struct {
 	Slot int32 `json:"slot"`
 	// NATS configures worker connectivity.
 	NATS *WorkerNATSConfig `json:"nats,omitempty"`
+	// NThreads configures the number of threads for dllama-api worker.
+	// Defaults to 1. This controls the --nthreads flag.
+	NThreads int32 `json:"nThreads,omitempty"`
 }
 
 // WorkerNATSConfig configures NATS connectivity for worker pods.

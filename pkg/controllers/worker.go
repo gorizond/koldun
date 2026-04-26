@@ -126,14 +126,16 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 	}
 
 	replicas := int32(1)
-	threads := int32(1)
+	// Use NThreads from Worker spec, default to 1 for single-core inference.
+	threads := worker.Spec.NThreads
+	if threads <= 0 {
+		threads = 1
+	}
 	if dllama != nil {
 		replicas = workersForReplicaPower(dllama.Spec.ReplicaPower)
 		if replicas <= 0 {
 			replicas = 1
 		}
-		// Default to 1 thread for single-core inference.
-		// NThreads can be customized via spec.args on the Worker CR.
 	}
 
 	var model *v1.Model
