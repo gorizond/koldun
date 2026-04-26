@@ -1177,6 +1177,9 @@ type IngressBackendSpec struct {
 	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
 	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
 	RootMemory      *IngressRootMemorySpec      `json:"rootMemory,omitempty"`
+	// NThreads configures the number of threads for dllama-api root and worker containers.
+	// Default is 1. This controls the --nthreads flag passed to distributed-llama.
+	NThreads int32 `json:"nThreads,omitempty"`
 }
 
 // IngressRootMemorySpec customises root memory calculation.
