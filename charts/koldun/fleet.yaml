@@ -2,16 +2,6 @@ defaultNamespace: koldun
 
 helm:
   chart: .
-  values: 
+  values:
     image:
-      tag: v0.0.7 # {"$imagescan": "koldun:tag"}
-
-imageScans:
-  - policy:
-      semver:
-        range: "v0.0.*"
-      alphabetical:
-        order: asc
-    image: "ghcr.io/gorizond/koldun"
-    tagName: koldun
-    interval: 10s
+      tag: v0.0.7
