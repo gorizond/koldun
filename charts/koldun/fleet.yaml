@@ -4,4 +4,8 @@ helm:
   chart: .
   values:
     image:
-      tag: v0.0.7
+      tag: v0.0.134
+    operator:
+      conversation:
+        natsUrl: nats://nats.nats.svc:4222
+        kvBucket: conversations
