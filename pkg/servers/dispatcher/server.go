@@ -88,9 +88,14 @@ type assignment struct {
 	requestID    string
 	worker       string
 	payload      []byte
+	attempts     int
 }
 
 var ErrQueueMisconfigured = errors.New("dispatcher queue misconfigured")
+
+// maxBacklogAttempts bounds redeliveries of a failing request before the
+// dispatcher reports a terminal error to the client instead of requeueing.
+const maxBacklogAttempts = 3
 
 // New constructs a dispatcher instance.
 func New(cfg Config) (*Server, error) {
@@ -299,9 +304,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 				"pin":          pin,
 			}).Info("dispatcher backlog: no idle workers available, requeuing")
 		}
-		if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); err != nil {
-			s.log.WithError(err).Error("failed to requeue backlog message after retries")
-		}
+		s.requeueOrFail(backlog, "no idle workers available")
 		return
 	}
 
@@ -320,10 +323,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 	subject := fmt.Sprintf("%s%s.in", s.cfg.DllamaSubjectPrefix, worker)
 	if err := PublishWithRetry(s.nc, subject, payload, s.retryConfig, s.log); err != nil {
 		s.log.WithError(err).WithField("subject", subject).Error("failed to publish assignment after retries")
-		// Requeue the backlog item since we couldn't dispatch it
-		if requeueErr := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); requeueErr != nil {
-			s.log.WithError(requeueErr).Error("failed to requeue after publish failure")
-		}
+		s.requeueOrFail(backlog, "failed to publish assignment")
 		return
 	}
 
@@ -343,6 +343,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		requestID:    backlog.ID,
 		worker:       worker,
 		payload:      backlog.Payload,
+		attempts:     backlog.Attempts,
 	}
 	s.mu.Unlock()
 
@@ -412,6 +413,9 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 	}
 
 	if requeue {
+		// The worker failed before delivering a token; drop the pin so the
+		// retry cannot land on the same instance once it reports idle again.
+		s.clearPin(asn.worker)
 		s.requeueAssignment(asn)
 	}
 
@@ -426,8 +430,27 @@ func (s *Server) requeueAssignment(asn *assignment) {
 		ID:        asn.requestID,
 		Payload:   asn.payload,
 		CreatedAt: time.Now().Unix(),
+		Attempts:  asn.attempts,
 	}
-	body, err := json.Marshal(backlog)
+	s.requeueOrFail(backlog, "worker reported an error")
+}
+
+// requeueOrFail republishes the backlog item until maxBacklogAttempts is
+// reached; afterwards the failure is reported to the client and the item is
+// dropped so workers stop spinning on a deterministic failure.
+func (s *Server) requeueOrFail(backlog conversation.BacklogMessage, reason string) {
+	attempts := backlog.Attempts + 1
+	if attempts >= maxBacklogAttempts {
+		s.failBacklog(backlog, attempts, reason)
+		return
+	}
+	next := conversation.BacklogMessage{
+		ID:        backlog.ID,
+		Payload:   backlog.Payload,
+		CreatedAt: time.Now().Unix(),
+		Attempts:  attempts,
+	}
+	body, err := json.Marshal(next)
 	if err != nil {
 		s.log.WithError(err).Warn("marshal backlog retry")
 		return
@@ -435,6 +458,48 @@ func (s *Server) requeueAssignment(asn *assignment) {
 	if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, body, s.retryConfig, s.log); err != nil {
 		s.log.WithError(err).Error("failed to republish backlog after retries")
 	}
+}
+
+// failBacklog publishes a terminal error to the request's response subject so
+// streaming clients are unblocked instead of hanging on a dead request.
+func (s *Server) failBacklog(backlog conversation.BacklogMessage, attempts int, reason string) {
+	var payload struct {
+		ResponseSubject string `json:"responseSubject"`
+	}
+	_ = json.Unmarshal(backlog.Payload, &payload)
+	subject := strings.TrimSpace(payload.ResponseSubject)
+	if subject == "" {
+		s.log.WithFields(logrus.Fields{
+			"requestId": backlog.ID,
+			"attempts":  attempts,
+			"reason":    reason,
+		}).Warn("dropping failed backlog without a response subject")
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("inference failed after %d attempts: %s", attempts, reason),
+			"type":    "server_error",
+			"code":    "inference_failed",
+		},
+	})
+	if err != nil {
+		s.log.WithError(err).Warn("marshal terminal failure")
+		return
+	}
+	if err := PublishWithRetry(s.nc, subject, body, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithField("subject", subject).Error("publish terminal failure")
+	}
+	if err := PublishWithRetry(s.nc, subject, []byte("[DONE]"), s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithField("subject", subject).Error("publish terminal done marker")
+	}
+	s.log.WithFields(logrus.Fields{
+		"requestId": backlog.ID,
+		"attempts":  attempts,
+		"reason":    reason,
+		"subject":   subject,
+	}).Warn("backlog failed permanently")
 }
 
 // selectWorker returns the deterministic worker pick without affinity.

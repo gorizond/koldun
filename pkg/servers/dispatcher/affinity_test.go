@@ -258,3 +258,94 @@ func TestHandleBacklogRepinsWhenPinnedGone(t *testing.T) {
 	assert.Equal(t, "worker-a", srv.conversations.(*conversationKV).record(t).PinnedDllama)
 	assert.Equal(t, before+1, promtestutil.ToFloat64(metrics.DispatcherCacheEvictionsTotal.WithLabelValues("pinned_gone")))
 }
+
+func TestHandleBacklogRequeuesWithAttempts(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{}, "")
+	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
+
+	backlog := conversation.BacklogMessage{
+		ID:       "req-retry",
+		Payload:  json.RawMessage(`{"responseSubject":"out.req-retry"}`),
+		Attempts: 0,
+	}
+	data, err := json.Marshal(backlog)
+	require.NoError(t, err)
+
+	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: data})
+
+	require.Len(t, recorder.Published, 1, "no worker means one requeue, not an error")
+	next := recorder.Published[0]
+	assert.Equal(t, "backlog", next.Subject)
+	var requeued conversation.BacklogMessage
+	require.NoError(t, json.Unmarshal(next.Data, &requeued))
+	assert.Equal(t, 1, requeued.Attempts)
+	assert.Equal(t, backlog.ID, requeued.ID)
+}
+
+func TestHandleBacklogFailsAfterMaxAttempts(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{}, "")
+	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
+
+	backlog := conversation.BacklogMessage{
+		ID:       "req-dead",
+		Payload:  json.RawMessage(`{"responseSubject":"out.req-dead"}`),
+		Attempts: maxBacklogAttempts - 1,
+	}
+	data, err := json.Marshal(backlog)
+	require.NoError(t, err)
+
+	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: data})
+
+	require.Len(t, recorder.Published, 2, "terminal error and [DONE], no requeue")
+	for _, message := range recorder.Published {
+		assert.Equal(t, "out.req-dead", message.Subject)
+	}
+	var failure map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Published[0].Data, &failure))
+	errBody, ok := failure["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "inference_failed", errBody["code"])
+	assert.Contains(t, errBody["message"], "inference failed after 3 attempts")
+	assert.Equal(t, "[DONE]", string(recorder.Published[1].Data))
+}
+
+func TestFinishAssignmentRequeueClearsPinAndIncrementsAttempts(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{}, "worker-a")
+	srv.inflight["asn-1"] = &assignment{
+		assignmentID: "asn-1",
+		requestID:    "req-pin",
+		worker:       "worker-a",
+		payload:      []byte(`{"responseSubject":"out.req-pin"}`),
+		attempts:     0,
+	}
+	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
+
+	srv.finishAssignment("asn-1", true)
+
+	assert.Empty(t, srv.conversations.(*conversationKV).record(t).PinnedDllama, "failed worker must lose the pin")
+	require.Len(t, recorder.Published, 1)
+	assert.Equal(t, "backlog", recorder.Published[0].Subject)
+	var requeued conversation.BacklogMessage
+	require.NoError(t, json.Unmarshal(recorder.Published[0].Data, &requeued))
+	assert.Equal(t, 1, requeued.Attempts)
+
+	srv.mu.Lock()
+	inflight := len(srv.inflight)
+	srv.mu.Unlock()
+	assert.Zero(t, inflight)
+}
+
+func TestFinishAssignmentRequeueKeepsNewerPin(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{}, "worker-b")
+	srv.inflight["asn-2"] = &assignment{
+		assignmentID: "asn-2",
+		requestID:    "req-pin-2",
+		worker:       "worker-a",
+		payload:      []byte(`{"responseSubject":"out.req-pin-2"}`),
+	}
+
+	srv.finishAssignment("asn-2", true)
+
+	assert.Equal(t, "worker-b", srv.conversations.(*conversationKV).record(t).PinnedDllama,
+		"clearing must not overwrite a pin written for another worker")
+}

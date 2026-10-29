@@ -134,6 +134,26 @@ func (s *Server) pinWorker(worker string) {
 	}
 }
 
+// clearPin removes the affinity entry when it still points at the failed
+// worker. Later pins written by another request are left untouched.
+func (s *Server) clearPin(worker string) {
+	worker = strings.TrimSpace(worker)
+	if s.conversations == nil || worker == "" {
+		return
+	}
+	key := conversation.DefaultTTLPrefix + s.cfg.Hash
+	_, err := conversation.UpdateRecord(s.conversations, key, func(record *conversation.Record) bool {
+		if record.PinnedDllama != worker {
+			return false
+		}
+		record.PinnedDllama = ""
+		return true
+	})
+	if err != nil {
+		s.log.WithError(err).WithField("worker", worker).Debug("clear pinned worker")
+	}
+}
+
 func recordAffinityMetrics(pin, outcome string) {
 	metrics.DispatcherAffinityEventsTotal.WithLabelValues(outcome).Inc()
 	switch outcome {
