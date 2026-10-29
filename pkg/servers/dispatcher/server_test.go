@@ -1250,8 +1250,8 @@ func TestRecoverAssignmentsDeleteError(t *testing.T) {
 
 	// Verify message was still requeued despite delete error
 	rec := srv.nc.(*testhelpers.RecordingNATSConn)
-	assert.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "test.backlog", rec.Messages()[0].Subject)
 }
 
 func TestRecoverAssignmentsNoKeysFound(t *testing.T) {
@@ -1288,11 +1288,12 @@ func TestRequeueAssignmentPublishesBacklog(t *testing.T) {
 
 	srv.requeueAssignment(asn, "requeue test")
 
-	require.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, time.Second, 10*time.Millisecond)
+	published := rec.Messages()
+	assert.Equal(t, "test.backlog", published[0].Subject)
 
 	var backlog conversation.BacklogMessage
-	require.NoError(t, json.Unmarshal(rec.Published[0].Data, &backlog))
+	require.NoError(t, json.Unmarshal(published[0].Data, &backlog))
 	assert.Equal(t, "req-1", backlog.ID)
 	assert.NotEmpty(t, backlog.Payload)
 }
@@ -1316,8 +1317,8 @@ func TestRequeueAssignmentLogsPublishError(t *testing.T) {
 	require.NotPanics(t, func() {
 		srv.requeueAssignment(asn, "requeue test")
 	})
-	require.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, "test.backlog", rec.Messages()[0].Subject)
 }
 
 func TestDispatcherIntegration(t *testing.T) {

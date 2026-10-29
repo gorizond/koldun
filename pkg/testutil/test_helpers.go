@@ -38,6 +38,13 @@ func (r *RecordingNATSConn) Publish(subject string, data []byte) error {
 	return nil
 }
 
+// Messages returns a snapshot of the recorded publications.
+func (r *RecordingNATSConn) Messages() []PublishedMessage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]PublishedMessage(nil), r.Published...)
+}
+
 func (r *RecordingNATSConn) Subscribe(string, nats.MsgHandler) (*nats.Subscription, error) {
 	return nil, errors.New("recording connection Subscribe not implemented")
 }

@@ -15,6 +15,7 @@ type BacklogMessage struct {
 type AssignmentEnvelope struct {
 	AssignmentID string          `json:"assignmentId"`
 	RequestID    string          `json:"requestId"`
+	Attempts     int             `json:"attempts,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 }
 

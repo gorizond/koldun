@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -259,8 +260,9 @@ func TestHandleBacklogRepinsWhenPinnedGone(t *testing.T) {
 	assert.Equal(t, before+1, promtestutil.ToFloat64(metrics.DispatcherCacheEvictionsTotal.WithLabelValues("pinned_gone")))
 }
 
-func TestHandleBacklogRequeuesWithAttempts(t *testing.T) {
+func TestHandleBacklogCapacityRequeueKeepsAttempts(t *testing.T) {
 	srv := newAffinityServer(t, map[string]*workerState{}, "")
+	srv.cfg.RequeueDelay = 20 * time.Millisecond
 	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
 
 	backlog := conversation.BacklogMessage{
@@ -271,24 +273,28 @@ func TestHandleBacklogRequeuesWithAttempts(t *testing.T) {
 	data, err := json.Marshal(backlog)
 	require.NoError(t, err)
 
+	// A missing idle worker is capacity pressure, never a failure.
 	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: data})
 
-	require.Len(t, recorder.Published, 1, "no worker means one requeue, not an error")
-	next := recorder.Published[0]
+	require.Eventually(t, func() bool { return len(recorder.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	next := recorder.Messages()[0]
 	assert.Equal(t, "backlog", next.Subject)
 	var requeued conversation.BacklogMessage
 	require.NoError(t, json.Unmarshal(next.Data, &requeued))
-	assert.Equal(t, 1, requeued.Attempts)
 	assert.Equal(t, backlog.ID, requeued.ID)
+	assert.Zero(t, requeued.Attempts, "capacity requeues must not consume the failure budget")
 }
 
-func TestHandleBacklogFailsAfterMaxAttempts(t *testing.T) {
+func TestHandleBacklogCapacityNeverTerminallyFails(t *testing.T) {
 	srv := newAffinityServer(t, map[string]*workerState{}, "")
+	srv.cfg.RequeueDelay = 20 * time.Millisecond
 	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
 
+	// Even at the edge of the worker-failure budget, capacity pressure only
+	// requeues: the backend never saw the request.
 	backlog := conversation.BacklogMessage{
-		ID:       "req-dead",
-		Payload:  json.RawMessage(`{"responseSubject":"out.req-dead"}`),
+		ID:       "req-waiting",
+		Payload:  json.RawMessage(`{"responseSubject":"out.req-waiting"}`),
 		Attempts: maxBacklogAttempts - 1,
 	}
 	data, err := json.Marshal(backlog)
@@ -296,17 +302,110 @@ func TestHandleBacklogFailsAfterMaxAttempts(t *testing.T) {
 
 	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: data})
 
-	require.Len(t, recorder.Published, 2, "terminal error and [DONE], no requeue")
-	for _, message := range recorder.Published {
-		assert.Equal(t, "out.req-dead", message.Subject)
+	require.Eventually(t, func() bool { return len(recorder.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	published := recorder.Messages()
+	assert.Equal(t, "backlog", published[0].Subject)
+	var requeued conversation.BacklogMessage
+	require.NoError(t, json.Unmarshal(published[0].Data, &requeued))
+	assert.Equal(t, maxBacklogAttempts-1, requeued.Attempts)
+	for _, message := range published {
+		assert.NotContains(t, string(message.Data), "inference_failed")
 	}
-	var failure map[string]any
-	require.NoError(t, json.Unmarshal(recorder.Published[0].Data, &failure))
-	errBody, ok := failure["error"].(map[string]any)
-	require.True(t, ok)
-	assert.Equal(t, "inference_failed", errBody["code"])
-	assert.Contains(t, errBody["message"], "inference failed after 3 attempts")
-	assert.Equal(t, "[DONE]", string(recorder.Published[1].Data))
+}
+
+// failingSubjectConn rejects publishes to one subject while recording the rest.
+type failingSubjectConn struct {
+	testhelpers.RecordingNATSConn
+	subject string
+}
+
+func (c *failingSubjectConn) Publish(subject string, data []byte) error {
+	if subject == c.subject {
+		return errors.New("transport down")
+	}
+	return c.RecordingNATSConn.Publish(subject, data)
+}
+
+func TestHandleBacklogTransportFailureKeepsAttempts(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{
+		"worker-a": idleWorker("worker-a"),
+	}, "")
+	srv.cfg.RequeueDelay = 20 * time.Millisecond
+	srv.retryConfig = natsutil.RetryConfig{MaxRetries: 0}
+	conn := &failingSubjectConn{subject: "dllama.worker-a.in"}
+	srv.nc = conn
+
+	backlog := conversation.BacklogMessage{
+		ID:       "req-transport",
+		Payload:  json.RawMessage(`{"responseSubject":"out.req-transport"}`),
+		Attempts: 2,
+	}
+	data, err := json.Marshal(backlog)
+	require.NoError(t, err)
+
+	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: data})
+
+	require.Eventually(t, func() bool { return len(conn.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	published := conn.Messages()
+	assert.Equal(t, "backlog", published[0].Subject)
+	var requeued conversation.BacklogMessage
+	require.NoError(t, json.Unmarshal(published[0].Data, &requeued))
+	assert.Equal(t, backlog.Attempts, requeued.Attempts, "transport failures must not consume the failure budget")
+}
+
+func TestOneWorkerSecondRequestWaitsThenSucceeds(t *testing.T) {
+	worker := idleWorker("worker-a")
+	srv := newAffinityServer(t, map[string]*workerState{"worker-a": worker}, "")
+	srv.cfg.RequeueDelay = 20 * time.Millisecond
+	srv.retryConfig = natsutil.RetryConfig{MaxRetries: 0}
+	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
+
+	makeBacklog := func(id string) *nats.Msg {
+		backlog := conversation.BacklogMessage{
+			ID:      id,
+			Payload: json.RawMessage(`{"responseSubject":"out.` + id + `"}`),
+		}
+		data, err := json.Marshal(backlog)
+		require.NoError(t, err)
+		return &nats.Msg{Subject: "backlog", Data: data}
+	}
+
+	// First request occupies the only worker.
+	srv.handleBacklog(makeBacklog("req-1"))
+	srv.mu.Lock()
+	srv.workers["worker-a"].state = "busy"
+	srv.workers["worker-a"].active = 1
+	srv.mu.Unlock()
+
+	// Second request must not fail: it waits for capacity.
+	start := time.Now()
+	srv.handleBacklog(makeBacklog("req-2"))
+	assert.Less(t, time.Since(start), srv.requeueDelay(), "capacity requeue must not block the dispatcher")
+
+	require.Eventually(t, func() bool { return len(recorder.Messages()) == 2 }, 2*time.Second, 10*time.Millisecond)
+	requeuedMsg := recorder.Messages()[1]
+	assert.Equal(t, "backlog", requeuedMsg.Subject)
+	var requeued conversation.BacklogMessage
+	require.NoError(t, json.Unmarshal(requeuedMsg.Data, &requeued))
+	assert.Zero(t, requeued.Attempts)
+
+	// Worker becomes free again; the requeued request is dispatched.
+	srv.mu.Lock()
+	srv.workers["worker-a"].state = "idle"
+	srv.workers["worker-a"].active = 0
+	srv.workers["worker-a"].lastHeartbeat = time.Now()
+	srv.mu.Unlock()
+
+	srv.handleBacklog(&nats.Msg{Subject: "backlog", Data: requeuedMsg.Data})
+
+	assignments := 0
+	for _, message := range recorder.Messages() {
+		if message.Subject == "dllama.worker-a.in" {
+			assignments++
+		}
+		assert.NotContains(t, string(message.Data), "inference_failed")
+	}
+	assert.Equal(t, 2, assignments, "both requests must eventually reach the worker")
 }
 
 func TestFinishAssignmentRequeueClearsPinAndIncrementsAttempts(t *testing.T) {
@@ -323,10 +422,11 @@ func TestFinishAssignmentRequeueClearsPinAndIncrementsAttempts(t *testing.T) {
 	srv.finishAssignment("asn-1", true)
 
 	assert.Empty(t, srv.conversations.(*conversationKV).record(t).PinnedDllama, "failed worker must lose the pin")
-	require.Len(t, recorder.Published, 1)
-	assert.Equal(t, "backlog", recorder.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(recorder.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	published := recorder.Messages()
+	assert.Equal(t, "backlog", published[0].Subject)
 	var requeued conversation.BacklogMessage
-	require.NoError(t, json.Unmarshal(recorder.Published[0].Data, &requeued))
+	require.NoError(t, json.Unmarshal(published[0].Data, &requeued))
 	assert.Equal(t, 1, requeued.Attempts)
 
 	srv.mu.Lock()
