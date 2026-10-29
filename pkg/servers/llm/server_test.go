@@ -492,7 +492,7 @@ func TestStreamToSidecarPublishesChunks(t *testing.T) {
 		},
 	}
 
-	err = srv.streamToSidecar(payload)
+	err = srv.streamToSidecar(payload, &chunkRecorder{})
 	require.NoError(t, err)
 
 	msg, err := sub.NextMsg(time.Second)
@@ -546,18 +546,14 @@ func TestStreamToSidecarPublishesErrorOnFailure(t *testing.T) {
 		},
 	}
 
-	err = srv.streamToSidecar(payload)
+	err = srv.streamToSidecar(payload, &chunkRecorder{})
 	require.Error(t, err)
+	require.NotErrorIs(t, err, errStreamCommitted)
+	require.Contains(t, err.Error(), "sidecar responded 500")
 
-	msg, err := sub.NextMsg(time.Second)
-	require.NoError(t, err)
-	var body map[string]string
-	require.NoError(t, json.Unmarshal(msg.Data, &body))
-	require.Contains(t, body["error"], "sidecar responded 500")
-
-	msg, err = sub.NextMsg(time.Second)
-	require.NoError(t, err)
-	require.Equal(t, "[DONE]", string(msg.Data))
+	// Pre-token failures stay retryable and must not leak partial output.
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require.ErrorIs(t, err, nats.ErrTimeout)
 }
 
 func TestStreamToSidecarClientErrorPublishesError(t *testing.T) {
@@ -591,19 +587,12 @@ func TestStreamToSidecarClientErrorPublishesError(t *testing.T) {
 		},
 	}
 
-	err = srv.streamToSidecar(payload)
+	err = srv.streamToSidecar(payload, &chunkRecorder{})
 	require.ErrorIs(t, err, clientErr)
+	require.NotErrorIs(t, err, errStreamCommitted)
 
-	msg, err := sub.NextMsg(time.Second)
-	require.NoError(t, err)
-
-	var body map[string]string
-	require.NoError(t, json.Unmarshal(msg.Data, &body))
-	require.Contains(t, body["error"], "client boom")
-
-	msg, err = sub.NextMsg(time.Second)
-	require.NoError(t, err)
-	require.Equal(t, "[DONE]", string(msg.Data))
+	_, err = sub.NextMsg(250 * time.Millisecond)
+	require.ErrorIs(t, err, nats.ErrTimeout)
 }
 
 func TestStreamToSidecarScannerError(t *testing.T) {
@@ -646,16 +635,25 @@ func TestStreamToSidecarScannerError(t *testing.T) {
 		},
 	}
 
-	err = srv.streamToSidecar(payload)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "stream read failure")
+	err = srv.streamToSidecar(payload, &chunkRecorder{})
+	require.ErrorIs(t, err, errStreamCommitted)
 
 	msg, err := sub.NextMsg(time.Second)
 	require.NoError(t, err)
 	require.JSONEq(t, `{"id":"chunk-1"}`, string(msg.Data))
 
-	_, err = sub.NextMsg(250 * time.Millisecond)
-	require.ErrorIs(t, err, nats.ErrTimeout)
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	var interrupted map[string]any
+	require.NoError(t, json.Unmarshal(msg.Data, &interrupted))
+	errBody, ok := interrupted["error"].(map[string]any)
+	require.True(t, ok, "expected structured error chunk")
+	require.Equal(t, "stream_interrupted", errBody["code"])
+	require.Contains(t, errBody["message"], "stream read failure")
+
+	msg, err = sub.NextMsg(time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "[DONE]", string(msg.Data))
 }
 
 func TestStreamToSidecarDonePublishFailure(t *testing.T) {
@@ -698,7 +696,7 @@ func TestStreamToSidecarDonePublishFailure(t *testing.T) {
 		},
 	}
 
-	err := srv.streamToSidecar(payload)
+	err := srv.streamToSidecar(payload, &chunkRecorder{})
 	require.Error(t, err)
 	require.ErrorIs(t, err, nats.ErrConnectionClosed)
 }
@@ -744,7 +742,7 @@ func TestExecuteOncePublishesResponse(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, srv.executeOnce(payload))
+	require.NoError(t, srv.executeOnce(payload, &chunkRecorder{}))
 
 	msg, err := sub.NextMsg(time.Second)
 	require.NoError(t, err)
@@ -789,7 +787,7 @@ func TestExecuteOncePublishesErrorOnFailure(t *testing.T) {
 		},
 	}
 
-	err = srv.executeOnce(payload)
+	err = srv.executeOnce(payload, &chunkRecorder{})
 	require.Error(t, err)
 
 	msg, err := sub.NextMsg(time.Second)
@@ -840,7 +838,7 @@ func TestExecuteOncePublishesErrorOnEmptyBody(t *testing.T) {
 		Request: openai.ChatCompletionRequest{Model: "model"},
 	}
 
-	err = srv.executeOnce(payload)
+	err = srv.executeOnce(payload, &chunkRecorder{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "empty body")
 
@@ -889,7 +887,7 @@ func TestExecuteOnceRejectsOversizedResponse(t *testing.T) {
 
 	payload := inboundRequest{}
 
-	err = srv.executeOnce(payload)
+	err = srv.executeOnce(payload, &chunkRecorder{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exceeded")
 
@@ -2206,7 +2204,7 @@ func TestExecuteOnceWithSidecarTimeout(t *testing.T) {
 		ResponseSubject: "test.response",
 	}
 
-	err := srv.executeOnce(payload)
+	err := srv.executeOnce(payload, &chunkRecorder{})
 	require.Error(t, err)
 
 	// Should have published error message
