@@ -26,6 +26,8 @@ const (
 
 	// defaultMaxSeqLen is the fallback context window for distributed-llama.
 	defaultMaxSeqLen int32 = 4096
+	// defaultNATSMaxPayload matches stock NATS max_payload (1 MiB).
+	defaultNATSMaxPayload int32 = 1 << 20
 )
 
 var (

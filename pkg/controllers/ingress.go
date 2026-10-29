@@ -458,6 +458,12 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	}
 	args = append(args, fmt.Sprintf("--backend-max-seq-len=%d", maxSeqLen))
 
+	natsMaxPayload := spec.Backend.NATSMaxPayload
+	if natsMaxPayload <= 0 {
+		natsMaxPayload = defaultNATSMaxPayload
+	}
+	args = append(args, fmt.Sprintf("--backend-nats-max-payload=%d", natsMaxPayload))
+
 	return args
 }
 

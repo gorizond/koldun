@@ -1197,6 +1197,9 @@ type IngressBackendSpec struct {
 	// MaxSeqLen configures the maximum prompt length accepted by the backend.
 	// Default is 4096.
 	MaxSeqLen int32 `json:"maxSeqLen,omitempty"`
+	// NATSMaxPayload is the NATS max_payload budget in bytes; backlog messages
+	// are capped at half of it. Default is 1 MiB (stock NATS).
+	NATSMaxPayload int32 `json:"natsMaxPayload,omitempty"`
 }
 
 // IngressRootMemorySpec customises root memory calculation.
