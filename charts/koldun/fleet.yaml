@@ -4,7 +4,7 @@ helm:
   chart: .
   values:
     image:
-      tag: v0.0.134
+      tag: v0.0.137
     operator:
       conversation:
         natsUrl: nats://nats.nats.svc:4222
