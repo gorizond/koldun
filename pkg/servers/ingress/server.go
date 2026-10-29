@@ -81,7 +81,8 @@ const (
 	defaultTokenPrefix        = registry.DefaultTokenPrefix
 	tokenCacheTTL             = 5 * time.Minute
 	defaultMaxSeqLen          = 4096
-	defaultNATSMaxPayload     = 4 << 20 // conservative NATS max_payload budget (bytes)
+	defaultNATSMaxPayload     = 1 << 20 // stock NATS max_payload (bytes)
+	backlogEnvelopeReserve    = 512     // room for ids/subjects when sizing the backlog message
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 
@@ -126,8 +127,8 @@ type Config struct {
 
 	// MaxSeqLen caps the prompt token budget accepted by the backend.
 	MaxSeqLen int
-	// NATSMaxPayload is the NATS max_payload budget in bytes. Request bodies
-	// are capped at half of it to leave room for envelopes and headers.
+	// NATSMaxPayload is the NATS max_payload budget in bytes. Backlog messages
+	// are capped at half of it, leaving headroom for assignment envelopes.
 	NATSMaxPayload int
 
 	DisableThinkFilter bool
@@ -652,10 +653,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		tokenHash = sha256Hex(token)
 	}
 
-	payload, err := readAll(r, s.maxBodyBytes())
+	payload, err := readAll(r, s.maxRequestBodyBytes())
 	if err != nil {
 		if errors.Is(err, errBodyTooLarge) {
-			writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxBodyBytes()))
+			writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
 			return
 		}
 		s.log.WithError(err).Warn("read request body")
@@ -666,6 +667,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// be identical (compaction and HTML escaping are not stable across
 	// marshal/unmarshal round trips otherwise).
 	canonical := conversation.CanonicalMessages(payload)
+	// HTML escaping can inflate the body several times over, so admission is
+	// decided on the canonical size, not on what the client uploaded.
+	if int64(len(canonical)) > s.maxCanonicalBodyBytes() {
+		writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
+		return
+	}
 
 	var req openai.ChatCompletionRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
@@ -834,6 +841,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to marshal backlog envelope")
 		return
 	}
+	if int64(len(body)) > s.maxBacklogBytes() {
+		writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
+		return
+	}
 
 	if err := s.raw.Publish(backlogSubject, body); err != nil {
 		s.log.WithError(err).Error("publish request")
@@ -877,8 +888,11 @@ func errorResponseStatus(body []byte) int {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return 0
 	}
-	if envelope.Error.Code == "context_length_exceeded" {
+	switch envelope.Error.Code {
+	case "context_length_exceeded":
 		return http.StatusBadRequest
+	case "inference_failed":
+		return http.StatusBadGateway
 	}
 	return 0
 }
@@ -2107,12 +2121,35 @@ func readAll(r *http.Request, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-func (s *Server) maxBodyBytes() int64 {
+func (s *Server) natsPayloadBudget() int64 {
 	budget := s.cfg.NATSMaxPayload
 	if budget <= 0 {
 		budget = defaultNATSMaxPayload
 	}
-	return int64(budget) / 2
+	return int64(budget)
+}
+
+// maxBacklogBytes is the largest marshaled backlog message we publish: half of
+// the NATS budget, so assignment envelopes and headers still fit.
+func (s *Server) maxBacklogBytes() int64 {
+	return s.natsPayloadBudget() / 2
+}
+
+// maxCanonicalBodyBytes is the largest canonical request body that still
+// leaves room for the backlog envelope.
+func (s *Server) maxCanonicalBodyBytes() int64 {
+	limit := s.maxBacklogBytes() - backlogEnvelopeReserve
+	if limit <= 0 {
+		return s.maxBacklogBytes()
+	}
+	return limit
+}
+
+// maxRequestBodyBytes bounds how much we read before canonicalisation; pretty
+// printed JSON shrinks during canonicalisation, so allow a multiple of the
+// effective limit.
+func (s *Server) maxRequestBodyBytes() int64 {
+	return s.maxBacklogBytes() * 4
 }
 
 func bodyTooLargeBody(limit int64) map[string]any {

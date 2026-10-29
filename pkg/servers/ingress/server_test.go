@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -3989,6 +3990,7 @@ func TestErrorResponseStatus(t *testing.T) {
 	t.Parallel()
 
 	require.Equal(t, http.StatusBadRequest, errorResponseStatus([]byte(`{"error":{"code":"context_length_exceeded","message":"x"}}`)))
+	require.Equal(t, http.StatusBadGateway, errorResponseStatus([]byte(`{"error":{"code":"inference_failed","message":"x"}}`)))
 	require.Zero(t, errorResponseStatus([]byte(`{"error":"plain failure"}`)))
 	require.Zero(t, errorResponseStatus([]byte(`{"object":"chat.completion"}`)))
 }
@@ -4296,4 +4298,83 @@ func TestHandleNonStreamReturns400OnContextOverflow(t *testing.T) {
 	var response map[string]map[string]any
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
 	require.Equal(t, "context_length_exceeded", response["error"]["code"])
+}
+
+func TestHandleChatCompletionsRejectsCanonicalInflation(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			NATSMaxPayload:  8192,
+			MaxSeqLen:       1 << 20,
+			ResponseTimeout: time.Second,
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	limit := srv.maxCanonicalBodyBytes()
+
+	base := `{"model":"tenant/chat-1","messages":[{"role":"user","content":""}]}`
+	baseSize := int64(len(conversation.CanonicalMessages([]byte(base))))
+	content := strings.Repeat("&", 700) // each & becomes \u0026 (6 bytes)
+	body := fmt.Sprintf(`{"model":"tenant/chat-1","messages":[{"role":"user","content":%q}]}`, content)
+
+	// The uploaded body fits, but canonicalisation (HTML escaping) inflates it
+	// past the effective limit.
+	require.Less(t, int64(len(body)), limit, "raw body must be under the limit")
+	canonical := conversation.CanonicalMessages([]byte(body))
+	require.Greater(t, int64(len(canonical)), limit, "canonical body must exceed the limit")
+	require.Greater(t, int64(len(canonical)), baseSize+700)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	var payload map[string]map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Equal(t, "request_too_large", payload["error"]["code"])
+	require.Contains(t, payload["error"]["message"], fmt.Sprintf("%d bytes", limit))
+}
+
+func TestHandleChatCompletionsAcceptsBoundaryBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			NATSMaxPayload:  8192,
+			MaxSeqLen:       1 << 20,
+			ResponseTimeout: time.Second,
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			getFn: func(string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+
+	limit := srv.maxCanonicalBodyBytes()
+	base := `{"model":"tenant/chat-1","messages":[{"role":"user","content":""}]}`
+	baseSize := int64(len(conversation.CanonicalMessages([]byte(base))))
+	require.Less(t, baseSize, limit)
+
+	padding := int(limit - baseSize)
+	body := fmt.Sprintf(`{"model":"tenant/chat-1","messages":[{"role":"user","content":"%s"}]}`, strings.Repeat("x", padding))
+	require.Equal(t, limit, int64(len(conversation.CanonicalMessages([]byte(body)))), "body must sit exactly on the effective limit")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code, "a body at the limit must pass admission")
+	require.Equal(t, http.StatusBadRequest, w.Code, "the request should fail later on model resolution")
 }
