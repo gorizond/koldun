@@ -3836,3 +3836,110 @@ func TestRegistryModelReadyReturnsTrueForValidModelWithBytes(t *testing.T) {
 	ready := registryModelReady(model)
 	assert.True(t, ready)
 }
+
+func TestHandleChatCompletionsRejectsOversizedPrompt(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous: true,
+			MaxSeqLen:      8,
+			Namespace:      "test-ns",
+			TTLPrefix:      "nats_ttl_",
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				model := &registry.Model{
+					Namespace:           "test-ns",
+					Name:                "test-model",
+					OutputPVCName:       "pvc",
+					ConversionSizeHuman: "1Gi",
+				}
+				data, _ := json.Marshal(model)
+				return &kvEntryStub{value: data}, nil
+			},
+		},
+	}
+
+	body := strings.NewReader(`{"model":"test-ns/test-model","messages":[{"role":"user","content":"` + strings.Repeat("x", 200) + `"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Equal(t, "context_length_exceeded", payload.Error.Code)
+	require.Equal(t, "invalid_request_error", payload.Error.Type)
+	require.Contains(t, payload.Error.Message, "maximum context length is 8 tokens")
+}
+
+func TestServeTouchConversationRecord(t *testing.T) {
+	t.Parallel()
+
+	record := &conversation.Record{
+		Hash:        "conv",
+		Namespace:   "ns",
+		Model:       "ns/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+	}
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+
+	var stored []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 7}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			require.Equal(t, uint64(7), revision)
+			stored = append([]byte(nil), value...)
+			return 8, nil
+		},
+	}
+
+	srv := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	now := time.Unix(1700000123, 0)
+	srv.touchConversationRecord("conv", 3, "deadbeef", now)
+
+	require.NotNil(t, stored)
+	parsed, err := conversation.ParseRecord(stored)
+	require.NoError(t, err)
+	require.Equal(t, 3, parsed.Cursor)
+	require.Equal(t, "deadbeef", parsed.MessageHash)
+	require.Equal(t, now.Unix(), parsed.LastActivityAt)
+}
+
+func TestNormaliseStreamingChunkPreservesErrorPayload(t *testing.T) {
+	t.Parallel()
+
+	state := &streamingNormaliserState{}
+	raw := `{"error":{"message":"upstream stream interrupted: boom","type":"server_error","code":"stream_interrupted"}}`
+
+	normalised, err := normaliseStreamingChunk(raw, state)
+	require.NoError(t, err)
+	require.JSONEq(t, raw, normalised)
+	require.False(t, isEmptyDeltaChunk(normalised), "error payloads must reach the client")
+
+	stringError := `{"error":"sidecar responded 500"}`
+	normalised, err = normaliseStreamingChunk(stringError, state)
+	require.NoError(t, err)
+	require.JSONEq(t, stringError, normalised)
+	require.False(t, isEmptyDeltaChunk(normalised))
+}

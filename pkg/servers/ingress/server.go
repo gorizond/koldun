@@ -80,6 +80,7 @@ const (
 	defaultModelPrefix        = registry.DefaultModelPrefix
 	defaultTokenPrefix        = registry.DefaultTokenPrefix
 	tokenCacheTTL             = 5 * time.Minute
+	defaultMaxSeqLen          = 4096
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 
@@ -121,6 +122,9 @@ type Config struct {
 	AllowAnonymous bool
 
 	ReplicaPower int32
+
+	// MaxSeqLen caps the prompt token budget accepted by the backend.
+	MaxSeqLen int
 
 	DisableThinkFilter bool
 
@@ -233,6 +237,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.ReplicaPower < 0 {
 		cfg.ReplicaPower = 0
+	}
+	if cfg.MaxSeqLen <= 0 {
+		cfg.MaxSeqLen = defaultMaxSeqLen
 	}
 
 	log := cfg.Logger
@@ -666,6 +673,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	maxSeqLen := s.cfg.MaxSeqLen
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	if tokens := estimatePromptTokens(&req); tokens > maxSeqLen {
+		metrics.ContextOverflowTotal.WithLabelValues("ingress").Inc()
+		writeJSON(w, http.StatusBadRequest, contextLengthExceededBody(maxSeqLen))
+		return
+	}
+
 	load := s.incrementSessionLoad(hash)
 
 	record, err := s.ensureConversation(authCtx, hash, model, load)
@@ -745,6 +762,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	requestID := newRequestID()
 
+	// The conversation record carries the client cursor and the hash of the
+	// prefix it already knows, so workers can detect instance changes.
+	messageCount := len(req.Messages)
+	prefixHash := ""
+	if messageCount > 0 {
+		prefixHash, _ = conversation.PrefixHash(payload, messageCount)
+	}
+
 	reqPayload := struct {
 		Hash            string                       `json:"hash"`
 		ChatID          string                       `json:"chatId"`
@@ -755,6 +780,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Request         openai.ChatCompletionRequest `json:"request"`
 		ResponseSubject string                       `json:"responseSubject"`
 		RequestID       string                       `json:"requestId"`
+		Cursor          int                          `json:"cursor,omitempty"`
+		PrefixHash      string                       `json:"prefixHash,omitempty"`
+		Raw             json.RawMessage              `json:"raw,omitempty"`
 	}{
 		Hash:            hash,
 		ChatID:          chatID,
@@ -765,6 +793,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Request:         req,
 		ResponseSubject: responseSubject,
 		RequestID:       requestID,
+		Cursor:          record.Cursor,
+		PrefixHash:      record.MessageHash,
+		Raw:             json.RawMessage(payload),
 	}
 
 	payloadBody, err := json.Marshal(reqPayload)
@@ -789,6 +820,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "failed to enqueue request")
 		return
 	}
+
+	s.touchConversationRecord(hash, messageCount, prefixHash, time.Now())
 
 	if req.Stream {
 		s.streamResponse(respCtx, w, msgs)
@@ -1847,6 +1880,12 @@ func longestDetailsSuffix(s string) int {
 }
 
 func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (string, error) {
+	// Error payloads (sidecar failures, context overflow) have no choices and
+	// must reach the client untouched.
+	if hasErrorField([]byte(raw)) {
+		return raw, nil
+	}
+
 	var chunk streamingChunk
 	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
 		return raw, nil
@@ -1895,6 +1934,9 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 }
 
 func isEmptyDeltaChunk(payload string) bool {
+	if hasErrorField([]byte(payload)) {
+		return false
+	}
 	var chunk streamingChunk
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 		return false
@@ -1908,6 +1950,73 @@ func isEmptyDeltaChunk(payload string) bool {
 		}
 	}
 	return true
+}
+
+// hasErrorField reports whether the JSON object carries a non-empty error.
+func hasErrorField(raw []byte) bool {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return false
+	}
+	value := strings.TrimSpace(string(envelope.Error))
+	return value != "" && value != "null" && value != `""`
+}
+
+// estimatePromptTokens approximates the prompt token count (4 bytes per token).
+func estimatePromptTokens(req *openai.ChatCompletionRequest) int {
+	if req == nil {
+		return 2
+	}
+	total := 0
+	for _, message := range req.Messages {
+		total += len(message.Role) + len(message.Content) + 4
+	}
+	return total/4 + 2
+}
+
+func contextLengthExceededBody(maxSeqLen int) map[string]any {
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	return map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("context_length_exceeded: maximum context length is %d tokens", maxSeqLen),
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    "context_length_exceeded",
+		},
+	}
+}
+
+// touchConversationRecord persists the client cursor after the request is
+// enqueued. Failures are logged only: the request already has a worker.
+func (s *Server) touchConversationRecord(hash string, count int, prefixHash string, now time.Time) {
+	if s.convKV == nil {
+		return
+	}
+	key := s.cfg.TTLPrefix + hash
+	activity := now.Unix()
+	_, err := conversation.UpdateRecord(s.convKV, key, func(record *conversation.Record) bool {
+		changed := false
+		if record.Cursor != count {
+			record.Cursor = count
+			changed = true
+		}
+		if record.MessageHash != prefixHash {
+			record.MessageHash = prefixHash
+			changed = true
+		}
+		if record.LastActivityAt != activity {
+			record.LastActivityAt = activity
+			changed = true
+		}
+		return changed
+	})
+	if err != nil {
+		s.log.WithError(err).WithField("hash", hash).Warn("update conversation cursor")
+	}
 }
 
 func sha256Hex(value string) string {
