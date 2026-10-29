@@ -231,6 +231,9 @@ type ModelSpec struct {
 	PV *ModelPVSpec `json:"pv,omitempty"`
 	// ReplicaPower defines the desired worker fan-out (power of two) for Dllama instances referencing this model.
 	ReplicaPower int32 `json:"replicaPower,omitempty"`
+	// MaxSeqLen is the model context window passed to distributed-llama
+	// (--max-seq-len) and the local llm sidecar. Defaults to 4096.
+	MaxSeqLen int32 `json:"maxSeqLen,omitempty"`
 	// PreConverted indicates the model files are already in dllama format in the object storage.
 	// When true, download and conversion jobs are skipped and the model is immediately marked Ready.
 	PreConverted bool `json:"preConverted,omitempty"`
@@ -929,6 +932,8 @@ type SessionQueueSpec struct {
 	ResponseSubjectPrefix string `json:"responseSubjectPrefix,omitempty"`
 	// AssignmentsBucket stores per-request dispatcher assignments for idempotency.
 	AssignmentsBucket string `json:"assignmentsBucket,omitempty"`
+	// ConversationBucket stores conversation records (worker affinity, cursors).
+	ConversationBucket string `json:"conversationBucket,omitempty"`
 	// DllamaSubjectPrefix prefixes per-dllama request subjects (must end with '.').
 	DllamaSubjectPrefix string `json:"dllamaSubjectPrefix,omitempty"`
 	// StateStream stores worker heartbeat events for dispatcher recovery.

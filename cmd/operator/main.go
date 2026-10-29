@@ -136,6 +136,7 @@ func main() {
 		backendWorkerImage                    string
 		backendDisableThinkFilter             bool
 		backendMaxSeqLen                      int
+		backendNATSMaxPayload                 int
 
 		// Dispatcher flags
 		dispatcherHash               string
@@ -219,6 +220,7 @@ func main() {
 	fs.BoolVar(&backendDisableThinkFilter, "backend-disable-think-filter", false, "Disable think tag redaction in streaming responses")
 	fs.IntVar(&backendReplicaPower, "backend-replica-power", 0, "Override replica power for Sessions created by the backend (0 uses model setting)")
 	fs.IntVar(&backendMaxSeqLen, "backend-max-seq-len", 4096, "Maximum context length accepted by the backend (prompt tokens)")
+	fs.IntVar(&backendNATSMaxPayload, "backend-nats-max-payload", 4<<20, "NATS max_payload budget in bytes; request bodies are capped at half of it")
 
 	fs.StringVar(&operatorNATSURL, "operator-nats-url", "", "NATS endpoint used by the operator to reconcile conversations and publish registry data")
 	fs.StringVar(&operatorKVBucket, "operator-kv-bucket", "", "JetStream KeyValue bucket containing conversation records")
@@ -315,6 +317,7 @@ func main() {
 			DisableThinkFilter:             backendDisableThinkFilter,
 			ReplicaPower:                   int32(backendReplicaPower),
 			MaxSeqLen:                      backendMaxSeqLen,
+			NATSMaxPayload:                 backendNATSMaxPayload,
 		})
 	case "dispatcher":
 		statePrefix := strings.TrimSpace(dispatcherStatePrefix)

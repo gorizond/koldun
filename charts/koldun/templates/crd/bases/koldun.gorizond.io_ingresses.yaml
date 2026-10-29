@@ -108,6 +108,12 @@ spec:
                       required:
                         - url
                       type: object
+                    maxSeqLen:
+                      description:
+                        MaxSeqLen configures the maximum prompt length accepted
+                        by the backend. Default is 4096.
+                      format: int32
+                      type: integer
                     nThreads:
                       description:
                         NThreads configures the number of threads for dllama-api

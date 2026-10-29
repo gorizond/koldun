@@ -257,9 +257,10 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	} else {
 		root.Spec.NThreads = 1
 	}
-	// Set MaxSeqLen from Ingress CR, default to 4096.
-	if maxSeqLen := h.getIngressMaxSeqLen(dllama); maxSeqLen > 0 {
-		root.Spec.MaxSeqLen = maxSeqLen
+	// The context window belongs to the model, not to whichever Ingress
+	// happened to be listed first.
+	if model.Spec.MaxSeqLen > 0 {
+		root.Spec.MaxSeqLen = model.Spec.MaxSeqLen
 	} else {
 		root.Spec.MaxSeqLen = defaultMaxSeqLen
 	}
@@ -422,35 +423,6 @@ func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
 		for _, ing := range ings {
 			if ing.Spec.Backend.NThreads > 0 {
 				return ing.Spec.Backend.NThreads
-			}
-		}
-		return 0
-	}
-
-	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
-		if v := lookup(ingresses); v > 0 {
-			return v
-		}
-	}
-	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
-		if v := lookup(allIngresses); v > 0 {
-			return v
-		}
-	}
-	return 0
-}
-
-// getIngressMaxSeqLen retrieves the MaxSeqLen value from Ingress CR.
-// It first checks ingresses in the same namespace, then falls back to cluster-wide.
-// Returns 0 if no Ingress has MaxSeqLen configured (use default).
-func (h *dllamaHandler) getIngressMaxSeqLen(dllama *v1.Dllama) int32 {
-	if h.ingresses == nil {
-		return 0
-	}
-	lookup := func(ings []*v1.Ingress) int32 {
-		for _, ing := range ings {
-			if ing.Spec.Backend.MaxSeqLen > 0 {
-				return ing.Spec.Backend.MaxSeqLen
 			}
 		}
 		return 0
