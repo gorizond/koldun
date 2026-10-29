@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -738,5 +739,46 @@ func TestUpdateRecordGivesUpAfterRetries(t *testing.T) {
 	}
 	if kv.updates != updateRecordRetries {
 		t.Fatalf("updates = %d, want %d", kv.updates, updateRecordRetries)
+	}
+}
+
+func TestCanonicalMessagesIsIdempotentAndEscaped(t *testing.T) {
+	raw := []byte("{\n  \"model\": \"m\",\n  \"messages\": [{\"role\": \"user\", \"content\": \"a & b <tag> > done\"}]\n}")
+
+	canonical := CanonicalMessages(raw)
+	if canonical == nil {
+		t.Fatal("canonical form must not be nil")
+	}
+	if bytes.Contains(canonical, []byte("\n")) {
+		t.Fatalf("canonical form must be compact, got %s", canonical)
+	}
+	for _, escaped := range [][]byte{[]byte(`\u0026`), []byte(`\u003c`), []byte(`\u003e`)} {
+		if !bytes.Contains(canonical, escaped) {
+			t.Fatalf("canonical form must escape HTML characters, got %s", canonical)
+		}
+	}
+	if again := CanonicalMessages(canonical); !bytes.Equal(again, canonical) {
+		t.Fatalf("canonicalisation must be idempotent: %s != %s", again, canonical)
+	}
+
+	first, err := PrefixHash(canonical, 1)
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
+	second, err := PrefixHash(CanonicalMessages(raw), 1)
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
+	if first != second {
+		t.Fatalf("hashes of canonical bodies differ: %q != %q", first, second)
+	}
+}
+
+func TestCanonicalMessagesEmpty(t *testing.T) {
+	if got := CanonicalMessages(nil); got != nil {
+		t.Fatalf("CanonicalMessages(nil) = %v, want nil", got)
+	}
+	if got := CanonicalMessages([]byte("  \n")); got != nil {
+		t.Fatalf("CanonicalMessages(blank) = %v, want nil", got)
 	}
 }

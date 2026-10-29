@@ -1,6 +1,7 @@
 package conversation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -54,6 +55,7 @@ type QueueConfig struct {
 	BacklogSubject        string `json:"backlogSubject,omitempty"`
 	ResponseSubjectPrefix string `json:"responseSubjectPrefix,omitempty"`
 	AssignmentsBucket     string `json:"assignmentsBucket,omitempty"`
+	ConversationBucket    string `json:"conversationBucket,omitempty"`
 	DllamaSubjectPrefix   string `json:"dllamaSubjectPrefix,omitempty"`
 	StateStream           string `json:"stateStream,omitempty"`
 }
@@ -294,6 +296,22 @@ func MessageCount(raw []byte) (int, error) {
 		return 0, fmt.Errorf("unmarshal messages: %w", err)
 	}
 	return len(envelope.Messages), nil
+}
+
+// CanonicalMessages returns the canonical JSON encoding of a chat-completion
+// body: compacted and HTML-escaped exactly the way encoding/json re-encodes
+// json.RawMessage. It is idempotent, so hashing canonical bytes on both the
+// ingress and the worker side yields the same value even when the client sends
+// pretty-printed JSON or strings containing <, > or &.
+func CanonicalMessages(raw []byte) []byte {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(json.RawMessage(raw))
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	return encoded
 }
 
 // PrefixHash returns a stable SHA-256 hash over the raw bytes of the first n
