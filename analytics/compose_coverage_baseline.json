@@ -1,6 +1,6 @@
 {
-  "total": 86.0,
-  "updated_at": "2026-04-25T01:54:24Z",
-  "commit": "e61770da4cfbb36caa88ab19e2b290769450a858",
-  "source": "e61770d \u2014 Remove stale config files and align S3 credential keys in examples"
+  "total": 86.4,
+  "updated_at": "2026-10-29T22:54:04Z",
+  "commit": "1fc1f397885c2d5009dd3c978c63014de492a8fa",
+  "source": "1fc1f39 \u2014 fix(dispatcher): surface the worker-reported failure reason"
 }
