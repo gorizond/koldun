@@ -490,6 +490,16 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		_ = msg.Term()
 		return
 	}
+	// Ingress sends the raw body only; canonicalise it once so the bytes we
+	// hash are exactly the bytes the sidecar receives. Older payloads without
+	// raw fall back to the parsed request.
+	if len(bytes.TrimSpace(payload.Raw)) > 0 {
+		payload.Raw = conversation.CanonicalMessages(payload.Raw)
+		var decoded openai.ChatCompletionRequest
+		if err := json.Unmarshal(payload.Raw, &decoded); err == nil {
+			payload.Request = decoded
+		}
+	}
 
 	assignmentID := envelope.AssignmentID
 	if assignmentID == "" {
@@ -530,6 +540,9 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 			metrics.LLMDedupTotal.WithLabelValues("skipped").Inc()
 			s.log.WithField("requestId", requestKey).Info("skipped duplicate request")
 		}
+		// Duplicates never reach the normal completion path; publish idle so
+		// the dispatcher does not leak the inflight assignment.
+		s.publishState("idle", assignmentID, 0, "")
 		if err := msg.Ack(); err != nil {
 			s.log.WithError(err).Warn("ack duplicate request")
 		}
@@ -656,7 +669,7 @@ func (s *Server) streamToSidecar(payload inboundRequest, recorder *chunkRecorder
 			s.publishContextOverflow(target, recorder)
 			return errStreamCommitted
 		}
-		if err := s.publishChunk(target, recorder, normalized); err != nil {
+		if err := s.publishChunk(target, recorder, normalized, chunkHasContent(normalized)); err != nil {
 			s.log.WithError(err).Warn("publish chunk")
 			if recorder.hasToken() {
 				metrics.LLMStreamAbortsTotal.WithLabelValues("post_token").Inc()
@@ -678,6 +691,12 @@ func (s *Server) streamToSidecar(payload inboundRequest, recorder *chunkRecorder
 	}
 	if err := s.nc.Publish(target, []byte("[DONE]")); err != nil {
 		s.log.WithError(err).Warn("publish done marker")
+		if recorder.hasToken() {
+			// The client already received the full text; retrying would
+			// duplicate it, so treat the stream as committed.
+			metrics.LLMStreamAbortsTotal.WithLabelValues("post_token").Inc()
+			return errStreamCommitted
+		}
 		return err
 	}
 	return nil
@@ -761,7 +780,7 @@ func (s *Server) executeOnce(payload inboundRequest, recorder *chunkRecorder) er
 	// Normalize response for OpenAI API compatibility
 	normalized := normalizeChatCompletionResponse(trimmed, payload.Request.Model)
 
-	if err := s.publishChunk(target, recorder, normalized); err != nil {
+	if err := s.publishChunk(target, recorder, normalized, true); err != nil {
 		return fmt.Errorf("publish response: %w", err)
 	}
 

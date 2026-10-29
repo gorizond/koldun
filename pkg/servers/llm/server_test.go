@@ -47,7 +47,7 @@ type failingStreamReader struct {
 
 func (r *failingStreamReader) Read(p []byte) (int, error) {
 	if !r.sent {
-		data := []byte("data: {\"id\":\"chunk-1\"}\n\n")
+		data := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi-token\"}}]}\n\n")
 		copy(p, data)
 		r.sent = true
 		return len(data), nil
@@ -640,7 +640,7 @@ func TestStreamToSidecarScannerError(t *testing.T) {
 
 	msg, err := sub.NextMsg(time.Second)
 	require.NoError(t, err)
-	require.JSONEq(t, `{"id":"chunk-1"}`, string(msg.Data))
+	require.JSONEq(t, `{"choices":[{"delta":{"content":"hi-token"}}]}`, string(msg.Data))
 
 	msg, err = sub.NextMsg(time.Second)
 	require.NoError(t, err)
@@ -656,20 +656,29 @@ func TestStreamToSidecarScannerError(t *testing.T) {
 	require.Equal(t, "[DONE]", string(msg.Data))
 }
 
+// doneFailingNATSConn fails only the terminal [DONE] publish.
+type doneFailingNATSConn struct {
+	testhelpers.RecordingNATSConn
+}
+
+func (c *doneFailingNATSConn) Publish(subject string, data []byte) error {
+	if string(data) == "[DONE]" {
+		return errors.New("done publish boom")
+	}
+	return c.RecordingNATSConn.Publish(subject, data)
+}
+
 func TestStreamToSidecarDonePublishFailure(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping streaming test in short mode")
 	}
-
-	ns := startJetStreamServer(t)
-	_, nc := connectJetStream(t, ns)
 
 	sidecar := testhelpers.NewHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, sidecarChatCompletionsPath, r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, ok := w.(http.Flusher)
 		require.True(t, ok)
-		_, _ = w.Write([]byte("data: {\"id\":\"chunk-1\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
 		flusher.Flush()
 	}))
 	t.Cleanup(sidecar.Close)
@@ -677,28 +686,28 @@ func TestStreamToSidecarDonePublishFailure(t *testing.T) {
 	logger := logrus.New()
 	logger.SetLevel(logrus.ErrorLevel)
 
+	conn := &doneFailingNATSConn{}
 	srv := &Server{
 		cfg: Config{
 			DllamaName: "dllama-stream",
 			SidecarURL: sidecar.URL,
 		},
-		nc:         nc,
+		nc:         conn,
 		client:     sidecar.Client(),
 		log:        logrus.NewEntry(logger),
 		outSubject: "stream.responses",
 	}
 
-	nc.Close()
+	recorder := &chunkRecorder{}
+	err := srv.streamToSidecar(inboundRequest{
+		ResponseSubject: "stream.responses",
+		Request:         openai.ChatCompletionRequest{Stream: true},
+	}, recorder)
 
-	payload := inboundRequest{
-		Request: openai.ChatCompletionRequest{
-			Stream: true,
-		},
-	}
-
-	err := srv.streamToSidecar(payload, &chunkRecorder{})
-	require.Error(t, err)
-	require.ErrorIs(t, err, nats.ErrConnectionClosed)
+	// The client received the full text; retrying would duplicate it.
+	require.ErrorIs(t, err, errStreamCommitted)
+	require.True(t, recorder.hasToken())
+	require.Len(t, conn.RecordingNATSConn.Published, 1, "content was delivered before [DONE] failed")
 }
 
 func TestExecuteOncePublishesResponse(t *testing.T) {

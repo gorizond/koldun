@@ -327,7 +327,7 @@ type chunkRecorder struct {
 	startedAt  time.Time
 }
 
-func (r *chunkRecorder) record(chunk []byte) {
+func (r *chunkRecorder) record(chunk []byte, content bool) {
 	if r == nil || len(chunk) == 0 {
 		return
 	}
@@ -343,7 +343,9 @@ func (r *chunkRecorder) record(chunk []byte) {
 			r.bytes += len(chunk)
 		}
 	}
-	if !r.firstToken {
+	// Only content-bearing chunks mark the stream as delivered: role-only or
+	// error chunks must not disable a safe pre-token retry.
+	if content && !r.firstToken {
 		r.firstToken = true
 		if r.coldStart && !r.startedAt.IsZero() {
 			metrics.ColdStartSeconds.Observe(time.Since(r.startedAt).Seconds())
@@ -500,12 +502,35 @@ func (s *Server) recordHistoryMetrics(payload *inboundRequest, class historyClas
 }
 
 // publishChunk publishes a response chunk and records it for dedup replay.
-func (s *Server) publishChunk(target string, recorder *chunkRecorder, chunk []byte) error {
+// content reports whether the chunk carries model output (text/tool calls).
+func (s *Server) publishChunk(target string, recorder *chunkRecorder, chunk []byte, content bool) error {
 	if err := s.nc.Publish(target, chunk); err != nil {
 		return err
 	}
-	recorder.record(chunk)
+	recorder.record(chunk, content)
 	return nil
+}
+
+// chunkHasContent reports whether an SSE chunk carries model output rather than
+// only a role, finish reason or error.
+func chunkHasContent(data []byte) bool {
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content   string            `json:"content"`
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(data, &chunk); err != nil {
+		return false
+	}
+	for _, choice := range chunk.Choices {
+		if strings.TrimSpace(choice.Delta.Content) != "" || len(choice.Delta.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) publishStreamInterrupted(target string, cause error, recorder *chunkRecorder) {
@@ -520,7 +545,7 @@ func (s *Server) publishStreamInterrupted(target string, cause error, recorder *
 	if err != nil {
 		return
 	}
-	if err := s.publishChunk(target, recorder, body); err != nil {
+	if err := s.publishChunk(target, recorder, body, false); err != nil {
 		s.log.WithError(err).Warn("publish stream error chunk")
 	}
 	if err := s.nc.Publish(target, []byte("[DONE]")); err != nil {
@@ -551,7 +576,7 @@ func (s *Server) publishContextOverflow(target string, recorder *chunkRecorder) 
 	body := contextOverflowPayload(s.cfg.MaxSeqLen)
 	metrics.ContextOverflowTotal.WithLabelValues("sidecar").Inc()
 	if body != nil {
-		if err := s.publishChunk(target, recorder, body); err != nil {
+		if err := s.publishChunk(target, recorder, body, false); err != nil {
 			s.log.WithError(err).Warn("publish context overflow chunk")
 		}
 	}

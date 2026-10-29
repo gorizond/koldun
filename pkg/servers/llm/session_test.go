@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -312,33 +313,68 @@ func TestDedupDifferentSubjectSkips(t *testing.T) {
 }
 
 func TestAbortPreTokenRetries(t *testing.T) {
+	ns := startJetStreamServer(t)
+	_, nc := connectJetStream(t, ns)
+
 	sidecar := &recordingSidecar{status: http.StatusInternalServerError}
-	srv, nc := newSessionTestServer(t, sidecar)
+	ts := testhelpers.NewHTTPServer(t, http.HandlerFunc(sidecar.handle))
+	t.Cleanup(ts.Close)
+
+	srv := &Server{
+		cfg: Config{
+			DllamaName:   "worker-1",
+			SidecarURL:   ts.URL,
+			MaxSeqLen:    4096,
+			StateSubject: "state.test",
+		},
+		nc:           nc,
+		client:       ts.Client(),
+		outSubject:   "out.test",
+		stateSubject: "state.test",
+		log:          discardLogger(),
+	}
+	srv.initSessionState()
+
+	ackSub, err := nc.SubscribeSync("_INBOX.ack")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+	t.Cleanup(func() { _ = ackSub.Unsubscribe() })
 
 	preTokenBefore := promtestutil.ToFloat64(metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token"))
 	envelope := buildSessionPayload(t, "req-pre", "out.test", []openai.ChatMessage{{Role: "user", Content: "hi"}}, 0, "")
 
-	runHandleMessage(srv, envelope)
-	runHandleMessage(srv, envelope)
+	handle := func() {
+		msg := &nats.Msg{Subject: "in.test", Reply: "_INBOX.ack", Sub: ackSub, Data: envelope}
+		srv.handleMessage(msg)
+		ack, ackErr := ackSub.NextMsg(time.Second)
+		require.NoError(t, ackErr)
+		require.Equal(t, "+ACK", string(ack.Data), "pre-token failures must be acked (state=error drives the retry)")
+	}
+
+	stateSub, err := nc.SubscribeSync("state.test")
+	require.NoError(t, err)
+	outSub, err := nc.SubscribeSync("out.test")
+	require.NoError(t, err)
+	require.NoError(t, nc.Flush())
+
+	handle()
+	handle()
 
 	assert.Equal(t, 2, sidecar.callCount(), "pre-token failures must stay retryable")
 	assert.Equal(t, preTokenBefore+2, promtestutil.ToFloat64(metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token")))
 
-	for _, message := range nc.Published {
-		assert.NotEqual(t, "out.test", message.Subject, "pre-token failures must not publish partial output")
-	}
-
 	var lastState conversation.WorkerStateEvent
-	found := false
-	for _, message := range nc.Published {
-		if message.Subject != "state.test" {
-			continue
+	for {
+		msg, nextErr := stateSub.NextMsg(50 * time.Millisecond)
+		if nextErr != nil {
+			break
 		}
-		require.NoError(t, json.Unmarshal(message.Data, &lastState))
-		found = true
+		require.NoError(t, json.Unmarshal(msg.Data, &lastState))
 	}
-	require.True(t, found, "worker state must be published")
-	assert.Equal(t, "error", lastState.State)
+	assert.Equal(t, "error", lastState.State, "the dispatcher requeues on state=error")
+
+	_, err = outSub.NextMsg(100 * time.Millisecond)
+	assert.ErrorIs(t, err, nats.ErrTimeout, "pre-token failures must not publish partial output")
 }
 
 func TestAbortPostTokenNoRetry(t *testing.T) {
@@ -367,7 +403,7 @@ func TestAbortPostTokenNoRetry(t *testing.T) {
 
 	assert.Equal(t, postTokenBefore+1, promtestutil.ToFloat64(metrics.LLMStreamAbortsTotal.WithLabelValues("post_token")))
 	require.Len(t, nc.Published, 3, "content, error chunk and [DONE]")
-	assert.Contains(t, string(nc.Published[0].Data), "chunk-1")
+	assert.Contains(t, string(nc.Published[0].Data), "hi-token")
 
 	var interrupted map[string]any
 	require.NoError(t, json.Unmarshal(nc.Published[1].Data, &interrupted))
@@ -418,4 +454,140 @@ func TestHeartbeatKeepsBusy(t *testing.T) {
 	require.NoError(t, json.Unmarshal(nc.Published[1].Data, &idle))
 	assert.Equal(t, "idle", idle.State)
 	assert.Equal(t, int32(0), idle.Active)
+}
+
+func buildRawSessionPayload(t *testing.T, requestID, subject string, raw []byte, cursor int, prefixHash string) []byte {
+	t.Helper()
+	var decoded openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(raw, &decoded))
+	payload := inboundRequest{
+		Hash:            "conv-1",
+		ChatID:          "conv-1",
+		RequestID:       requestID,
+		Request:         decoded,
+		ResponseSubject: subject,
+		Cursor:          cursor,
+		PrefixHash:      prefixHash,
+		Raw:             raw,
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+	envelope, err := json.Marshal(conversation.AssignmentEnvelope{
+		AssignmentID: "assign-" + requestID,
+		RequestID:    requestID,
+		Payload:      body,
+	})
+	require.NoError(t, err)
+	return envelope
+}
+
+// TestCanonicalPrefixHitWithEscapedHistory proves that hashing the canonical
+// bytes (compact + HTML-escaped) makes differently formatted but identical
+// histories share a prefix hash, so the second request is a cache hit.
+func TestCanonicalPrefixHitWithEscapedHistory(t *testing.T) {
+	sidecar := &recordingSidecar{chunks: []string{`{"choices":[{"delta":{"content":"ok"}}]}`}}
+	srv, _ := newSessionTestServer(t, sidecar)
+
+	pretty := []byte(`{
+  "model": "test-model",
+  "stream": true,
+  "messages": [
+    {"role": "user", "content": "a & b <tag> > done"}
+  ]
+}`)
+	extended := []byte(`{"model":"test-model","stream":true,"messages":[{"role":"user","content":"a & b <tag> > done"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}`)
+
+	raw1 := conversation.CanonicalMessages(pretty)
+	raw2 := conversation.CanonicalMessages(extended)
+	require.NotContains(t, string(raw1), "\n", "canonical history must be compact")
+
+	prefix1, err := conversation.PrefixHash(raw1, 1)
+	require.NoError(t, err)
+	prefix2, err := conversation.PrefixHash(raw2, 1)
+	require.NoError(t, err)
+	require.Equal(t, prefix1, prefix2, "canonical prefix hashes must agree across formatting")
+
+	hitBefore := promtestutil.ToFloat64(metrics.SessionMessagesSentTotal.WithLabelValues("hit"))
+
+	runHandleMessage(srv, buildRawSessionPayload(t, "req-canon-1", "out.test", raw1, 0, ""))
+	runHandleMessage(srv, buildRawSessionPayload(t, "req-canon-2", "out.test", raw2, 1, prefix1))
+
+	assert.Equal(t, hitBefore+1, promtestutil.ToFloat64(metrics.SessionMessagesSentTotal.WithLabelValues("hit")))
+	require.Equal(t, 2, sidecar.callCount())
+	assert.Equal(t, raw2, sidecar.body(1), "the worker must forward the canonical bytes it hashed")
+}
+
+type metaThenFailReader struct {
+	sent bool
+}
+
+func (r *metaThenFailReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		data := []byte("data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n")
+		copy(p, data)
+		return len(data), nil
+	}
+	return 0, errors.New("stream read failure")
+}
+
+func TestMetaChunkDoesNotCommitStream(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(&metaThenFailReader{}),
+		Header:     make(http.Header),
+	}
+	resp.Header.Set("Content-Type", "text/event-stream")
+
+	nc := &testhelpers.RecordingNATSConn{}
+	srv := &Server{
+		cfg:        Config{DllamaName: "worker-1", MaxSeqLen: 4096},
+		nc:         nc,
+		client:     &http.Client{Transport: staticResponseTransport{resp: resp}},
+		outSubject: "out.test",
+		log:        discardLogger(),
+	}
+	srv.initSessionState()
+
+	preTokenBefore := promtestutil.ToFloat64(metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token"))
+	recorder := &chunkRecorder{}
+	err := srv.streamToSidecar(inboundRequest{
+		ResponseSubject: "out.test",
+		Request:         openai.ChatCompletionRequest{Stream: true},
+	}, recorder)
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, errStreamCommitted, "a role-only chunk must not commit the stream")
+	require.False(t, recorder.hasToken())
+	require.Len(t, nc.Published, 1, "only the role chunk was published")
+	assert.Equal(t, preTokenBefore+1, promtestutil.ToFloat64(metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token")))
+}
+
+func TestDedupReplayPublishesIdleState(t *testing.T) {
+	sidecar := &recordingSidecar{chunks: []string{`{"choices":[{"delta":{"content":"ok"}}]}`}}
+	srv, nc := newSessionTestServer(t, sidecar)
+
+	envelope := buildSessionPayload(t, "req-dedup-state", "out.test", []openai.ChatMessage{{Role: "user", Content: "hello"}}, 0, "")
+	runHandleMessage(srv, envelope)
+	runHandleMessage(srv, envelope)
+
+	require.Equal(t, 1, sidecar.callCount())
+
+	busy := 0
+	idle := 0
+	for _, message := range nc.Published {
+		if message.Subject != "state.test" {
+			continue
+		}
+		var event conversation.WorkerStateEvent
+		require.NoError(t, json.Unmarshal(message.Data, &event))
+		switch event.State {
+		case "busy":
+			busy++
+		case "idle":
+			idle++
+		}
+	}
+	assert.Equal(t, 1, busy)
+	assert.Equal(t, 2, idle, "duplicate must publish idle so the dispatcher clears inflight")
 }
