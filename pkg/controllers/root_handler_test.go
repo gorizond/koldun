@@ -1548,3 +1548,44 @@ func TestRootHandlerResolveModelValidatesName(t *testing.T) {
 	_, err = h.resolveModel(dllama)
 	require.Error(t, err)
 }
+
+func TestRootContainerMaxSeqLen(t *testing.T) {
+	handler := &rootHandler{}
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Name: "root", Namespace: "ns"},
+		Spec: v1.RootSpec{
+			Image:     "ghcr.io/gorizond/root:latest",
+			MaxSeqLen: 8192,
+		},
+	}
+
+	container := handler.rootContainer(root, "/models/model.gguf", "/models/tokenizer.json", "q4_0", 4, nil, corev1.ResourceRequirements{})
+	require.Contains(t, container.Args, "--max-seq-len")
+	require.Contains(t, container.Args, "8192")
+
+	sidecar := handler.llmSidecarContainer(root)
+	index := -1
+	for i, arg := range sidecar.Args {
+		if arg == "--llm-max-seq-len" {
+			index = i
+			break
+		}
+	}
+	require.NotEqual(t, -1, index, "sidecar must receive --llm-max-seq-len")
+	require.Equal(t, "8192", sidecar.Args[index+1])
+}
+
+func TestRootContainerDefaultMaxSeqLen(t *testing.T) {
+	handler := &rootHandler{}
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Name: "root", Namespace: "ns"},
+		Spec:       v1.RootSpec{Image: "ghcr.io/gorizond/root:latest"},
+	}
+
+	container := handler.rootContainer(root, "model", "tokenizer", "q4_0", 1, nil, corev1.ResourceRequirements{})
+	require.Contains(t, container.Args, "--max-seq-len")
+	require.Contains(t, container.Args, "4096")
+
+	sidecar := handler.llmSidecarContainer(root)
+	require.Contains(t, sidecar.Args, "4096")
+}

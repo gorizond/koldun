@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -123,4 +124,64 @@ func TestDesiredWorkersPopulatesAnnotationsFromIngressWhenAnnotationsEmpty(t *te
 
 	require.Equal(t, "label-hash", worker.Annotations[labelConversationHash])
 	require.Equal(t, "nats://ns-only:4222", worker.Spec.NATS.URL)
+}
+
+func TestGetIngressMaxSeqLen(t *testing.T) {
+	t.Run("nil ingresses", func(t *testing.T) {
+		handler := &dllamaHandler{}
+		require.Zero(t, handler.getIngressMaxSeqLen(&v1.Dllama{}))
+	})
+
+	t.Run("same namespace", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		cache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+		controller := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+		handler := &dllamaHandler{ingresses: controller}
+
+		controller.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().List("ns-a", gomock.Any()).Return([]*v1.Ingress{{
+			Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{MaxSeqLen: 8192}},
+		}}, nil)
+
+		dllama := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Namespace: "ns-a"}}
+		require.Equal(t, int32(8192), handler.getIngressMaxSeqLen(dllama))
+	})
+
+	t.Run("cluster wide fallback", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		cache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+		controller := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+		handler := &dllamaHandler{ingresses: controller}
+
+		controller.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().List("ns-b", gomock.Any()).Return([]*v1.Ingress{}, nil)
+		cache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{{
+			Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{MaxSeqLen: 2048}},
+		}}, nil)
+
+		dllama := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Namespace: "ns-b"}}
+		require.Equal(t, int32(2048), handler.getIngressMaxSeqLen(dllama))
+	})
+
+	t.Run("not configured and cache errors", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		cache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+		controller := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+		handler := &dllamaHandler{ingresses: controller}
+
+		controller.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().List("ns-c", gomock.Any()).Return(nil, errors.New("namespace cache error"))
+		cache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{{
+			Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{}},
+		}}, nil)
+
+		dllama := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Namespace: "ns-c"}}
+		require.Zero(t, handler.getIngressMaxSeqLen(dllama))
+	})
 }

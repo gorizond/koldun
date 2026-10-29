@@ -312,6 +312,9 @@ type RootSpec struct {
 	// NThreads configures the number of threads for dllama-api.
 	// Defaults to 1. This controls the --nthreads flag.
 	NThreads int32 `json:"nThreads,omitempty"`
+	// MaxSeqLen configures the model context window (--max-seq-len).
+	// Defaults to 4096.
+	MaxSeqLen int32 `json:"maxSeqLen,omitempty"`
 }
 
 // RootMemorySpec customizes root memory calculations.
@@ -1186,6 +1189,9 @@ type IngressBackendSpec struct {
 	// NThreads configures the number of threads for dllama-api root and worker containers.
 	// Default is 1. This controls the --nthreads flag passed to distributed-llama.
 	NThreads int32 `json:"nThreads,omitempty"`
+	// MaxSeqLen configures the maximum prompt length accepted by the backend.
+	// Default is 4096.
+	MaxSeqLen int32 `json:"maxSeqLen,omitempty"`
 }
 
 // IngressRootMemorySpec customises root memory calculation.

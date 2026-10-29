@@ -395,6 +395,7 @@ func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {
 		"--backend-session-scale-down-idle-seconds=120",
 		"--backend-hash-secret=topsecret",
 		"--backend-allow-anonymous",
+		"--backend-max-seq-len=4096",
 	}
 
 	require.Equal(t, expected, args)
