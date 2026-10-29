@@ -191,4 +191,142 @@ var (
 		},
 		[]string{"dllama"},
 	)
+
+	// SessionMessagesSentTotal tracks per-request history decisions (hit, miss,
+	// cold_start, truncated).
+	SessionMessagesSentTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Name:      "session_messages_sent_total",
+			Help:      "Chat requests by prefix-cache decision",
+		},
+		[]string{"result"},
+	)
+
+	// SessionHistoryMessages tracks the number of client history messages
+	// forwarded to the sidecar, labelled by request classification.
+	SessionHistoryMessages = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: "koldun",
+			Name:      "session_history_messages",
+			Help:      "Number of client history messages forwarded to the model",
+			Buckets:   prometheus.ExponentialBuckets(2, 2, 10),
+		},
+		[]string{"kind"},
+	)
+
+	// CacheEventsTotal tracks prefix-cache bookkeeping events.
+	CacheEventsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Name:      "cache_events_total",
+			Help:      "Prefix-cache events by result",
+		},
+		[]string{"result"},
+	)
+
+	// CacheHitRatio tracks the observed prefix-cache hit ratio (0..1).
+	CacheHitRatio = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "koldun",
+			Name:      "cache_hit_ratio",
+			Help:      "Share of requests served from the warm prefix cache",
+		},
+	)
+
+	// ColdStartSeconds tracks the time from request arrival to the first token
+	// when the worker has to replay client history.
+	ColdStartSeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "koldun",
+			Name:      "cold_start_seconds",
+			Help:      "Duration from request arrival to first token on cold start",
+			Buckets:   []float64{1, 2, 5, 10, 20, 30, 60, 90, 120, 180, 240, 300},
+		},
+	)
+
+	// ColdStartsTotal tracks cold starts by reason (instance_change, record_expired).
+	ColdStartsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Name:      "cold_starts_total",
+			Help:      "Cold-start requests by reason",
+		},
+		[]string{"reason"},
+	)
+
+	// ContextTruncationsTotal tracks requests where client history was truncated.
+	ContextTruncationsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Name:      "context_truncations_total",
+			Help:      "Requests whose client history was dropped or shrank",
+		},
+		[]string{"reason"},
+	)
+
+	// ContextOverflowTotal tracks requests rejected because the prompt exceeds
+	// the model context window.
+	ContextOverflowTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Name:      "context_overflow_total",
+			Help:      "Context-window overflow events by stage",
+		},
+		[]string{"stage"},
+	)
+
+	// LLMMaxSeqLen exposes the effective --max-seq-len configured for the worker.
+	LLMMaxSeqLen = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "koldun",
+			Subsystem: "llm",
+			Name:      "max_seq_len",
+			Help:      "Effective maximum sequence length of the local model",
+		},
+	)
+
+	// LLMStreamAbortsTotal tracks interrupted upstream streams by phase.
+	LLMStreamAbortsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "llm",
+			Name:      "stream_aborts_total",
+			Help:      "Interrupted upstream streams by phase (pre_token, post_token)",
+		},
+		[]string{"phase"},
+	)
+
+	// LLMDedupTotal tracks duplicate request suppressions.
+	LLMDedupTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "llm",
+			Name:      "dedup_total",
+			Help:      "Duplicate assignment handling by result",
+		},
+		[]string{"result"},
+	)
+
+	// DispatcherAffinityEventsTotal tracks worker affinity decisions.
+	DispatcherAffinityEventsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "dispatcher",
+			Name:      "affinity_events_total",
+			Help:      "Worker affinity decisions by result",
+		},
+		[]string{"result"},
+	)
+
+	// DispatcherCacheEvictionsTotal tracks pinned-worker invalidations.
+	DispatcherCacheEvictionsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "dispatcher",
+			Name:      "cache_evictions_total",
+			Help:      "Pinned worker evictions by reason",
+		},
+		[]string{"reason"},
+	)
 )

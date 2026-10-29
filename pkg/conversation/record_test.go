@@ -2,7 +2,10 @@ package conversation
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
+
+	"github.com/nats-io/nats.go"
 )
 
 func TestRecord_Validate(t *testing.T) {
@@ -531,5 +534,209 @@ func TestRecordNamespacedName(t *testing.T) {
 	expected := "test-ns/my-session"
 	if result != expected {
 		t.Errorf("NamespacedName() = %q, want %q", result, expected)
+	}
+}
+
+func TestRecordAffinityFieldsRoundTrip(t *testing.T) {
+	record := Record{
+		Hash:           "conv",
+		Namespace:      "ns",
+		Model:          "ns/model",
+		RootImage:      "root:latest",
+		WorkerImage:    "worker:latest",
+		PinnedDllama:   "worker-7",
+		Cursor:         42,
+		MessageHash:    "abc123",
+		LastActivityAt: 1700000000,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	parsed, err := ParseRecord(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if parsed.PinnedDllama != "worker-7" {
+		t.Errorf("PinnedDllama = %q, want worker-7", parsed.PinnedDllama)
+	}
+	if parsed.Cursor != 42 {
+		t.Errorf("Cursor = %d, want 42", parsed.Cursor)
+	}
+	if parsed.MessageHash != "abc123" {
+		t.Errorf("MessageHash = %q, want abc123", parsed.MessageHash)
+	}
+	if parsed.LastActivityAt != 1700000000 {
+		t.Errorf("LastActivityAt = %d, want 1700000000", parsed.LastActivityAt)
+	}
+}
+
+func TestMessageCount(t *testing.T) {
+	count, err := MessageCount([]byte(`{"messages":[{"role":"user"},{"role":"assistant"}]}`))
+	if err != nil {
+		t.Fatalf("MessageCount: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	count, err = MessageCount([]byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("MessageCount empty: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("count = %d, want 0", count)
+	}
+
+	if _, err := MessageCount([]byte(`not-json`)); err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestPrefixHashStableAndExact(t *testing.T) {
+	raw := []byte(`{"model":"m","messages":[{"role":"user","content":"hi","extra":{"keep":true}},{"role":"assistant","content":"hello"}]}`)
+
+	first, err := PrefixHash(raw, 1)
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
+	second, err := PrefixHash(raw, 1)
+	if err != nil {
+		t.Fatalf("PrefixHash: %v", err)
+	}
+	if first != second {
+		t.Fatalf("hash is not stable: %q != %q", first, second)
+	}
+	if first == "" {
+		t.Fatal("hash must not be empty")
+	}
+
+	full, err := PrefixHash(raw, 2)
+	if err != nil {
+		t.Fatalf("PrefixHash full: %v", err)
+	}
+	if full == first {
+		t.Fatal("prefix of one message must differ from the full history")
+	}
+
+	// Unknown fields inside messages participate in the hash, so a mutated
+	// message changes the prefix hash.
+	mutated := []byte(`{"model":"m","messages":[{"role":"user","content":"hi","extra":{"keep":false}},{"role":"assistant","content":"hello"}]}`)
+	mutatedHash, err := PrefixHash(mutated, 1)
+	if err != nil {
+		t.Fatalf("PrefixHash mutated: %v", err)
+	}
+	if mutatedHash == first {
+		t.Fatal("mutating an unknown field must change the prefix hash")
+	}
+
+	empty, err := PrefixHash(raw, 0)
+	if err != nil {
+		t.Fatalf("PrefixHash zero: %v", err)
+	}
+	if empty != "" {
+		t.Fatalf("hash of zero messages = %q, want empty", empty)
+	}
+}
+
+type fakeKV struct {
+	value       []byte
+	revision    uint64
+	updates     int
+	failUpdates int
+}
+
+func (f *fakeKV) Get(string) (nats.KeyValueEntry, error) {
+	return &fakeEntry{value: f.value, revision: f.revision}, nil
+}
+
+func (f *fakeKV) Update(_ string, value []byte, revision uint64) (uint64, error) {
+	f.updates++
+	if f.failUpdates > 0 {
+		f.failUpdates--
+		return 0, fmt.Errorf("%w: stale revision", nats.ErrKeyExists)
+	}
+	if revision != f.revision {
+		return 0, nats.ErrKeyExists
+	}
+	f.value = append([]byte(nil), value...)
+	f.revision++
+	return f.revision, nil
+}
+
+type fakeEntry struct {
+	nats.KeyValueEntry
+	value    []byte
+	revision uint64
+}
+
+func (e *fakeEntry) Value() []byte    { return e.value }
+func (e *fakeEntry) Revision() uint64 { return e.revision }
+
+func TestUpdateRecordRetriesOnConflict(t *testing.T) {
+	record := Record{Hash: "conv", Namespace: "ns", Model: "ns/model", RootImage: "root", WorkerImage: "worker"}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	kv := &fakeKV{value: data, revision: 3, failUpdates: 1}
+
+	updated, err := UpdateRecord(kv, "nats_ttl_conv", func(r *Record) bool {
+		if r.PinnedDllama == "worker-1" {
+			return false
+		}
+		r.PinnedDllama = "worker-1"
+		return true
+	})
+	if err != nil {
+		t.Fatalf("UpdateRecord: %v", err)
+	}
+	if updated.PinnedDllama != "worker-1" {
+		t.Fatalf("pin = %q, want worker-1", updated.PinnedDllama)
+	}
+	if kv.updates != 2 {
+		t.Fatalf("updates = %d, want 2 (one conflict + one success)", kv.updates)
+	}
+
+	parsed, err := ParseRecord(kv.value)
+	if err != nil {
+		t.Fatalf("parse stored record: %v", err)
+	}
+	if parsed.PinnedDllama != "worker-1" {
+		t.Fatalf("stored pin = %q, want worker-1", parsed.PinnedDllama)
+	}
+}
+
+func TestUpdateRecordSkipsUnchanged(t *testing.T) {
+	record := Record{Hash: "conv", Namespace: "ns", Model: "ns/model", RootImage: "root", WorkerImage: "worker", PinnedDllama: "worker-1"}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	kv := &fakeKV{value: data, revision: 1}
+
+	_, err = UpdateRecord(kv, "key", func(r *Record) bool { return r.PinnedDllama != "worker-1" })
+	if err != nil {
+		t.Fatalf("UpdateRecord: %v", err)
+	}
+	if kv.updates != 0 {
+		t.Fatalf("updates = %d, want 0", kv.updates)
+	}
+}
+
+func TestUpdateRecordGivesUpAfterRetries(t *testing.T) {
+	record := Record{Hash: "conv", Namespace: "ns", Model: "ns/model", RootImage: "root", WorkerImage: "worker"}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	kv := &fakeKV{value: data, revision: 1, failUpdates: 10}
+
+	_, err = UpdateRecord(kv, "key", func(r *Record) bool { r.Cursor = 1; return true })
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if kv.updates != updateRecordRetries {
+		t.Fatalf("updates = %d, want %d", kv.updates, updateRecordRetries)
 	}
 }
