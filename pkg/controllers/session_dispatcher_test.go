@@ -47,7 +47,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-queue-group=session-dispatchers",
 				"--dispatcher-ack-wait=30s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "trimmed hash and URL",
@@ -70,7 +70,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-nats-url=nats://localhost:4222",
 				"--dispatcher-ack-wait=1m0s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "different ack wait durations",
@@ -91,7 +91,7 @@ func TestDispatcherArgs(t *testing.T) {
 			expectedContains: []string{
 				"--dispatcher-ack-wait=5m0s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "metrics listener flag is appended",
@@ -113,7 +113,7 @@ func TestDispatcherArgs(t *testing.T) {
 			expectedContains: []string{
 				"--dispatcher-metrics-listen=:9100",
 			},
-			expectedLen: 10,
+			expectedLen: 11,
 		},
 	}
 

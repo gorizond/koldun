@@ -16,6 +16,7 @@ import (
 	"k8s.io/utils/pointer"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	"github.com/sirupsen/logrus"
@@ -790,6 +791,7 @@ func dispatcherArgs(sess *v1.Session, backlogSubject, assignmentsBucket, dllamaP
 		fmt.Sprintf("--dispatcher-state-prefix=%s", statePrefix),
 		fmt.Sprintf("--dispatcher-queue-group=%s", queueGroup),
 		fmt.Sprintf("--dispatcher-ack-wait=%s", ackWait.String()),
+		fmt.Sprintf("--dispatcher-conversation-bucket=%s", conversation.DefaultBucket),
 	}
 
 	if metricsAddr := strings.TrimSpace(sess.Spec.DispatcherMetricsListen); metricsAddr != "" {

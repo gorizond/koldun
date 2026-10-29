@@ -260,18 +260,19 @@ func TestSelectWorker_IdleWorkerSelected(t *testing.T) {
 
 	worker := srv.selectWorker()
 	assert.NotEmpty(t, worker, "should select an idle worker")
-	// Should select the least recently used idle worker (worker1)
-	assert.Equal(t, "worker1", worker)
+	assert.NotEqual(t, "worker2", worker, "busy workers must not be selected")
+	// Deterministic selection keeps the same instance for a stable pool.
+	assert.Equal(t, worker, srv.selectWorker())
 }
 
 // TestSnapshotWorkerStats validates worker statistics calculation.
 func TestSnapshotWorkerStats(t *testing.T) {
 	srv := &Server{
 		workers: map[string]*workerState{
-			"worker1": {state: "idle", active: 0},
-			"worker2": {state: "busy", active: 1},
-			"worker3": {state: "idle", active: 0},
-			"worker4": {state: "processing", active: 1},
+			"worker1": {state: "idle", active: 0, lastHeartbeat: time.Now()},
+			"worker2": {state: "busy", active: 1, lastHeartbeat: time.Now()},
+			"worker3": {state: "idle", active: 0, lastHeartbeat: time.Now()},
+			"worker4": {state: "processing", active: 1, lastHeartbeat: time.Now()},
 		},
 		inflight: map[string]*assignment{
 			"assign-1": {assignmentID: "assign-1"},

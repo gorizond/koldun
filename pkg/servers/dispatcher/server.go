@@ -23,11 +23,13 @@ type Config struct {
 	NATSURL             string
 	BacklogSubject      string
 	AssignmentsBucket   string
+	ConversationBucket  string
 	DllamaSubjectPrefix string
 	StateSubjectPrefix  string
 	QueueGroup          string
 	AckWait             time.Duration
-	MetricsAddr         string // Address for metrics HTTP server (e.g., ":9090")
+	WorkerStaleAfter    time.Duration // Heartbeats older than this are ignored (default 90s)
+	MetricsAddr         string        // Address for metrics HTTP server (e.g., ":9090")
 	Logger              *logrus.Entry
 }
 
@@ -36,15 +38,17 @@ type Server struct {
 	cfg Config
 	log *logrus.Entry
 
-	nc          natsutil.NATSConn
-	js          nats.JetStreamContext
-	backlogSub  backlogSubscription
-	stateSub    *nats.Subscription
-	assignments natsutil.NATSKeyValue
+	nc            natsutil.NATSConn
+	js            nats.JetStreamContext
+	backlogSub    backlogSubscription
+	stateSub      *nats.Subscription
+	assignments   natsutil.NATSKeyValue
+	conversations conversation.KV
 
 	mu            sync.Mutex
 	workers       map[string]*workerState
 	inflight      map[string]*assignment
+	fallbacks     map[string]int
 	lastNoIdleLog time.Time
 
 	retryConfig   natsutil.RetryConfig
@@ -148,15 +152,33 @@ func New(cfg Config) (*Server, error) {
 	nc := natsutil.NewNATSConnWrapper(natsConn)
 	kv := natsutil.NewNATSKeyValueWrapper(kvRaw)
 
+	// Conversation affinity lives on the existing conversation record. Never
+	// create the bucket here: ingress/operator own its lifecycle.
+	var convKV conversation.KV
+	if bucket := strings.TrimSpace(cfg.ConversationBucket); bucket != "" {
+		rawConvKV, convErr := js.KeyValue(bucket)
+		switch {
+		case convErr == nil:
+			convKV = natsutil.NewNATSKeyValueWrapper(rawConvKV)
+		case errors.Is(convErr, nats.ErrBucketNotFound):
+			logger.WithField("bucket", bucket).Debug("conversation bucket not found; worker affinity disabled")
+		default:
+			natsConn.Close()
+			return nil, fmt.Errorf("conversation bucket %s: %w", bucket, convErr)
+		}
+	}
+
 	srv := &Server{
-		cfg:         cfg,
-		log:         logger,
-		nc:          nc,
-		js:          js,
-		assignments: kv,
-		workers:     make(map[string]*workerState),
-		inflight:    make(map[string]*assignment),
-		retryConfig: natsutil.DefaultRetryConfig(),
+		cfg:           cfg,
+		log:           logger,
+		nc:            nc,
+		js:            js,
+		assignments:   kv,
+		conversations: convKV,
+		workers:       make(map[string]*workerState),
+		inflight:      make(map[string]*assignment),
+		fallbacks:     make(map[string]int),
+		retryConfig:   natsutil.DefaultRetryConfig(),
 	}
 	return srv, nil
 }
@@ -263,7 +285,9 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 
 	idleWorkers, totalWorkers, inflight := s.snapshotWorkerStats()
 
-	worker := s.selectWorker()
+	pin := s.pinnedWorker()
+	worker, affinity := s.selectWorkerFor(pin)
+	recordAffinityMetrics(pin, affinity)
 	if worker == "" {
 		if s.shouldLogNoIdle(time.Now()) {
 			s.log.WithFields(logrus.Fields{
@@ -271,6 +295,8 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 				"idleWorkers":  idleWorkers,
 				"totalWorkers": totalWorkers,
 				"inflight":     inflight,
+				"affinity":     affinity,
+				"pin":          pin,
 			}).Info("dispatcher backlog: no idle workers available, requeuing")
 		}
 		if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); err != nil {
@@ -301,6 +327,11 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		return
 	}
 
+	switch affinity {
+	case "pinned", "repin", "no_pin":
+		s.pinWorker(worker)
+	}
+
 	if _, err := KVPutWithRetry(s.assignments, backlog.ID, payload, s.retryConfig, s.log); err != nil {
 		s.log.WithError(err).Error("failed to record assignment in KV after retries")
 		// Continue execution - assignment was sent, KV is for recovery only
@@ -321,6 +352,8 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		"assignmentId": assignmentID,
 		"requestId":    backlog.ID,
 		"worker":       worker,
+		"affinity":     affinity,
+		"pin":          pin,
 		"idleWorkers":  nowIdle,
 		"totalWorkers": total,
 		"inflight":     nowInflight,
@@ -404,24 +437,10 @@ func (s *Server) requeueAssignment(asn *assignment) {
 	}
 }
 
+// selectWorker returns the deterministic worker pick without affinity.
 func (s *Server) selectWorker() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var selected string
-	var selectedTime time.Time
-	for name, st := range s.workers {
-		if strings.ToLower(st.state) != "idle" {
-			continue
-		}
-		if st.active > 0 {
-			continue
-		}
-		if selected == "" || st.lastHeartbeat.Before(selectedTime) {
-			selected = name
-			selectedTime = st.lastHeartbeat
-		}
-	}
-	return selected
+	worker, _ := s.selectWorkerFor("")
+	return worker
 }
 
 func (s *Server) recoverAssignments() {
@@ -458,9 +477,11 @@ func (s *Server) recoverAssignments() {
 func (s *Server) snapshotWorkerStats() (idle int, total int, inflight int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	staleAfter := s.staleAfter()
 	for _, st := range s.workers {
 		total++
-		if strings.ToLower(st.state) == "idle" && st.active == 0 {
+		if workerLive(st, now, staleAfter) {
 			idle++
 		}
 	}
