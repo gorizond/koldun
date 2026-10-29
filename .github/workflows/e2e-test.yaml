@@ -146,10 +146,28 @@ jobs:
 
       - name: Create test model bucket
         run: |
-          # Configure mc alias once per pod and create bucket idempotently
-          kubectl run minio-mc -n koldun --rm -i --restart=Never --image=minio/mc -- \
-            /bin/sh -c "mc alias set local http://koldun-minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/koldun-models" \
-            || true
+          # minio/mc no longer exists on Docker Hub, so use aws-cli against the in-cluster
+          # MinIO. One pod: create the bucket idempotently, then prove it is really there.
+          kubectl run minio-bucket -n koldun --rm -i --restart=Never \
+            --image=amazon/aws-cli:2.17.0 --command -- /bin/sh -c '
+              set -e
+              export AWS_ACCESS_KEY_ID=minioadmin
+              export AWS_SECRET_ACCESS_KEY=minioadmin
+              export AWS_DEFAULT_REGION=us-east-1
+              S3=http://koldun-minio:9000
+              if out=$(aws --endpoint-url "$S3" s3api create-bucket --bucket koldun-models 2>&1); then
+                echo "$out"
+              elif echo "$out" | grep -q BucketAlreadyOwnedByYou; then
+                echo "bucket already owned, continuing"
+              else
+                echo "$out"
+                echo "create-bucket failed for koldun-models" >&2
+                exit 1
+              fi
+              aws --endpoint-url "$S3" s3api head-bucket --bucket koldun-models
+              aws --endpoint-url "$S3" s3 ls
+              aws --endpoint-url "$S3" s3 ls | grep -qw koldun-models
+            '
 
       - name: Install Koldun operator
         run: |
