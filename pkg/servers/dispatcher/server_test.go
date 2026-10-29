@@ -1286,7 +1286,7 @@ func TestRequeueAssignmentPublishesBacklog(t *testing.T) {
 		payload:   []byte(`{"foo":"bar"}`),
 	}
 
-	srv.requeueAssignment(asn)
+	srv.requeueAssignment(asn, "requeue test")
 
 	require.Len(t, rec.Published, 1)
 	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
@@ -1314,7 +1314,7 @@ func TestRequeueAssignmentLogsPublishError(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		srv.requeueAssignment(asn)
+		srv.requeueAssignment(asn, "requeue test")
 	})
 	require.Len(t, rec.Published, 1)
 	assert.Equal(t, "test.backlog", rec.Published[0].Subject)

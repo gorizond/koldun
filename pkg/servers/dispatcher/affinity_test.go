@@ -349,3 +349,36 @@ func TestFinishAssignmentRequeueKeepsNewerPin(t *testing.T) {
 	assert.Equal(t, "worker-b", srv.conversations.(*conversationKV).record(t).PinnedDllama,
 		"clearing must not overwrite a pin written for another worker")
 }
+
+func TestHandleStateErrorSurfacesWorkerReason(t *testing.T) {
+	srv := newAffinityServer(t, map[string]*workerState{"worker-a": idleWorker("worker-a")}, "worker-a")
+	srv.inflight["asn-9"] = &assignment{
+		assignmentID: "asn-9",
+		requestID:    "req-9",
+		worker:       "worker-a",
+		payload:      []byte(`{"responseSubject":"out.req-9"}`),
+		attempts:     maxBacklogAttempts - 1,
+	}
+	recorder := srv.nc.(*testhelpers.RecordingNATSConn)
+
+	event := conversation.WorkerStateEvent{
+		Dllama:       "worker-a",
+		State:        "error",
+		AssignmentID: "asn-9",
+		Error:        "sidecar responded 500: model exploded",
+	}
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	srv.handleState(&nats.Msg{Subject: "state.worker-a", Data: data})
+
+	require.Len(t, recorder.Published, 2)
+	var failure map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Published[0].Data, &failure))
+	errBody, ok := failure["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "inference_failed", errBody["code"])
+	assert.Contains(t, errBody["message"], "sidecar responded 500: model exploded")
+	assert.Equal(t, "[DONE]", string(recorder.Published[1].Data))
+	assert.Empty(t, srv.conversations.(*conversationKV).record(t).PinnedDllama)
+}

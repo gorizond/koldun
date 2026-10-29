@@ -396,12 +396,12 @@ func (s *Server) handleState(msg *nats.Msg) {
 		}
 	case "error":
 		if assignmentID != "" {
-			s.finishAssignment(assignmentID, true)
+			s.finishAssignment(assignmentID, true, event.Error)
 		}
 	}
 }
 
-func (s *Server) finishAssignment(assignmentID string, requeue bool) {
+func (s *Server) finishAssignment(assignmentID string, requeue bool, reasons ...string) {
 	s.mu.Lock()
 	asn, ok := s.inflight[assignmentID]
 	if ok {
@@ -416,7 +416,11 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 		// The worker failed before delivering a token; drop the pin so the
 		// retry cannot land on the same instance once it reports idle again.
 		s.clearPin(asn.worker)
-		s.requeueAssignment(asn)
+		reason := "worker reported an error"
+		if len(reasons) > 0 && strings.TrimSpace(reasons[0]) != "" {
+			reason = strings.TrimSpace(reasons[0])
+		}
+		s.requeueAssignment(asn, reason)
 	}
 
 	if err := KVDeleteWithRetry(s.assignments, asn.requestID, s.retryConfig, s.log); err != nil {
@@ -425,14 +429,14 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 	}
 }
 
-func (s *Server) requeueAssignment(asn *assignment) {
+func (s *Server) requeueAssignment(asn *assignment, reason string) {
 	backlog := conversation.BacklogMessage{
 		ID:        asn.requestID,
 		Payload:   asn.payload,
 		CreatedAt: time.Now().Unix(),
 		Attempts:  asn.attempts,
 	}
-	s.requeueOrFail(backlog, "worker reported an error")
+	s.requeueOrFail(backlog, reason)
 }
 
 // requeueOrFail republishes the backlog item until maxBacklogAttempts is
@@ -532,7 +536,7 @@ func (s *Server) recoverAssignments() {
 			assignmentID: env.AssignmentID,
 			requestID:    env.RequestID,
 			payload:      env.Payload,
-		})
+		}, "recovered unfinished assignment")
 		if err := KVDeleteWithRetry(s.assignments, key, s.retryConfig, s.log); err != nil {
 			s.log.WithError(err).WithField("key", key).Error("failed to cleanup assignment entry after retries")
 		}
