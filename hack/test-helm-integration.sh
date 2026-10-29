@@ -99,11 +99,19 @@ HELM_ARGS=(
     # Disable nats-box to reduce image pulls
     --set nats.natsBox.enabled=false
     --set minio.enabled=true
+    # Public mirror of the official MinIO image: docker.io/minio/minio is empty and
+    # quay.io/minio/minio answers anonymous pulls with 401 UNAUTHORIZED
+    --set minio.image.repository=coollabsio/minio
+    --set minio.image.tag=RELEASE.2025-10-15T17-29-55Z
     # Disable MinIO persistence for tests (uses emptyDir)
     --set minio.persistence.enabled=false
     --set minio.resources.requests.memory=256Mi
-    # Disable bucket creation to avoid post-install hook timeout
-    --set minio.buckets=null
+    # Skip the post-install job entirely: it needs the dead quay.io/minio/mc image.
+    # `--set minio.buckets=null` does not work (the parent values.yaml supplies a
+    # default bucket list), and the subchart also renders that job for its default
+    # `users` entry, so clear both with set-json (Helm 3.14+).
+    --set-json 'minio.buckets=[]'
+    --set-json 'minio.users=[]'
     --timeout "$TIMEOUT"
 )
 

@@ -112,7 +112,7 @@ jobs:
               spec:
                 containers:
                 - name: minio
-                  image: minio/minio:RELEASE.2024-01-01T16-36-33Z
+                  image: coollabsio/minio:RELEASE.2025-10-15T17-29-55Z
                   args:
                   - server
                   - /data
