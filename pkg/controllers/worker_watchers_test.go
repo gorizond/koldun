@@ -94,7 +94,9 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 		workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
 		handler := &workerHandler{workers: workers}
 
-		workers.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+		// A deleted worker STS must re-enqueue the Worker, otherwise the
+		// Parallel migration would never recreate it.
+		workers.EXPECT().Enqueue("models", "mistral-workers")
 
 		result, err := handler.onRelatedStatefulSet("models/mistral-workers", nil)
 		require.NoError(t, err)

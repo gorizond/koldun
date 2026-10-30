@@ -75,8 +75,12 @@ spec:
             - {{ . | quote }}
             {{- end }}
           env:
-            - name: OPERATOR_SERVICE_ACCOUNT
+            - name: DLLAMA_SERVICE_ACCOUNT
+              {{- if .Values.serviceAccount.create }}
+              value: {{ include "koldun.dllamaServiceAccountName" . | quote }}
+              {{- else }}
               value: {{ include "koldun.serviceAccountName" . | quote }}
+              {{- end }}
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port | default .Values.service.port }}

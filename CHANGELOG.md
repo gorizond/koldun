@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - dllama workers now report readiness only after their weight shards are loaded (patched worker marker + readiness probe); the llm sidecar waits for `status.readyWorkers` before accepting requests.
 - `dllama-api` survives HTTP client disconnects/timeouts with a retriable 503 instead of terminating; socket read timeout is tied to the ingress sidecar timeout.
-- Existing OrderedReady worker StatefulSets are rolled automatically to Parallel pod management.
+- Existing OrderedReady worker StatefulSets are detected and rolled automatically: the worker and root StatefulSets are deleted and recreated (worker first, then root) with Parallel pod management and the weights-loaded readiness probe.
 
 ### Notes
-- Rolling an existing Dllama group (image/config change) requires deleting the root and worker StatefulSets together; expect 8-10 minutes without service and in-flight generations being terminated (grace period 0).
+- Rolling an existing Dllama group (image/config change) requires deleting the root and worker StatefulSets together, selected via `kubectl get sts -l koldun.gorizond.io/dllama=<dllama>` (both names may be truncated); expect 8-10 minutes without service and in-flight generations being terminated (grace period 0).
+- Root pods use a dedicated minimal service account (`<release>-dllama`, get/delete dllamas only) instead of the operator service account.
 
 ## [0.1.0] - 2025-11-18
 

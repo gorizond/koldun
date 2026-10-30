@@ -1034,6 +1034,7 @@ func (s *Server) workersReadyForTraffic() bool {
 
 func (s *Server) logWorkerReadForbidden(err error) {
 	s.forbiddenOnce.Do(func() {
+		metrics.LLMWorkerReadForbiddenTotal.Inc()
 		s.log.WithError(err).Error("llm sidecar cannot get dllamas; worker-load gate disabled (check the root pod serviceAccountName/RBAC)")
 	})
 }

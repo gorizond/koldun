@@ -2823,10 +2823,12 @@ func TestWaitForWorkersLoadedForbiddenFailsOpen(t *testing.T) {
 		workerLoadPollInterval: 5 * time.Millisecond,
 	}
 
+	before := promtestutil.ToFloat64(metrics.LLMWorkerReadForbiddenTotal)
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	require.NoError(t, srv.waitForWorkersLoaded(ctx))
 	require.True(t, srv.workersReadyForTraffic())
+	require.Equal(t, before+1, promtestutil.ToFloat64(metrics.LLMWorkerReadForbiddenTotal))
 }
 
 func TestWaitForWorkersLoadedTimeout(t *testing.T) {

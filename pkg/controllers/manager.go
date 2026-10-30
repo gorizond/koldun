@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	koldv1 "github.com/gorizond/koldun/pkg/controllers/koldunv1"
 	lassocontroller "github.com/rancher/lasso/pkg/controller"
@@ -56,6 +57,15 @@ func defaultFactoryCreator(cfg *rest.Config, opts *generic.FactoryOptions) (shar
 
 func defaultFactoryFromConfig(cfg *rest.Config, opts *generic.FactoryOptions) (sharedFactory, error) {
 	return factoryCreatorFn(cfg, opts)
+}
+
+// rootServiceAccountName returns the minimal dllama service account injected by
+// Helm, falling back to the operator SA name for older chart versions.
+func rootServiceAccountName() string {
+	if name := strings.TrimSpace(os.Getenv("DLLAMA_SERVICE_ACCOUNT")); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("OPERATOR_SERVICE_ACCOUNT"))
 }
 
 // Manager wires together Wrangler factories, controllers, and reconcilers for the operator.
@@ -134,7 +144,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		Batch:                      batch,
 		Kold:                       kold,
 		ensureObjectStorageBuckets: true,
-		ServiceAccountName:         os.Getenv("OPERATOR_SERVICE_ACCOUNT"),
+		ServiceAccountName:         rootServiceAccountName(),
 	}, nil
 }
 

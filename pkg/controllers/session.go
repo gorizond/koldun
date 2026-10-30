@@ -428,7 +428,7 @@ func (p sessionScalingParams) shouldScaleUp(state sessionPoolState) bool {
 	if p.desired > 0 && int32(state.total()) < p.desired {
 		return true
 	}
-	if state.loadingCount() > 0 && state.readyCount() == 0 {
+	if state.notReadyCount() > 0 && state.readyCount() == 0 {
 		// The initial group is still loading its weights (8-10 min). Backlog
 		// alone must not create more groups that would also be loading.
 		return false
@@ -486,7 +486,9 @@ func (s sessionPoolState) readyCount() int { return len(s.ready) }
 
 func (s sessionPoolState) idleCount() int { return len(s.idleReady) }
 
-func (s sessionPoolState) loadingCount() int { return s.total() - len(s.ready) }
+// notReadyCount counts groups that are not Ready yet. This includes failed
+// groups, so scale-up is suppressed only until at least one group becomes ready.
+func (s sessionPoolState) notReadyCount() int { return s.total() - len(s.ready) }
 
 func (s sessionPoolState) busyCount() int { return len(s.ready) - len(s.idleReady) }
 

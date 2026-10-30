@@ -286,6 +286,17 @@ var (
 		},
 	)
 
+	// LLMWorkerReadForbiddenTotal tracks worker-load gate fail-opens caused by
+	// missing RBAC on dllamas (observable misconfiguration).
+	LLMWorkerReadForbiddenTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "llm",
+			Name:      "worker_read_forbidden_total",
+			Help:      "Times the llm sidecar could not read Dllama status due to RBAC",
+		},
+	)
+
 	// LLMStreamAbortsTotal tracks interrupted upstream streams by phase.
 	LLMStreamAbortsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{

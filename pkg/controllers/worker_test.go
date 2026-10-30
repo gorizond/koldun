@@ -1760,3 +1760,93 @@ func TestWorkerHandlerEnsureStatefulSetMigrationDeleteErrors(t *testing.T) {
 		require.Error(t, handler.ensureStatefulSet(worker))
 	})
 }
+
+func TestWorkerHandlerEnsureStatefulSetMigratesLongNameAndRecreates(t *testing.T) {
+	dllamaName := strings.Repeat("s", 40) + "-abcdefghijklmno"
+	require.Greater(t, len(dllamaName), 47)
+	workerName := workerResourceName(dllamaName)
+	expectedRoot := rootStatefulSetName(dllamaName + "-root")
+	require.NotEqual(t, dllamaName+"-root", expectedRoot, "long names must be truncated like the root controller does")
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workerName,
+			Namespace: "models",
+			Labels:    map[string]string{labelDllamaName: dllamaName},
+		},
+		Spec: v1.WorkerSpec{Image: "image", ModelRef: "model-pvc"},
+	}
+
+	t.Run("deletes the truncated root statefulset", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+		handler := &workerHandler{apply: &fakeapply.FakeApply{}, statefulsets: statefulsets}
+
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		statefulsetsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{PodManagementPolicy: appsv1.OrderedReadyPodManagement},
+		}, nil)
+		statefulsets.EXPECT().Delete("models", workerName, gomock.Any()).Return(nil)
+		statefulsets.EXPECT().Delete("models", expectedRoot, gomock.Any()).Return(nil)
+
+		require.NoError(t, handler.ensureStatefulSet(worker))
+	})
+
+	t.Run("recreates the worker statefulset after deletion", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+		applySpy := &fakeapply.FakeApply{}
+		dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+		dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+		models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+		modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+		handler := &workerHandler{
+			apply:        applySpy,
+			statefulsets: statefulsets,
+			dllamas:      dllamas,
+			models:       models,
+		}
+
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		statefulsetsCache.EXPECT().Get("models", workerName).Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "statefulsets"}, workerName))
+		dllamas.EXPECT().Cache().Return(dllamaCache).AnyTimes()
+		dllamaCache.EXPECT().Get("models", dllamaName).Return(&v1.Dllama{
+			ObjectMeta: metav1.ObjectMeta{Name: dllamaName, Namespace: "models"},
+			Spec:       v1.DllamaSpec{ReplicaPower: 1, ModelRef: v1.ModelReference{Kind: "Model", Name: "model"}},
+		}, nil)
+		models.EXPECT().Cache().Return(modelCache).AnyTimes()
+		modelCache.EXPECT().Get("models", "model").Return(&v1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "models"},
+			Spec:       v1.ModelSpec{Conversion: &v1.ModelConversionSpec{WeightsFloatType: "q40"}},
+		}, nil)
+
+		require.NoError(t, handler.ensureStatefulSet(worker))
+		require.NotEmpty(t, applySpy.Objects)
+		var created *appsv1.StatefulSet
+		for _, object := range applySpy.Objects[0].All() {
+			if sts, ok := object.(*appsv1.StatefulSet); ok {
+				created = sts
+			}
+		}
+		require.NotNil(t, created)
+		require.Equal(t, workerName, created.Name)
+		require.Equal(t, appsv1.ParallelPodManagement, created.Spec.PodManagementPolicy)
+		require.NotNil(t, created.Spec.Template.Spec.Containers[0].ReadinessProbe)
+	})
+}
+
+func TestWorkerOnRelatedStatefulSetRemoveEnqueuesWorker(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	handler := &workerHandler{workers: workers}
+
+	workers.EXPECT().Enqueue("models", "mistral-workers")
+	_, err := handler.onRelatedStatefulSet("models/mistral-workers", nil)
+	require.NoError(t, err)
+}

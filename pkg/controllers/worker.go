@@ -50,6 +50,7 @@ func registerWorkerController(ctx context.Context, m *Manager) error {
 	handler.workers.OnChange(ctx, "koldun-worker-controller", handler.onChange)
 	handler.workers.OnRemove(ctx, "koldun-worker-controller", handler.onRemove)
 	handler.statefulsets.OnChange(ctx, "koldun-worker-statefulset-watch", handler.onRelatedStatefulSet)
+	handler.statefulsets.OnRemove(ctx, "koldun-worker-statefulset-remove", handler.onRelatedStatefulSet)
 	handler.services.OnChange(ctx, "koldun-worker-service-watch", handler.onRelatedService)
 	handler.dllamas.OnChange(ctx, "koldun-worker-dllama-watch", handler.onRelatedDllama)
 	handler.dllamas.OnRemove(ctx, "koldun-worker-dllama-remove", handler.onRelatedDllama)
@@ -79,6 +80,12 @@ func (h *workerHandler) onRemove(key string, obj *v1.Worker) (*v1.Worker, error)
 
 func (h *workerHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
 	if obj == nil {
+		// The STS was deleted (e.g. OrderedReady -> Parallel migration). The
+		// Worker must be re-enqueued or the deleted STS is never recreated and
+		// the session strands until the worker-load timeout evicts it.
+		if namespace, name := splitKey(key); namespace != "" && name != "" {
+			h.workers.Enqueue(namespace, name)
+		}
 		return nil, nil
 	}
 	if obj.Labels[labelComponent] != componentWorker {
@@ -286,7 +293,10 @@ func (h *workerHandler) rolloutWorkerGroup(worker *v1.Worker) error {
 		return fmt.Errorf("delete worker statefulset for pod management migration: %w", err)
 	}
 	if dllamaName := labelValue(worker.Labels, labelDllamaName); dllamaName != "" {
-		rootName := fmt.Sprintf("%s-root", dllamaName)
+		// The root controller names the StatefulSet via rootStatefulSetName,
+		// which truncates long Dllama names; using the raw "<name>-root" would
+		// miss the real object for production-length names.
+		rootName := rootStatefulSetName(fmt.Sprintf("%s-root", dllamaName))
 		if err := h.statefulsets.Delete(worker.Namespace, rootName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete root statefulset for pod management migration: %w", err)
 		}

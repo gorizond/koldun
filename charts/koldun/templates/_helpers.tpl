@@ -60,3 +60,10 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Minimal service account for dllama root pods: read/delete dllamas only.
+*/}}
+{{- define "koldun.dllamaServiceAccountName" -}}
+{{- printf "%s-dllama" (include "koldun.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
