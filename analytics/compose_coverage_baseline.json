@@ -1,6 +1,6 @@
 {
-  "total": 86.8,
-  "updated_at": "2026-10-30T19:17:32Z",
-  "commit": "39259d8161d4d3ab39e05ec2e6670e617c6f40a5",
-  "source": "39259d8 \u2014 fix: schedule and guard session scale-to-zero"
+  "total": 87.0,
+  "updated_at": "2026-10-30T19:39:58Z",
+  "commit": "6d5bf9489871a05bddb39f528b45eedc26ff9b73",
+  "source": "6d5bf94 \u2014 fix: drive idle scale-down from the conversation record"
 }
