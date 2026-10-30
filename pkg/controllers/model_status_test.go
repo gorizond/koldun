@@ -1175,11 +1175,13 @@ func TestEnsureStatusSizingHistoricalStateHandling(t *testing.T) {
 		expectedStatus  metav1.ConditionStatus
 	}{
 		{
+			// Size measurements follow the artifact hash, not the generation:
+			// a runtime-only spec bump keeps the previous measurement valid.
 			name:            "reuseSucceededPreviousGeneration",
 			sizeState:       "Succeeded",
 			generationMatch: false,
-			expectedReason:  "SizingPending",
-			expectedStatus:  metav1.ConditionFalse,
+			expectedReason:  "SizingSucceeded",
+			expectedStatus:  metav1.ConditionTrue,
 		},
 		{
 			name:            "failedCurrentGeneration",
@@ -1192,7 +1194,7 @@ func TestEnsureStatusSizingHistoricalStateHandling(t *testing.T) {
 			name:            "failedPreviousGeneration",
 			sizeState:       "Failed",
 			generationMatch: false,
-			expectedReason:  "SizingPending",
+			expectedReason:  "SizingFailed",
 			expectedStatus:  metav1.ConditionFalse,
 		},
 		{
@@ -1249,14 +1251,9 @@ func TestEnsureStatusSizingHistoricalStateHandling(t *testing.T) {
 				if sizeCond.Status != tt.expectedStatus {
 					t.Fatalf("size condition status = %s, want %s", sizeCond.Status, tt.expectedStatus)
 				}
-				if tt.sizeState == "Failed" && tt.generationMatch {
+				if tt.sizeState == "Failed" {
 					if updated.Status.ConversionSizeForceToken != "force-me" {
 						t.Fatalf("ConversionSizeForceToken = %q, want force-me", updated.Status.ConversionSizeForceToken)
-					}
-				}
-				if tt.sizeState == "Failed" && !tt.generationMatch {
-					if updated.Status.ConversionSizeForceToken != "" {
-						t.Fatalf("ConversionSizeForceToken = %q, want empty for previous generation", updated.Status.ConversionSizeForceToken)
 					}
 				}
 				return updated, nil
@@ -1721,5 +1718,86 @@ func TestEnsureStatusPreConvertedModelMissingPVCName(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatalf("ensureStatus returned nil result")
+	}
+}
+
+func TestEnsureStatusAdoptsLegacyJobsAndPersistsArtifactHash(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+
+	handler := &modelHandler{jobs: jobs, models: models}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "alpha", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL: "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "models-bucket",
+				BucketForConvert: "convert-bucket",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+			MaxSeqLen:  4096,
+		},
+		Status: v1.ModelStatus{
+			ObservedGeneration:       2,
+			DownloadState:            "Succeeded",
+			ConversionState:          "Succeeded",
+			ConversionSizeState:      "Succeeded",
+			ConversionSizeGeneration: 2,
+			ConversionSizeBytes:      3072,
+			ConversionSizeHuman:      "3 KiB",
+		},
+	}
+	model.Generation = 2
+	// Legacy jobs created before artifact hashes existed (generation only).
+	download := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "alpha-download",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "2"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+	conversion := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "alpha-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "2"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "alpha-download").Return(download, nil)
+	jobsCache.EXPECT().Get("models", "alpha-convert").Return(conversion, nil)
+	jobsCache.EXPECT().Get("models", "alpha-size").Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "jobs"}, "alpha-size"))
+
+	// maxSeqLen-only change: generation moves on, artifacts stay valid.
+	model.Spec.MaxSeqLen = 8192
+	model.Generation = 3
+	wantHash := modelArtifactHash(model)
+
+	models.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Model{})).DoAndReturn(func(updated *v1.Model) (*v1.Model, error) {
+		if updated.Status.ArtifactHash != wantHash {
+			t.Fatalf("ArtifactHash = %q, want %q", updated.Status.ArtifactHash, wantHash)
+		}
+		if updated.Status.ObservedGeneration != 3 {
+			t.Fatalf("ObservedGeneration = %d, want 3", updated.Status.ObservedGeneration)
+		}
+		ready := meta.FindStatusCondition(updated.Status.Conditions, conditionReady)
+		if ready == nil || ready.Status != metav1.ConditionTrue {
+			t.Fatalf("expected Ready=True after runtime-only change, got %+v", ready)
+		}
+		if updated.Status.DownloadState != "Succeeded" {
+			t.Fatalf("DownloadState = %q, want Succeeded", updated.Status.DownloadState)
+		}
+		return updated, nil
+	})
+
+	if _, err := handler.ensureStatus(model); err != nil {
+		t.Fatalf("ensureStatus returned error: %v", err)
 	}
 }

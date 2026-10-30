@@ -313,6 +313,11 @@ spec:
             description: ModelStatus reports whether the model artifact is ready for
               consumption.
             properties:
+              artifactHash:
+                description: |-
+                  ArtifactHash identifies the ModelSpec fields that produced the current
+                  downloaded/converted artifacts. Runtime-only spec changes do not alter it.
+                type: string
               artifactSizeBytes:
                 description: ArtifactSizeBytes records the size of the downloaded
                   artifact, if known.

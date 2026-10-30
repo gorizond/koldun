@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,6 +13,51 @@ import (
 
 // model_helpers.go contains utility functions for the model controller.
 // These are pure functions with no side effects, making them easy to test and reuse.
+
+// modelArtifactHash returns a stable digest of the ModelSpec fields that affect
+// the downloaded/converted artifacts. Runtime-only fields (maxSeqLen,
+// replicaPower, launchOptions, pipProxy) are deliberately excluded so tuning
+// them does not restart multi-hour download/conversion jobs.
+func modelArtifactHash(obj *v1.Model) string {
+	payload := struct {
+		SourceURL             string                     `json:"sourceUrl"`
+		LocalPath             string                     `json:"localPath"`
+		ObjectStorage         *v1.ModelObjectStorageSpec `json:"objectStorage,omitempty"`
+		Download              *v1.ModelDownloadSpec      `json:"download,omitempty"`
+		Conversion            *v1.ModelConversionSpec    `json:"conversion,omitempty"`
+		PV                    *v1.ModelPVSpec            `json:"pv,omitempty"`
+		PreConverted          bool                       `json:"preConverted,omitempty"`
+		PreConvertedPVCName   string                     `json:"preConvertedPVCName,omitempty"`
+		PreConvertedSizeBytes int64                      `json:"preConvertedSizeBytes,omitempty"`
+	}{
+		SourceURL:             obj.Spec.SourceURL,
+		LocalPath:             obj.Spec.LocalPath,
+		ObjectStorage:         obj.Spec.ObjectStorage,
+		Download:              obj.Spec.Download,
+		Conversion:            obj.Spec.Conversion,
+		PV:                    obj.Spec.PV,
+		PreConverted:          obj.Spec.PreConverted,
+		PreConvertedPVCName:   obj.Spec.PreConvertedPVCName,
+		PreConvertedSizeBytes: obj.Spec.PreConvertedSizeBytes,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// modelArtifactsCurrent reports whether the recorded artifacts were produced
+// for hash. A missing ArtifactHash means legacy status written before artifact
+// hashes existed: fall back to the generation gate so the first rollout does
+// not restart jobs for models that are already up to date.
+func modelArtifactsCurrent(obj *v1.Model, hash string) bool {
+	if obj.Status.ArtifactHash != "" {
+		return obj.Status.ArtifactHash == hash
+	}
+	return obj.Status.ObservedGeneration == obj.Generation
+}
 
 // normalizeForceToken generates a unique token for force size rerun requests.
 // If requested is true but value is empty, it generates a token based on resourceVersion.

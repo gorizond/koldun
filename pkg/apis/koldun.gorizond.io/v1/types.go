@@ -276,6 +276,9 @@ type ModelStatus struct {
 	ConversionSizeForceToken string `json:"conversionSizeForceToken,omitempty"`
 	// OutputPVCName is the PersistentVolumeClaim that stores converted artifacts.
 	OutputPVCName string `json:"outputPVCName,omitempty"`
+	// ArtifactHash identifies the ModelSpec fields that produced the current
+	// downloaded/converted artifacts. Runtime-only spec changes do not alter it.
+	ArtifactHash string `json:"artifactHash,omitempty"`
 }
 
 // +kubebuilder:object:root=true

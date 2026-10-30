@@ -29,6 +29,8 @@ const (
 
 	// Annotation to track when a job was last deleted to prevent immediate recreation
 	annotationJobDeletedAt = "koldun.gorizond.io/job-deleted-at"
+	// annotationArtifactHash records which artifact-affecting spec produced a job.
+	annotationArtifactHash = "koldun.gorizond.io/artifact-hash"
 	// annotationForceSizeRerun allows users to request re-running the sizing job
 	annotationForceSizeRerun = "koldun.gorizond.io/force-size-rerun"
 )

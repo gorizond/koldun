@@ -33,6 +33,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	spec := effectiveDownloadSpec(obj.Spec.Download)
 	jobName := jobNameForModel(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
+	currentArtifactHash := modelArtifactHash(obj)
 
 	klog.V(1).Infof("Model %s/%s: ensureDownloadJob called - Status.DownloadState=%s, Status.ObservedGeneration=%d, obj.Generation=%d",
 		obj.Namespace, obj.Name, obj.Status.DownloadState, obj.Status.ObservedGeneration, obj.Generation)
@@ -43,8 +44,8 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 			obj.Namespace, obj.Name, obj.Status.ObservedGeneration, obj.Generation)
 	}
 
-	if strings.EqualFold(obj.Status.DownloadState, "Succeeded") && obj.Status.ObservedGeneration == obj.Generation {
-		klog.V(4).Infof("Model %s/%s: download already succeeded for generation %d", obj.Namespace, obj.Name, obj.Generation)
+	if strings.EqualFold(obj.Status.DownloadState, "Succeeded") && modelArtifactsCurrent(obj, currentArtifactHash) {
+		klog.V(4).Infof("Model %s/%s: download already succeeded for the current artifacts", obj.Namespace, obj.Name)
 		return nil
 	}
 
@@ -59,10 +60,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 			klog.V(1).Infof("Model %s/%s: job %s is being deleted, waiting for completion", obj.Namespace, obj.Name, jobName)
 			return nil
 		}
-		currentGen := existing.Annotations[annotationModelGeneration]
-		if currentGen == "" {
-			currentGen = existing.Labels[annotationModelGeneration]
-		}
+		currentGen := jobGeneration(existing)
 		klog.V(1).Infof("Model %s/%s: existing job generation=%s, expected=%s", obj.Namespace, obj.Name, currentGen, expectedGeneration)
 
 		// If job has no generation annotation, it's an old job that should be deleted
@@ -83,9 +81,33 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 			return nil
 		}
 
+		if artifactHash := jobArtifactHash(existing); artifactHash != "" {
+			if artifactHash == currentArtifactHash {
+				klog.V(1).Infof("Model %s/%s: job %s already exists for the current artifact hash", obj.Namespace, obj.Name, jobName)
+				return nil
+			}
+			if !isJobFinished(existing) {
+				klog.V(1).Infof("Model %s/%s: job %s is still running for an outdated artifact hash, not interrupting", obj.Namespace, obj.Name, jobName)
+				return nil
+			}
+			klog.V(1).Infof("Model %s/%s: deleting finished job %s with outdated artifact hash", obj.Namespace, obj.Name, jobName)
+			propagation := metav1.DeletePropagationBackground
+			if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+				return fmt.Errorf("failed to delete outdated job: %w", err)
+			}
+			h.persistModelAnnotation(obj, annotationJobDeletedAt, time.Now().Format(time.RFC3339))
+			return nil
+		}
+
 		if currentGen == expectedGeneration {
 			// Job is already up to date with the current generation
 			klog.V(1).Infof("Model %s/%s: job %s already exists with correct generation %s", obj.Namespace, obj.Name, jobName, currentGen)
+			return nil
+		}
+		if isJobFinished(existing) && strings.EqualFold(obj.Status.DownloadState, "Succeeded") && legacyJobMatchesObservedGeneration(obj, existing) {
+			// Legacy job created before artifact hashes were recorded; adopt it
+			// instead of re-running the pipeline on the first rollout.
+			klog.V(1).Infof("Model %s/%s: adopting legacy job %s for the last observed generation", obj.Namespace, obj.Name, jobName)
 			return nil
 		}
 		if !isJobFinished(existing) {
@@ -211,6 +233,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 
 	annotations := map[string]string{
 		annotationModelGeneration: expectedGeneration,
+		annotationArtifactHash:    currentArtifactHash,
 	}
 
 	// Build container responsible for performing the download
@@ -300,7 +323,8 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		klog.V(2).Infof("Model %s/%s: conversion requested but objectStorage.bucketForConvert missing", obj.Namespace, obj.Name)
 		return nil
 	}
-	if !strings.EqualFold(obj.Status.DownloadState, "Succeeded") || obj.Status.ObservedGeneration != obj.Generation {
+	currentArtifactHash := modelArtifactHash(obj)
+	if !strings.EqualFold(obj.Status.DownloadState, "Succeeded") || !modelArtifactsCurrent(obj, currentArtifactHash) {
 		klog.V(2).Infof("Model %s/%s: waiting for download success before starting conversion (state=%s, observedGen=%d, gen=%d)",
 			obj.Namespace, obj.Name, obj.Status.DownloadState, obj.Status.ObservedGeneration, obj.Generation)
 		return nil
@@ -310,8 +334,8 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	jobName := conversionJobName(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
 
-	if strings.EqualFold(obj.Status.ConversionState, "Succeeded") && obj.Status.ObservedGeneration == obj.Generation {
-		klog.V(2).Infof("Model %s/%s: conversion already succeeded for generation %s, skipping", obj.Namespace, obj.Name, expectedGeneration)
+	if strings.EqualFold(obj.Status.ConversionState, "Succeeded") && modelArtifactsCurrent(obj, currentArtifactHash) {
+		klog.V(2).Infof("Model %s/%s: conversion already succeeded for the current artifacts, skipping", obj.Namespace, obj.Name)
 		return nil
 	}
 
@@ -319,14 +343,29 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		if existing.DeletionTimestamp != nil {
 			return nil
 		}
-		currentGen := existing.Annotations[annotationModelGeneration]
-		if currentGen == "" {
-			currentGen = existing.Labels[annotationModelGeneration]
+		currentGen := jobGeneration(existing)
+		if artifactHash := jobArtifactHash(existing); artifactHash != "" {
+			if artifactHash == currentArtifactHash {
+				return nil
+			}
+			if !isJobFinished(existing) {
+				return nil
+			}
+			klog.V(1).Infof("Model %s/%s: deleting finished conversion job %s with outdated artifact hash", obj.Namespace, obj.Name, jobName)
+			propagation := metav1.DeletePropagationBackground
+			if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
+				return fmt.Errorf("failed to delete outdated conversion job: %w", err)
+			}
+			return nil
 		}
 		if currentGen == expectedGeneration {
 			if !isJobFinished(existing) {
 				return nil
 			}
+			return nil
+		}
+		if isJobFinished(existing) && strings.EqualFold(obj.Status.ConversionState, "Succeeded") && legacyJobMatchesObservedGeneration(obj, existing) {
+			// Adopt a pre-artifact-hash job instead of re-converting.
 			return nil
 		}
 		if !isJobFinished(existing) {
@@ -341,7 +380,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		return nil
 	}
 
-	if obj.Status.ConversionJobName == jobName && !strings.EqualFold(obj.Status.ConversionState, "Failed") && obj.Status.ConversionState != "" {
+	if modelArtifactsCurrent(obj, currentArtifactHash) && obj.Status.ConversionJobName == jobName && !strings.EqualFold(obj.Status.ConversionState, "Failed") && obj.Status.ConversionState != "" {
 		klog.V(2).Infof("Model %s/%s: conversion job %s already tracked in status (state=%s), skipping recreation",
 			obj.Namespace, obj.Name, jobName, obj.Status.ConversionState)
 		return nil
@@ -362,7 +401,10 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		labels[labelDllamaName] = dllama
 	}
 
-	annotations := map[string]string{annotationModelGeneration: expectedGeneration}
+	annotations := map[string]string{
+		annotationModelGeneration: expectedGeneration,
+		annotationArtifactHash:    currentArtifactHash,
+	}
 
 	toolsImage := spec.ToolsImage
 	if toolsImage == "" {
@@ -761,7 +803,9 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 	if obj.Spec.Conversion == nil {
 		return nil
 	}
-	if !strings.EqualFold(obj.Status.ConversionState, "Succeeded") || obj.Status.ObservedGeneration != obj.Generation {
+	currentArtifactHash := modelArtifactHash(obj)
+	artifactsCurrent := modelArtifactsCurrent(obj, currentArtifactHash)
+	if !strings.EqualFold(obj.Status.ConversionState, "Succeeded") || !artifactsCurrent {
 		return nil
 	}
 
@@ -782,7 +826,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 	forceToken := normalizeForceToken(forceTokenRaw, forceRequested, obj.ResourceVersion)
 	processedToken := strings.TrimSpace(obj.Status.ConversionSizeForceToken)
 
-	alreadySucceeded := obj.Status.ConversionSizeGeneration == obj.Generation &&
+	alreadySucceeded := artifactsCurrent &&
 		strings.EqualFold(obj.Status.ConversionSizeState, "Succeeded") &&
 		obj.Status.ConversionSizeJobName == jobName
 	if alreadySucceeded && (!forceRequested || forceTokenMatches(forceToken, processedToken, obj.ResourceVersion)) {
@@ -794,9 +838,14 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 			return nil
 		}
 
-		currentGen := existing.Annotations[annotationModelGeneration]
-		if currentGen == "" {
-			currentGen = existing.Labels[annotationModelGeneration]
+		currentGen := jobGeneration(existing)
+		jobArtifact := jobArtifactHash(existing)
+		currentArtifacts := jobArtifact == currentArtifactHash
+		if jobArtifact == "" {
+			// Legacy jobs created before artifact hashes: fall back to the
+			// generation recorded when the job was created.
+			currentArtifacts = currentGen == expectedGeneration ||
+				(artifactsCurrent && legacyJobMatchesObservedGeneration(obj, existing))
 		}
 		jobForceToken := strings.TrimSpace(existing.Annotations[annotationForceSizeRerun])
 		finished := isJobFinished(existing)
@@ -809,7 +858,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 			return nil
 		}
 
-		if currentGen == expectedGeneration {
+		if currentArtifacts {
 			if !finished {
 				return nil
 			}
@@ -817,7 +866,7 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 			state := strings.ToLower(obj.Status.ConversionSizeState)
 			switch state {
 			case "succeeded":
-				if obj.Status.ConversionSizeGeneration == obj.Generation && (forceToken == "" || forceTokenMatches(forceToken, processedToken, obj.ResourceVersion)) {
+				if artifactsCurrent && (forceToken == "" || forceTokenMatches(forceToken, processedToken, obj.ResourceVersion)) {
 					propagation := metav1.DeletePropagationBackground
 					if err := h.jobs.Delete(obj.Namespace, jobName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil {
 						return fmt.Errorf("failed to delete completed sizing job: %w", err)
@@ -854,7 +903,10 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 		labels[labelDllamaName] = dllama
 	}
 
-	annotations := map[string]string{annotationModelGeneration: expectedGeneration}
+	annotations := map[string]string{
+		annotationModelGeneration: expectedGeneration,
+		annotationArtifactHash:    currentArtifactHash,
+	}
 	if forceToken != "" {
 		annotations[annotationForceSizeRerun] = forceToken
 	}
@@ -933,6 +985,29 @@ func (h *modelHandler) ensureSizingJob(obj *v1.Model) error {
 
 func jobNameForModel(model *v1.Model) string {
 	return truncateName(model.Name+jobSuffixDownload, 63)
+}
+
+func jobGeneration(job *batchv1.Job) string {
+	value := job.Annotations[annotationModelGeneration]
+	if value == "" {
+		value = job.Labels[annotationModelGeneration]
+	}
+	return value
+}
+
+func jobArtifactHash(job *batchv1.Job) string {
+	value := job.Annotations[annotationArtifactHash]
+	if value == "" {
+		value = job.Labels[annotationArtifactHash]
+	}
+	return value
+}
+
+// legacyJobMatchesObservedGeneration reports whether a job created before
+// artifact hashes were recorded represents the last observed model spec.
+func legacyJobMatchesObservedGeneration(obj *v1.Model, job *batchv1.Job) bool {
+	gen := jobGeneration(job)
+	return gen != "" && gen == fmt.Sprintf("%d", obj.Status.ObservedGeneration)
 }
 
 func conversionJobName(model *v1.Model) string {
