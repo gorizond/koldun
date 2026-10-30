@@ -332,8 +332,8 @@ func TestSessionEnsureTopologyScalesUpWhenBelowDesired(t *testing.T) {
 			RootImage:   "root:latest",
 			WorkerImage: "worker:latest",
 			Scaling: &v1.SessionScalingSpec{
-				MinDllamas:     1,
-				DesiredDllamas: 2,
+				MinDllamas:     int32Ptr(1),
+				DesiredDllamas: int32Ptr(2),
 			},
 		},
 		Status: v1.SessionStatus{
@@ -428,8 +428,8 @@ func TestSessionEnsureTopologyPropagatesScaleUpError(t *testing.T) {
 			RootImage:   "root:latest",
 			WorkerImage: "worker:latest",
 			Scaling: &v1.SessionScalingSpec{
-				MinDllamas:     1,
-				DesiredDllamas: 2,
+				MinDllamas:     int32Ptr(1),
+				DesiredDllamas: int32Ptr(2),
 			},
 		},
 		Status: v1.SessionStatus{
@@ -558,7 +558,7 @@ func TestSessionEnsureTopologyScalesUpWhenBacklogHasNoIdleSets(t *testing.T) {
 				StateStream:         "sessions.state",
 			},
 			Scaling: &v1.SessionScalingSpec{
-				MinDllamas:     1,
+				MinDllamas:     int32Ptr(1),
 				MaxDllamas:     5,
 				ScaleUpBacklog: 5,
 			},
@@ -649,6 +649,34 @@ func TestSessionEnsureTopologyScalesDownAndDeletesIdleDllama(t *testing.T) {
 	require.Len(t, handler.apply.(*fakeApply).appliedObjects, 1, "dispatcher deployment should be applied after scaling down")
 }
 
+func TestSessionEnsureTopologyScalesToZeroWithExplicitZeroMin(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &sessionHandler{
+		ctx:     context.Background(),
+		dllamas: dllamas,
+		apply:   newFakeApply(),
+		log:     logrus.NewEntry(logrus.New()),
+	}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	session, readyList := sessionScaleDownFixtures()
+	zero := int32(0)
+	session.Spec.Scaling.MinDllamas = &zero
+	session.Spec.Scaling.DesiredDllamas = &zero
+	cache.EXPECT().List("models", gomock.Any()).Return(readyList[:1], nil)
+	dllamas.EXPECT().Update(gomock.AssignableToTypeOf(&v1.Dllama{})).Return(nil, nil).AnyTimes()
+	dllamas.EXPECT().Delete("models", "chat-dllama-0", gomock.Any()).Return(nil)
+
+	require.NoError(t, handler.ensureTopology(session))
+	require.Len(t, handler.apply.(*fakeApply).appliedObjects, 1, "dispatcher deployment should be applied after scaling to zero")
+}
+
 func TestSessionEnsureTopologyScaleDownDeleteError(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
@@ -711,9 +739,9 @@ func TestSessionEnsureTopologyNoScaleRunsDispatcher(t *testing.T) {
 			RootImage:   "root:latest",
 			WorkerImage: "worker:latest",
 			Scaling: &v1.SessionScalingSpec{
-				MinDllamas:     1,
+				MinDllamas:     int32Ptr(1),
 				MaxDllamas:     3,
-				DesiredDllamas: 1,
+				DesiredDllamas: int32Ptr(1),
 			},
 		},
 		Status: v1.SessionStatus{
@@ -1747,7 +1775,7 @@ func sessionScaleDownFixtures() (*v1.Session, []*v1.Dllama) {
 				StateStream:         "sessions.state",
 			},
 			Scaling: &v1.SessionScalingSpec{
-				MinDllamas:           1,
+				MinDllamas:           int32Ptr(1),
 				MaxDllamas:           5,
 				ScaleDownIdleSeconds: 30,
 			},

@@ -295,8 +295,8 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 			DispatcherImage:         record.DispatcherImage,
 			DispatcherMetricsListen: record.DispatcherMetricsListen,
 			MinIdle: func() int32 {
-				if record.Scaling != nil && record.Scaling.MinDllamas > 0 {
-					return record.Scaling.MinDllamas
+				if record.Scaling != nil && record.Scaling.MinDllamas != nil {
+					return *record.Scaling.MinDllamas
 				}
 				return 1
 			}(),
@@ -351,9 +351,41 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 		session.Spec.ReplicaPower = 1
 	}
 
-	return r.apply.WithDefaultNamespace(record.Namespace).
+	if err := r.apply.WithDefaultNamespace(record.Namespace).
 		WithSetID(fmt.Sprintf("conversation-session-%s", record.Hash)).
-		ApplyObjects(session)
+		ApplyObjects(session); err != nil {
+		return err
+	}
+
+	r.syncSessionLastActivity(record)
+	return nil
+}
+
+// syncSessionLastActivity mirrors the conversation record's activity timestamp
+// into Session.Status.LastActivity so the session scaler can run its idle
+// timer. The Session status is a subresource, so this cannot go through apply.
+func (r *conversationReconciler) syncSessionLastActivity(record *conversation.Record) {
+	if record == nil || record.LastActivityAt <= 0 || r.sessions == nil {
+		return
+	}
+
+	session, err := r.sessions.Cache().Get(record.Namespace, record.SessionName())
+	if err != nil || session == nil {
+		if err != nil && !apierrors.IsNotFound(err) {
+			r.log.WithError(err).WithField("session", record.SessionName()).Warn("get session for last activity")
+		}
+		return
+	}
+
+	if session.Status.LastActivity != nil && session.Status.LastActivity.Unix() >= record.LastActivityAt {
+		return
+	}
+
+	updated := session.DeepCopy()
+	updated.Status.LastActivity = &metav1.Time{Time: time.Unix(record.LastActivityAt, 0).UTC()}
+	if _, err := r.sessions.UpdateStatus(updated); err != nil {
+		r.log.WithError(err).WithField("session", record.SessionName()).Warn("update session last activity")
+	}
 }
 
 func (r *conversationReconciler) openConnection() error {

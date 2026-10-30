@@ -48,7 +48,7 @@ func newIngressSpec() *v1.IngressSpec {
 			ConversationTTL: &conversationTTL,
 			ResponseTimeout: &responseTimeout,
 			SessionScaling: &v1.IngressSessionScalingSpec{
-				MinDllamas:           1,
+				MinDllamas:           int32Ptr(1),
 				MaxDllamas:           3,
 				ScaleUpBacklog:       5,
 				ScaleDownIdleSeconds: 120,
@@ -437,6 +437,16 @@ func TestBackendArgs_OverridesAndOmissions(t *testing.T) {
 	require.False(t, containsArg(args, "--backend-allow-anonymous"))
 }
 
+func TestBackendArgs_ExplicitZeroMinDllamas(t *testing.T) {
+	spec := newIngressSpec()
+	zero := int32(0)
+	spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{MinDllamas: &zero}
+
+	args := backendArgs(spec, 8082)
+
+	require.Contains(t, args, "--backend-session-min-dllamas=0")
+}
+
 func TestServicePort(t *testing.T) {
 	spec := newIngressSpec()
 	require.Equal(t, int32(8082), servicePort(spec))
@@ -740,7 +750,7 @@ func TestValidateIngressSpec(t *testing.T) {
 			name: "negative min dllamas",
 			mutate: func(spec *v1.IngressSpec) {
 				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
-					MinDllamas: -1,
+					MinDllamas: int32Ptr(-1),
 				}
 			},
 			wantErr: "backend.sessionScaling.minDllamas must be >= 0",
@@ -758,7 +768,7 @@ func TestValidateIngressSpec(t *testing.T) {
 			name: "max dllamas less than min",
 			mutate: func(spec *v1.IngressSpec) {
 				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
-					MinDllamas: 2,
+					MinDllamas: int32Ptr(2),
 					MaxDllamas: 1,
 				}
 			},

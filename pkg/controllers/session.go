@@ -389,16 +389,13 @@ type sessionScalingParams struct {
 func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 	params := sessionScalingParams{min: 1}
 
-	if sess.Spec.MinIdle > 0 {
-		params.min = sess.Spec.MinIdle
-	}
-	if sess.Spec.MaxWorkers > 0 {
-		params.max = sess.Spec.MaxWorkers
-	}
 	if sess.Spec.Scaling != nil {
 		sc := sess.Spec.Scaling
-		if sc.MinDllamas > 0 {
-			params.min = sc.MinDllamas
+		if sc.MinDllamas != nil {
+			params.min = *sc.MinDllamas
+			if params.min < 0 {
+				params.min = 0
+			}
 		}
 		if sc.MaxDllamas > 0 {
 			params.max = sc.MaxDllamas
@@ -409,8 +406,19 @@ func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 		if sc.ScaleDownIdleSeconds > 0 {
 			params.scaleDownIdle = time.Duration(sc.ScaleDownIdleSeconds) * time.Second
 		}
-		if sc.DesiredDllamas > 0 {
-			params.desired = sc.DesiredDllamas
+		if sc.DesiredDllamas != nil {
+			params.desired = *sc.DesiredDllamas
+			if params.desired < 0 {
+				params.desired = 0
+			}
+		}
+	} else {
+		// Deprecated fields only apply to Sessions without an explicit Scaling block.
+		if sess.Spec.MinIdle > 0 {
+			params.min = sess.Spec.MinIdle
+		}
+		if sess.Spec.MaxWorkers > 0 {
+			params.max = sess.Spec.MaxWorkers
 		}
 	}
 
@@ -445,9 +453,6 @@ func (p sessionScalingParams) shouldScaleDown(state sessionPoolState) bool {
 		return false
 	}
 	if int32(state.total()) <= p.min {
-		return false
-	}
-	if p.desired > 0 && int32(state.total()) <= p.desired {
 		return false
 	}
 	if state.idleCount() == 0 {

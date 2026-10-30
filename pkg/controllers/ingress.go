@@ -363,14 +363,16 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 		}
 	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {
-		if scaling.MinDllamas < 0 {
-			return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
+		if scaling.MinDllamas != nil {
+			if *scaling.MinDllamas < 0 {
+				return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
+			}
+			if *scaling.MinDllamas > 0 && scaling.MaxDllamas > 0 && scaling.MaxDllamas < *scaling.MinDllamas {
+				return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= minDllamas")
+			}
 		}
 		if scaling.MaxDllamas < 0 {
 			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= 0")
-		}
-		if scaling.MinDllamas > 0 && scaling.MaxDllamas > 0 && scaling.MaxDllamas < scaling.MinDllamas {
-			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= minDllamas")
 		}
 	}
 	return nil
@@ -432,8 +434,8 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	}
 	if spec.Backend.SessionScaling != nil {
 		scaling := spec.Backend.SessionScaling
-		if scaling.MinDllamas > 0 {
-			args = append(args, fmt.Sprintf("--backend-session-min-dllamas=%d", scaling.MinDllamas))
+		if scaling.MinDllamas != nil {
+			args = append(args, fmt.Sprintf("--backend-session-min-dllamas=%d", *scaling.MinDllamas))
 		}
 		if scaling.MaxDllamas > 0 {
 			args = append(args, fmt.Sprintf("--backend-session-max-dllamas=%d", scaling.MaxDllamas))

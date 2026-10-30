@@ -1333,11 +1333,11 @@ func TestSessionDeepCopyVariants(t *testing.T) {
 				AckTimeout: &duration,
 			},
 			Scaling: &SessionScalingSpec{
-				MinDllamas:           1,
+				MinDllamas:           int32Ptr(1),
 				MaxDllamas:           5,
 				ScaleUpBacklog:       2,
 				ScaleDownIdleSeconds: 30,
-				DesiredDllamas:       3,
+				DesiredDllamas:       int32Ptr(3),
 			},
 			NATS: &SessionNATSConfig{
 				URL: "nats://session:4222",
@@ -1430,7 +1430,7 @@ func TestIngressDeepCopyVariants(t *testing.T) {
 				ConversationTTL: &convTTL,
 				ResponseTimeout: &respTimeout,
 				SessionScaling: &IngressSessionScalingSpec{
-					MinDllamas:           1,
+					MinDllamas:           int32Ptr(1),
 					MaxDllamas:           3,
 					ScaleUpBacklog:       5,
 					ScaleDownIdleSeconds: 30,
@@ -2241,4 +2241,8 @@ func TestRootStatus_DeepCopy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func int32Ptr(value int32) *int32 {
+	return &value
 }

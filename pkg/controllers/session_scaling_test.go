@@ -44,7 +44,7 @@ func TestScalingParamsFromSession(t *testing.T) {
 					MinIdle:    2,
 					MaxWorkers: 5,
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 4,
+						MinDllamas: int32Ptr(4),
 						MaxDllamas: 20,
 					},
 				},
@@ -59,9 +59,9 @@ func TestScalingParamsFromSession(t *testing.T) {
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas:           2,
+						MinDllamas:           int32Ptr(2),
 						MaxDllamas:           15,
-						DesiredDllamas:       5,
+						DesiredDllamas:       int32Ptr(5),
 						ScaleUpBacklog:       100,
 						ScaleDownIdleSeconds: 300,
 					},
@@ -80,7 +80,7 @@ func TestScalingParamsFromSession(t *testing.T) {
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 10,
+						MinDllamas: int32Ptr(10),
 						MaxDllamas: 5,
 					},
 				},
@@ -91,17 +91,17 @@ func TestScalingParamsFromSession(t *testing.T) {
 			},
 		},
 		{
-			name: "zero min corrected to 1",
+			name: "explicit zero min keeps zero",
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 0,
+						MinDllamas: int32Ptr(0),
 						MaxDllamas: 10,
 					},
 				},
 			},
 			expected: sessionScalingParams{
-				min: 1, // corrected from 0
+				min: 0,
 				max: 10,
 			},
 		},
@@ -372,7 +372,22 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "don't scale down when at desired count",
+			name: "scale down to zero with explicit zero min and desired",
+			params: sessionScalingParams{
+				min:           0,
+				desired:       0,
+				scaleDownIdle: 5 * time.Minute,
+			},
+			state: sessionPoolState{
+				dllamas:      makeDllamas(1),
+				ready:        makeDllamas(1),
+				idleReady:    makeDllamas(1),
+				lastActivity: pastActivity,
+			},
+			expected: true,
+		},
+		{
+			name: "scale down below desired count",
 			params: sessionScalingParams{
 				min:           1,
 				desired:       3,
@@ -384,7 +399,7 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 				idleReady:    makeDllamas(2),
 				lastActivity: pastActivity,
 			},
-			expected: false,
+			expected: true,
 		},
 		{
 			name: "scale down when above desired count",

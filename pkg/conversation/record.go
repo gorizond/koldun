@@ -61,13 +61,15 @@ type QueueConfig struct {
 }
 
 // SessionScalingConfig stores desired pool sizing parameters for a session.
+// MinDllamas and DesiredDllamas are pointers so an explicit 0 (scale to zero)
+// is distinguishable from an unset field.
 type SessionScalingConfig struct {
-	MinDllamas           int32 `json:"minDllamas,omitempty"`
-	MaxDllamas           int32 `json:"maxDllamas,omitempty"`
-	ScaleUpBacklog       int32 `json:"scaleUpBacklog,omitempty"`
-	ScaleDownIdleSeconds int32 `json:"scaleDownIdleSeconds,omitempty"`
-	DesiredDllamas       int32 `json:"desiredDllamas,omitempty"`
-	ActiveRequests       int32 `json:"activeRequests,omitempty"`
+	MinDllamas           *int32 `json:"minDllamas,omitempty"`
+	MaxDllamas           int32  `json:"maxDllamas,omitempty"`
+	ScaleUpBacklog       int32  `json:"scaleUpBacklog,omitempty"`
+	ScaleDownIdleSeconds int32  `json:"scaleDownIdleSeconds,omitempty"`
+	DesiredDllamas       *int32 `json:"desiredDllamas,omitempty"`
+	ActiveRequests       int32  `json:"activeRequests,omitempty"`
 }
 
 // ParseRecord deserialises and validates a Record payload.
@@ -151,17 +153,25 @@ func (r *Record) Validate() error {
 	if r.Scaling == nil {
 		r.Scaling = &SessionScalingConfig{}
 	}
-	if r.Scaling.MinDllamas <= 0 {
-		r.Scaling.MinDllamas = 1
+	if r.Scaling.MinDllamas == nil {
+		min := int32(1)
+		r.Scaling.MinDllamas = &min
+	} else if *r.Scaling.MinDllamas < 0 {
+		min := int32(1)
+		r.Scaling.MinDllamas = &min
 	}
-	if r.Scaling.MaxDllamas > 0 && r.Scaling.MaxDllamas < r.Scaling.MinDllamas {
-		r.Scaling.MaxDllamas = r.Scaling.MinDllamas
+	minDllamas := *r.Scaling.MinDllamas
+	if r.Scaling.MaxDllamas > 0 && r.Scaling.MaxDllamas < minDllamas {
+		r.Scaling.MaxDllamas = minDllamas
 	}
-	if r.Scaling.DesiredDllamas < r.Scaling.MinDllamas {
-		r.Scaling.DesiredDllamas = r.Scaling.MinDllamas
+	if r.Scaling.DesiredDllamas == nil {
+		desired := minDllamas
+		r.Scaling.DesiredDllamas = &desired
+	} else if *r.Scaling.DesiredDllamas < minDllamas {
+		*r.Scaling.DesiredDllamas = minDllamas
 	}
-	if r.Scaling.MaxDllamas > 0 && r.Scaling.DesiredDllamas > r.Scaling.MaxDllamas {
-		r.Scaling.DesiredDllamas = r.Scaling.MaxDllamas
+	if r.Scaling.MaxDllamas > 0 && *r.Scaling.DesiredDllamas > r.Scaling.MaxDllamas {
+		*r.Scaling.DesiredDllamas = r.Scaling.MaxDllamas
 	}
 	if r.Scaling.ActiveRequests < 0 {
 		r.Scaling.ActiveRequests = 0

@@ -231,7 +231,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.ResponseTimeout = 2 * time.Minute
 	}
 	cfg.SessionDispatcherMetricsListen = strings.TrimSpace(cfg.SessionDispatcherMetricsListen)
-	if cfg.SessionMinDllamas <= 0 {
+	if cfg.SessionMinDllamas < 0 {
 		cfg.SessionMinDllamas = 1
 	}
 	if cfg.SessionMaxDllamas > 0 && cfg.SessionMaxDllamas < cfg.SessionMinDllamas {
@@ -343,19 +343,43 @@ func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig, log *logru
 	if desired := cfg.TTL; desired > 0 {
 		current := status.TTL()
 		if current <= 0 || absDuration(current-desired) > time.Second {
-			// Never delete an existing bucket: it holds pins, cursors and
-			// session state. Keep using it and surface the mismatch instead.
-			if log != nil {
+			if err := updateBucketTTL(js, cfg.Bucket, desired); err != nil {
+				if log != nil {
+					log.WithError(err).WithFields(logrus.Fields{
+						"bucket":     cfg.Bucket,
+						"want_ttl":   desired,
+						"actual_ttl": current,
+					}).Warn("failed to update conversation bucket TTL; keeping existing bucket")
+				}
+			} else if log != nil {
 				log.WithFields(logrus.Fields{
 					"bucket":     cfg.Bucket,
-					"want_ttl":   desired,
-					"actual_ttl": current,
-				}).Warn("conversation bucket TTL differs from configuration; keeping existing bucket")
+					"old_ttl":    current,
+					"actual_ttl": desired,
+				}).Info("conversation bucket TTL updated")
 			}
 		}
 	}
 
 	return kv, nil
+}
+
+// bucketTTLUpdater is the subset of nats.JetStreamContext needed to change a
+// KV bucket's TTL (its underlying stream MaxAge).
+type bucketTTLUpdater interface {
+	StreamInfo(stream string, opts ...nats.JSOpt) (*nats.StreamInfo, error)
+	UpdateStream(cfg *nats.StreamConfig, opts ...nats.JSOpt) (*nats.StreamInfo, error)
+}
+
+func updateBucketTTL(js bucketTTLUpdater, bucket string, ttl time.Duration) error {
+	info, err := js.StreamInfo("KV_" + bucket)
+	if err != nil {
+		return err
+	}
+	cfg := info.Config
+	cfg.MaxAge = ttl
+	_, err = js.UpdateStream(&cfg)
+	return err
 }
 
 func absDuration(d time.Duration) time.Duration {
@@ -987,8 +1011,8 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 				record.Scaling = &conversation.SessionScalingConfig{}
 				recordChanged = true
 			}
-			if record.Scaling.MinDllamas != s.cfg.SessionMinDllamas {
-				record.Scaling.MinDllamas = s.cfg.SessionMinDllamas
+			if !int32PointerMatches(record.Scaling.MinDllamas, s.cfg.SessionMinDllamas) {
+				record.Scaling.MinDllamas = int32Pointer(s.cfg.SessionMinDllamas)
 				recordChanged = true
 			}
 			if record.Scaling.MaxDllamas != s.cfg.SessionMaxDllamas {
@@ -1010,8 +1034,8 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 			if s.cfg.SessionMaxDllamas > 0 && desired > s.cfg.SessionMaxDllamas {
 				desired = s.cfg.SessionMaxDllamas
 			}
-			if record.Scaling.DesiredDllamas != desired {
-				record.Scaling.DesiredDllamas = desired
+			if !int32PointerMatches(record.Scaling.DesiredDllamas, desired) {
+				record.Scaling.DesiredDllamas = int32Pointer(desired)
 				recordChanged = true
 			}
 			if record.Scaling.ActiveRequests != active {
@@ -1065,11 +1089,11 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 			StateStream:           stateStreamName(hash),
 		},
 		Scaling: &conversation.SessionScalingConfig{
-			MinDllamas:           s.cfg.SessionMinDllamas,
+			MinDllamas:           int32Pointer(s.cfg.SessionMinDllamas),
 			MaxDllamas:           s.cfg.SessionMaxDllamas,
 			ScaleUpBacklog:       s.cfg.SessionScaleUpBacklog,
 			ScaleDownIdleSeconds: s.cfg.SessionScaleDownIdleSeconds,
-			DesiredDllamas:       desired,
+			DesiredDllamas:       int32Pointer(desired),
 			ActiveRequests:       active,
 		},
 	}
@@ -2286,6 +2310,14 @@ func canonicalModelID(model *registry.Model, fallbackNamespace string) string {
 	default:
 		return namespace + "/" + name
 	}
+}
+
+func int32Pointer(value int32) *int32 {
+	return &value
+}
+
+func int32PointerMatches(ptr *int32, value int32) bool {
+	return ptr != nil && *ptr == value
 }
 
 func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (string, error) {
