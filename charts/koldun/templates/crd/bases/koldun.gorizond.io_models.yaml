@@ -413,6 +413,11 @@ spec:
                 description: ConversionState mirrors DownloadState for the conversion
                   pipeline.
                 type: string
+              downloadHash:
+                description: |-
+                  DownloadHash identifies the ModelSpec fields that produced the current
+                  downloaded artifacts. Conversion-only changes do not alter it.
+                type: string
               downloadJobName:
                 description: DownloadJobName is the name of the Kubernetes Job responsible
                   for downloading the model.

@@ -370,9 +370,18 @@ func TestModelArtifactHashIgnoresRuntimeFields(t *testing.T) {
 	runtimeOnly.Spec.MaxSeqLen = 8192
 	runtimeOnly.Spec.ReplicaPower = 4
 	runtimeOnly.Spec.LaunchOptions = []string{"--ctx", "8192"}
-	runtimeOnly.Spec.PipProxy = "http://proxy:3128"
 	if got := modelArtifactHash(runtimeOnly); got != baseHash {
 		t.Fatalf("runtime-only spec change altered artifact hash: %s != %s", got, baseHash)
+	}
+
+	baseDownloadHash := modelDownloadHash(base)
+	conversionChanged := base.DeepCopy()
+	conversionChanged.Spec.Conversion.WeightsFloatType = "q4_1"
+	if got := modelDownloadHash(conversionChanged); got != baseDownloadHash {
+		t.Fatalf("conversion-only change altered download hash: %s != %s", got, baseDownloadHash)
+	}
+	if got := modelArtifactHash(conversionChanged); got == baseHash {
+		t.Fatal("conversion change did not alter artifact hash")
 	}
 
 	artifactChanges := map[string]func(*v1.Model){
@@ -385,6 +394,7 @@ func TestModelArtifactHashIgnoresRuntimeFields(t *testing.T) {
 		"preConverted":        func(m *v1.Model) { m.Spec.PreConverted = true },
 		"preConvertedPVCName": func(m *v1.Model) { m.Spec.PreConvertedPVCName = "pvc" },
 		"preConvertedSize":    func(m *v1.Model) { m.Spec.PreConvertedSizeBytes = 1024 },
+		"pipProxy":            func(m *v1.Model) { m.Spec.PipProxy = "http://proxy:3128" },
 	}
 	for name, mutate := range artifactChanges {
 		mutated := base.DeepCopy()

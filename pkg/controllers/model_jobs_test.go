@@ -4236,6 +4236,7 @@ func TestModelRuntimeSpecChangeDoesNotRecreateJobs(t *testing.T) {
 	model.Status = v1.ModelStatus{
 		ObservedGeneration:       2,
 		ArtifactHash:             artifactHash,
+		DownloadHash:             modelDownloadHash(model),
 		DownloadState:            "Succeeded",
 		ConversionState:          "Succeeded",
 		ConversionSizeState:      "Succeeded",
@@ -4313,7 +4314,7 @@ func TestEnsureDownloadJobRecreatesOnArtifactChange(t *testing.T) {
 	require.NoError(t, handler.ensureDownloadJob(model))
 	require.Equal(t, 1, applySpy.Count)
 	created := applySpy.Objects[0].All()[0].(*batchv1.Job)
-	require.Equal(t, newHash, created.Annotations[annotationArtifactHash])
+	require.Equal(t, modelDownloadHash(model), created.Annotations[annotationDownloadHash])
 }
 
 func TestEnsureConversionJobRecreatesOnArtifactChange(t *testing.T) {
@@ -4428,4 +4429,382 @@ func TestEnsureSizingJobRecreatesOnArtifactChange(t *testing.T) {
 	jobs.EXPECT().Delete("models", "mistral-size", gomock.Any()).Return(nil)
 
 	require.NoError(t, handler.ensureSizingJob(model))
+}
+
+func TestJobHashHelpersReadLabels(t *testing.T) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		annotationModelGeneration: "7",
+		annotationArtifactHash:    "artifact-hash",
+		annotationDownloadHash:    "download-hash",
+	}}}
+	require.Equal(t, "7", jobGeneration(job))
+	require.Equal(t, "artifact-hash", jobArtifactHash(job))
+	require.Equal(t, "download-hash", jobDownloadHash(job))
+
+	legacy := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		annotationArtifactHash: "combined-hash",
+	}}}
+	require.Equal(t, "combined-hash", jobDownloadHash(legacy))
+}
+
+func TestEnsureDownloadJobKeepsFinishedJobOnConversionOnlyChange(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL: "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{
+				BucketForSource:  "models-bucket",
+				BucketForConvert: "convert-bucket",
+			},
+			Conversion: &v1.ModelConversionSpec{},
+		},
+	}
+	model.Generation = 2
+	oldArtifactHash := modelArtifactHash(model)
+	model.Spec.Conversion.ConverterVersion = "v0.17.0"
+	model.Generation = 3
+	downloadHash := modelDownloadHash(model)
+	require.NotEqual(t, oldArtifactHash, modelArtifactHash(model))
+
+	model.Status = v1.ModelStatus{
+		ObservedGeneration: 2,
+		DownloadState:      "Pending",
+		DownloadHash:       downloadHash,
+		ArtifactHash:       oldArtifactHash,
+	}
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-download",
+			Namespace: "models",
+			Annotations: map[string]string{
+				annotationDownloadHash:    downloadHash,
+				annotationModelGeneration: "2",
+			},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-download").Return(existing, nil)
+
+	require.NoError(t, handler.ensureDownloadJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureDownloadJobSkipsRunningOutdatedHashJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "models-bucket"},
+		},
+	}
+	model.Generation = 3
+	model.Status = v1.ModelStatus{ObservedGeneration: 2, DownloadState: "Pending", DownloadHash: "old-download-hash"}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-download",
+			Namespace: "models",
+			Annotations: map[string]string{
+				annotationDownloadHash:    "old-download-hash",
+				annotationModelGeneration: "2",
+			},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-download").Return(existing, nil)
+
+	require.NoError(t, handler.ensureDownloadJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureDownloadJobDeleteOutdatedHashJobError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	handler := &modelHandler{apply: &fakeapply.FakeApply{}, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "models-bucket"},
+		},
+	}
+	model.Generation = 3
+	model.Status = v1.ModelStatus{ObservedGeneration: 2, DownloadState: "Pending"}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-download",
+			Namespace: "models",
+			Annotations: map[string]string{
+				annotationDownloadHash:    "old-download-hash",
+				annotationModelGeneration: "2",
+			},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-download").Return(existing, nil)
+	jobs.EXPECT().Delete("models", "mistral-download", gomock.Any()).Return(errors.New("boom"))
+
+	err := handler.ensureDownloadJob(model)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to delete outdated job")
+}
+
+func TestEnsureDownloadJobAdoptsLegacyJobForObservedGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "models-bucket"},
+			MaxSeqLen:     8192,
+		},
+	}
+	model.Generation = 5
+	model.Status = v1.ModelStatus{ObservedGeneration: 4, DownloadState: "Succeeded"}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-download",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "4"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-download").Return(existing, nil)
+
+	require.NoError(t, handler.ensureDownloadJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureConversionJobSkipsRunningOutdatedHashJob(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+	}
+	model.Generation = 3
+	model.Status = v1.ModelStatus{
+		ObservedGeneration: 2,
+		DownloadState:      "Succeeded",
+		DownloadHash:       modelDownloadHash(model),
+		ConversionState:    "Pending",
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationArtifactHash: "old-artifact-hash"},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+
+	require.NoError(t, handler.ensureConversionJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureConversionJobDeleteOutdatedHashJobError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	handler := &modelHandler{apply: &fakeapply.FakeApply{}, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+	}
+	model.Generation = 3
+	model.Status = v1.ModelStatus{
+		ObservedGeneration: 2,
+		DownloadState:      "Succeeded",
+		DownloadHash:       modelDownloadHash(model),
+		ConversionState:    "Pending",
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationArtifactHash: "old-artifact-hash"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+	jobs.EXPECT().Delete("models", "mistral-convert", gomock.Any()).Return(errors.New("boom"))
+
+	err := handler.ensureConversionJob(model)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to delete outdated conversion job")
+}
+
+func TestEnsureConversionJobSkipsRunningLegacyJobForCurrentGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+		},
+	}
+	model.Generation = 3
+	model.Status = v1.ModelStatus{
+		ObservedGeneration: 3,
+		DownloadState:      "Succeeded",
+		DownloadHash:       modelDownloadHash(model),
+		ConversionState:    "Pending",
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "3"},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+
+	require.NoError(t, handler.ensureConversionJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureConversionJobAdoptsLegacyJobForObservedGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{},
+			MaxSeqLen:     8192,
+		},
+	}
+	model.Generation = 5
+	model.Status = v1.ModelStatus{
+		ObservedGeneration: 4,
+		DownloadState:      "Succeeded",
+		DownloadHash:       modelDownloadHash(model),
+		ConversionState:    "Succeeded",
+	}
+
+	existing := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "mistral-convert",
+			Namespace:   "models",
+			Annotations: map[string]string{annotationModelGeneration: "4"},
+		},
+		Status: batchv1.JobStatus{Succeeded: 1},
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(existing, nil)
+
+	require.NoError(t, handler.ensureConversionJob(model))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestEnsureConversionJobMountsWriterConfigMap(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	jobsCache := genericfake.NewMockCacheInterface[*batchv1.Job](ctrl)
+	jobs := genericfake.NewMockControllerInterface[*batchv1.Job, *batchv1.JobList](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &modelHandler{apply: applySpy, jobs: jobs}
+
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral", Namespace: "models"},
+		Spec: v1.ModelSpec{
+			SourceURL:     "https://example.com/model.gguf",
+			ObjectStorage: &v1.ModelObjectStorageSpec{BucketForSource: "src", BucketForConvert: "out"},
+			Conversion:    &v1.ModelConversionSpec{WriterConfigMap: "writer-config"},
+		},
+	}
+	model.Generation = 2
+	model.Status = v1.ModelStatus{
+		DownloadState:      "Succeeded",
+		DownloadHash:       modelDownloadHash(model),
+		ObservedGeneration: 2,
+	}
+
+	jobs.EXPECT().Cache().Return(jobsCache).AnyTimes()
+	jobsCache.EXPECT().Get("models", "mistral-convert").Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "jobs"}, "mistral-convert")).AnyTimes()
+
+	require.NoError(t, handler.ensureConversionJob(model))
+	require.NotEmpty(t, applySpy.Objects)
 }

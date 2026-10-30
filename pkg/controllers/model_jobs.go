@@ -33,7 +33,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 	spec := effectiveDownloadSpec(obj.Spec.Download)
 	jobName := jobNameForModel(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
-	currentArtifactHash := modelArtifactHash(obj)
+	currentDownloadHash := modelDownloadHash(obj)
 
 	klog.V(1).Infof("Model %s/%s: ensureDownloadJob called - Status.DownloadState=%s, Status.ObservedGeneration=%d, obj.Generation=%d",
 		obj.Namespace, obj.Name, obj.Status.DownloadState, obj.Status.ObservedGeneration, obj.Generation)
@@ -44,8 +44,8 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 			obj.Namespace, obj.Name, obj.Status.ObservedGeneration, obj.Generation)
 	}
 
-	if strings.EqualFold(obj.Status.DownloadState, "Succeeded") && modelArtifactsCurrent(obj, currentArtifactHash) {
-		klog.V(4).Infof("Model %s/%s: download already succeeded for the current artifacts", obj.Namespace, obj.Name)
+	if strings.EqualFold(obj.Status.DownloadState, "Succeeded") && modelDownloadCurrent(obj, currentDownloadHash) {
+		klog.V(4).Infof("Model %s/%s: download already succeeded for the current source artifacts", obj.Namespace, obj.Name)
 		return nil
 	}
 
@@ -81,8 +81,8 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 			return nil
 		}
 
-		if artifactHash := jobArtifactHash(existing); artifactHash != "" {
-			if artifactHash == currentArtifactHash {
+		if downloadHash := jobDownloadHash(existing); downloadHash != "" {
+			if downloadHash == currentDownloadHash {
 				klog.V(1).Infof("Model %s/%s: job %s already exists for the current artifact hash", obj.Namespace, obj.Name, jobName)
 				return nil
 			}
@@ -233,7 +233,7 @@ func (h *modelHandler) ensureDownloadJob(obj *v1.Model) error {
 
 	annotations := map[string]string{
 		annotationModelGeneration: expectedGeneration,
-		annotationArtifactHash:    currentArtifactHash,
+		annotationDownloadHash:    currentDownloadHash,
 	}
 
 	// Build container responsible for performing the download
@@ -323,8 +323,8 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 		klog.V(2).Infof("Model %s/%s: conversion requested but objectStorage.bucketForConvert missing", obj.Namespace, obj.Name)
 		return nil
 	}
-	currentArtifactHash := modelArtifactHash(obj)
-	if !strings.EqualFold(obj.Status.DownloadState, "Succeeded") || !modelArtifactsCurrent(obj, currentArtifactHash) {
+	currentDownloadHash := modelDownloadHash(obj)
+	if !strings.EqualFold(obj.Status.DownloadState, "Succeeded") || !modelDownloadCurrent(obj, currentDownloadHash) {
 		klog.V(2).Infof("Model %s/%s: waiting for download success before starting conversion (state=%s, observedGen=%d, gen=%d)",
 			obj.Namespace, obj.Name, obj.Status.DownloadState, obj.Status.ObservedGeneration, obj.Generation)
 		return nil
@@ -333,6 +333,7 @@ func (h *modelHandler) ensureConversionJob(obj *v1.Model) error {
 	spec := effectiveConversionSpec(obj.Spec.Conversion)
 	jobName := conversionJobName(obj)
 	expectedGeneration := fmt.Sprintf("%d", obj.Generation)
+	currentArtifactHash := modelArtifactHash(obj)
 
 	if strings.EqualFold(obj.Status.ConversionState, "Succeeded") && modelArtifactsCurrent(obj, currentArtifactHash) {
 		klog.V(2).Infof("Model %s/%s: conversion already succeeded for the current artifacts, skipping", obj.Namespace, obj.Name)
@@ -999,6 +1000,20 @@ func jobArtifactHash(job *batchv1.Job) string {
 	value := job.Annotations[annotationArtifactHash]
 	if value == "" {
 		value = job.Labels[annotationArtifactHash]
+	}
+	return value
+}
+
+func jobDownloadHash(job *batchv1.Job) string {
+	value := job.Annotations[annotationDownloadHash]
+	if value == "" {
+		value = job.Labels[annotationDownloadHash]
+	}
+	if value == "" {
+		// Jobs created by the initial artifact-hash implementation only carry
+		// the combined hash; treat it as the download hash when no conversion
+		// change is involved.
+		value = jobArtifactHash(job)
 	}
 	return value
 }
