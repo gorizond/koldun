@@ -76,6 +76,12 @@ spec:
                 type: string
               modelRef:
                 type: string
+              nThreads:
+                description: |-
+                  NThreads configures the number of threads for dllama-api worker.
+                  Defaults to 1. This controls the --nthreads flag.
+                format: int32
+                type: integer
               nats:
                 description: NATS configures worker connectivity.
                 properties:

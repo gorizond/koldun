@@ -540,11 +540,7 @@ func TestConversationHashFromHeadersPlain(t *testing.T) {
 	actual, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 
-	pairs := []string{
-		"user-agent=ingress-test",
-		"x-request-id=req-1",
-		"x-trace-id=abc-123",
-	}
+	pairs := []string{"x-request-id=req-1"}
 	sort.Strings(pairs)
 	expectedSum := sha256.Sum256([]byte("model=tenant/chat-1\n" + strings.Join(pairs, "&")))
 	assert.Equal(t, hex.EncodeToString(expectedSum[:]), actual)
@@ -560,15 +556,79 @@ func TestConversationHashFromHeadersWithSecret(t *testing.T) {
 	actual, err := conversationHashFromHeaders(req, "tenant/chat-1", secret)
 	require.NoError(t, err)
 
-	pairs := []string{
-		"user-agent=ingress-test",
-		"x-trace-id=abc-123",
-	}
+	pairs := []string{"x-trace-id=abc-123"}
 	sort.Strings(pairs)
 	message := []byte("model=tenant/chat-1\n" + strings.Join(pairs, "&"))
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(message)
 	assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), actual)
+}
+
+func TestConversationHashStableAcrossRetriesWithChatID(t *testing.T) {
+	hashFor := func(requestID, traceID, retry string) string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("X-Chat-Id", "stable-chat")
+		req.Header.Set("X-Request-Id", requestID)
+		req.Header.Set("X-Trace-Id", traceID)
+		req.Header.Set("X-Stainless-Retry-Count", retry)
+		req.Header.Set("User-Agent", "ingress-test")
+		hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+		require.NoError(t, err)
+		return hash
+	}
+
+	first := hashFor("req-1", "trace-1", "0")
+	require.Equal(t, first, hashFor("req-2", "trace-2", "1"),
+		"retries with the same stable chat id must keep one session")
+}
+
+func TestConversationHashKeepsRequestIDWithoutStableChatID(t *testing.T) {
+	hashFor := func(requestID string) string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("X-Request-Id", requestID)
+		req.Header.Set("User-Agent", "ingress-test")
+		hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+		require.NoError(t, err)
+		return hash
+	}
+	require.NotEqual(t, hashFor("req-1"), hashFor("req-2"),
+		"without a stable chat id, request ids remain the conversation identity")
+}
+
+func TestConversationHashIgnoresSDKRetryWithoutChatID(t *testing.T) {
+	hashFor := func(retry, forwardedFor string) string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("X-Request-Id", "req-1")
+		req.Header.Set("X-Stainless-Retry-Count", retry)
+		req.Header.Set("X-Forwarded-For", forwardedFor)
+		req.Header.Set("User-Agent", "OpenAI/Python 1.0")
+		hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+		require.NoError(t, err)
+		return hash
+	}
+	require.Equal(t, hashFor("0", "10.0.0.1"), hashFor("1", "10.0.0.2"),
+		"SDK retries and proxy addresses must not re-key the conversation")
+}
+
+func TestConversationHashScopedByPrincipal(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Chat-Id", "shared-chat")
+
+	tokenA := sha256Hex("token-a")
+	tokenB := sha256Hex("token-b")
+	hashA, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenA, nil)
+	require.NoError(t, err)
+	hashB, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenB, nil)
+	require.NoError(t, err)
+	require.NotEqual(t, hashA, hashB, "different principals must not share a session")
+	require.Equal(t, hashA, mustConversationHash(t, req, "tenant/chat-1", tokenA))
+}
+
+func mustConversationHash(t *testing.T, req *http.Request, model, principal string) string {
+	t.Helper()
+	hash, err := conversationHashFromHeadersWithPrincipal(req, model, principal, nil)
+	require.NoError(t, err)
+	return hash
 }
 
 func TestConversationHashFromHeadersScopesByModel(t *testing.T) {
@@ -590,7 +650,7 @@ func TestConversationHashFromHeadersScopesByModel(t *testing.T) {
 	// to the legacy header-only hash.
 	empty, err := conversationHashFromHeaders(req, "", nil)
 	require.NoError(t, err)
-	pairs := []string{"user-agent=ingress-test", "x-chat-id=shared-chat"}
+	pairs := []string{"x-chat-id=shared-chat"}
 	sort.Strings(pairs)
 	sum := sha256.Sum256([]byte("model=\n" + strings.Join(pairs, "&")))
 	require.Equal(t, hex.EncodeToString(sum[:]), empty)
@@ -1973,7 +2033,7 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 	req.Header.Set("User-Agent", "ingress-test")
 	req.Header.Set("X-Trace-Id", "abc-123")
 
-	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+	hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -2115,7 +2175,7 @@ func TestHandleChatCompletionsStreamsResponses(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+	hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -2264,7 +2324,7 @@ func TestHandleChatCompletionsStreamPublishFailure(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+	hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
 	defer srv.decrementSessionLoad(hash)
@@ -2343,7 +2403,7 @@ func TestHandleChatCompletionsNonStreamPublishFailure(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+	hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
 	defer srv.decrementSessionLoad(hash)
@@ -2444,7 +2504,7 @@ func TestHandleChatCompletionsQueueMisconfigured(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			req := newRequest()
-			hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+			hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 			require.NoError(t, err)
 
 			require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
@@ -2536,7 +2596,7 @@ func TestHandleChatCompletionsStreamContextCancel(t *testing.T) {
 	defer cancel()
 	req := baseReq.WithContext(ctx)
 
-	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+	hash, err := conversationHashFromHeadersWithPrincipal(req, "tenant/chat-1", tokenHash, nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 

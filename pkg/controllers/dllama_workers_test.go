@@ -124,3 +124,28 @@ func TestDesiredWorkersPopulatesAnnotationsFromIngressWhenAnnotationsEmpty(t *te
 	require.Equal(t, "label-hash", worker.Annotations[labelConversationHash])
 	require.Equal(t, "nats://ns-only:4222", worker.Spec.NATS.URL)
 }
+
+func TestDesiredWorkersInheritsIngressNThreads(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	handler := &dllamaHandler{ingresses: ingressController}
+
+	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+	ingressCache.EXPECT().List("default", gomock.Any()).Return([]*v1.Ingress{{
+		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{NThreads: 4}},
+	}}, nil).AnyTimes()
+	ingressCache.EXPECT().List("", gomock.Any()).Return(nil, nil).AnyTimes()
+
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"},
+		Spec:       v1.DllamaSpec{WorkerImage: "worker:latest", ReplicaPower: 1},
+	}
+	model := &v1.Model{Status: v1.ModelStatus{OutputPVCName: "model-pvc"}}
+
+	workers := handler.desiredWorkers(dllama, model)
+	require.Len(t, workers, 1)
+	require.Equal(t, int32(4), workers[0].Spec.NThreads)
+}

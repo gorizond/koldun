@@ -717,7 +717,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// The model is part of the conversation identity: the same client headers
 	// must not route a request to a session pinned to another model.
-	hash, err := conversationHashFromHeaders(r, canonicalModelID(model, s.cfg.Namespace), s.cfg.HashSecret)
+	hash, err := conversationHashFromHeadersWithPrincipal(r, canonicalModelID(model, s.cfg.Namespace), tokenHash, s.cfg.HashSecret)
 	if err != nil {
 		s.log.WithError(err).Warn("conversation hash from headers")
 		writeError(w, http.StatusBadRequest, "failed to derive conversation id")
@@ -2398,39 +2398,56 @@ func int32PointerMatches(ptr *int32, value int32) bool {
 	return ptr != nil && *ptr == value
 }
 
+// stableConversationHeaders identify one logical conversation across requests.
+// When one is present, every other x-* header (request ids, trace ids, SDK
+// retry counters, forwarded-for addresses) is transport noise and must not
+// split the conversation.
+var stableConversationHeaders = []string{"x-chat-id", "x-session-id", "x-conversation-id"}
+
 func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (string, error) {
-	pairs := make([]string, 0, len(r.Header))
-	for name, values := range r.Header {
-		lower := strings.ToLower(name)
-		if !strings.HasPrefix(lower, "x-") {
-			continue
-		}
-		if lower == "x-forwarded-server" {
-			continue
-		}
-		for _, v := range values {
-			pairs = append(pairs, lower+"="+strings.TrimSpace(v))
+	return conversationHashFromHeadersWithPrincipal(r, model, "", secret)
+}
+
+// conversationHashFromHeadersWithPrincipal scopes the conversation to the
+// authenticated principal (token hash), so two tenants sharing an X-Chat-Id
+// cannot land in the same Session. The principal is omitted when empty to keep
+// anonymous hashes stable.
+func conversationHashFromHeadersWithPrincipal(r *http.Request, model, principal string, secret []byte) (string, error) {
+	pairs := make([]string, 0, len(stableConversationHeaders)+1)
+	for _, name := range stableConversationHeaders {
+		if value := strings.TrimSpace(r.Header.Get(name)); value != "" {
+			pairs = append(pairs, name+"="+value)
 		}
 	}
-	// Добавляем User-Agent в хеш
-	userAgent := strings.TrimSpace(r.Header.Get("User-Agent"))
-	if userAgent != "" {
-		pairs = append(pairs, "user-agent="+userAgent)
+	if len(pairs) == 0 {
+		// No stable chat id: keep the per-request identity, preferring the
+		// request id over the trace id and finally the User-Agent.
+		switch {
+		case strings.TrimSpace(r.Header.Get("x-request-id")) != "":
+			pairs = append(pairs, "x-request-id="+strings.TrimSpace(r.Header.Get("x-request-id")))
+		case strings.TrimSpace(r.Header.Get("x-trace-id")) != "":
+			pairs = append(pairs, "x-trace-id="+strings.TrimSpace(r.Header.Get("x-trace-id")))
+		case strings.TrimSpace(r.Header.Get("User-Agent")) != "":
+			pairs = append(pairs, "user-agent="+strings.TrimSpace(r.Header.Get("User-Agent")))
+		}
 	}
 	if len(pairs) == 0 {
 		return "", fmt.Errorf("no identifying headers provided")
 	}
 	sort.Strings(pairs)
-	// The model is always part of the signed input. An empty value still gets
-	// a fixed "model=\n" prefix, so there is no header-only fallback that could
-	// silently restore cross-model session sharing.
-	message := []byte("model=" + strings.TrimSpace(model) + "\n" + strings.Join(pairs, "&"))
+
+	message := "model=" + strings.TrimSpace(model) + "\n"
+	if principal = strings.TrimSpace(principal); principal != "" {
+		message += "principal=" + principal + "\n"
+	}
+	message += strings.Join(pairs, "&")
+
 	if len(secret) == 0 {
-		sum := sha256.Sum256(message)
+		sum := sha256.Sum256([]byte(message))
 		return hex.EncodeToString(sum[:]), nil
 	}
 	mac := hmac.New(sha256.New, secret)
-	mac.Write(message)
+	mac.Write([]byte(message))
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 

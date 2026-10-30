@@ -8,11 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `dllama-api` now serves HTTP connections on worker threads (bounded to 8, chat inference serialised) while still rebuilding its network on `NnExecutorException`; transient accept errors no longer terminate the root.
+- Conversation hashes use only stable identity headers plus the authenticated token hash when a chat id is present; SDK retry counters and forwarded-for addresses no longer re-key sessions.
+- Worker CRD now persists `spec.nThreads`; `backend.nThreads` reaches worker pods instead of being pruned to `--nthreads 1`.
+- `dllama-api` serves each HTTP connection on its own thread (chat inference serialised) so `/v1/models` and health checks stay responsive during long prefills.
+- Conversation hashes ignore per-request retry headers when a stable chat id is present, preventing one retried request from creating a second Session/Dllama.
+- dllama workers retry a partially established root connection instead of exiting with code 1 during startup; the readiness marker is dropped during the retry backoff.
+- Authenticated conversations are re-keyed once (token hash is now part of the hash); old sessions expire by TTL.
 - dllama workers now report readiness only after their weight shards are loaded (patched worker marker + readiness probe); the llm sidecar waits for `status.readyWorkers` before accepting requests.
 - `dllama-api` survives HTTP client disconnects/timeouts with a retriable 503 instead of terminating; socket read timeout is tied to the ingress sidecar timeout.
 - Existing OrderedReady worker StatefulSets are detected and rolled automatically: the worker and root StatefulSets are deleted and recreated (worker first, then root) with Parallel pod management and the weights-loaded readiness probe.
 
 ### Notes
+- A 32k-token prefill can exceed the default ingress `responseTimeout` (15m) and the client timeout; raise `backend.responseTimeout` (and the client timeout) for large-context tests. HTTP serving is no longer blocked by prefill, but the chat request itself is still bounded by that timeout.
+- Changing `backend.nThreads` updates the Worker spec and therefore the worker pod template; roll the group with the manual procedure below (the worker STS is Parallel after the readiness migration, so a plain RollingUpdate can stall on the single-accept worker).
 - Rolling an existing Dllama group (image/config change) requires deleting the root and worker StatefulSets together, selected via `kubectl get sts -l koldun.gorizond.io/dllama=<dllama>` (both names may be truncated); expect 8-10 minutes without service and in-flight generations being terminated (grace period 0).
 - Root pods in the release namespace use a dedicated minimal service account (`<release>-dllama`, get/delete dllamas only) instead of the operator service account. Roots created by Ingresses in other namespaces keep the default SA and the llm sidecar fails open if RBAC is absent.
 
