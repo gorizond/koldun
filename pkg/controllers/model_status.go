@@ -52,6 +52,10 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	downloadJobName := jobNameForModel(obj)
 	conversionJobName := conversionJobName(obj)
 	sizeJobName := sizeJobName(obj)
+	currentDownloadHash := modelDownloadHash(obj)
+	downloadCurrent := modelDownloadCurrent(obj, currentDownloadHash)
+	currentArtifactHash := modelArtifactHash(obj)
+	artifactsCurrent := modelArtifactsCurrent(obj, currentArtifactHash)
 
 	updated.Status.DownloadJobName = ""
 	updated.Status.ConversionJobName = ""
@@ -102,6 +106,8 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 			updated.Status.ConversionSizeHuman = humanizeBytes(obj.Spec.PreConvertedSizeBytes)
 		}
 		updated.Status.ConversionSizeGeneration = obj.Generation
+		updated.Status.ArtifactHash = currentArtifactHash
+		updated.Status.DownloadHash = currentDownloadHash
 
 		updated.Status.DownloadState = downloadState
 		updated.Status.ConversionState = conversionState
@@ -122,8 +128,34 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		downloadCond.Message = "Model requires sourceUrl and objectStorage.bucketForSource"
 	} else {
 		if job, err := h.jobs.Cache().Get(obj.Namespace, downloadJobName); err == nil && job != nil {
+			jobMatches := jobDownloadHash(job) == currentDownloadHash
+			if jobDownloadHash(job) == "" {
+				// Legacy job created before artifact hashes: adopt it when it
+				// matches the current or last observed generation. Unannotated
+				// jobs are trusted, matching the pre-hash behaviour.
+				generation := jobGeneration(job)
+				jobMatches = generation == "" ||
+					generation == fmt.Sprintf("%d", obj.Generation) ||
+					legacyJobMatchesObservedGeneration(obj, job)
+			}
 			updated.Status.DownloadJobName = job.Name
 			downloadState, downloadCond = summarizeJob(job, conditionDownloaded)
+
+			if jobMatches && strings.EqualFold(downloadState, "Succeeded") {
+				downloadCurrent = true
+				updated.Status.DownloadHash = currentDownloadHash
+			} else if strings.EqualFold(downloadState, "Succeeded") {
+				// The finished job belongs to a previous artifact hash; wait for
+				// the controller to replace it instead of reporting stale success.
+				updated.Status.DownloadJobName = ""
+				downloadState = "Pending"
+				downloadCond = metav1.Condition{
+					Type:    conditionDownloaded,
+					Status:  metav1.ConditionFalse,
+					Reason:  "ArtifactsOutdated",
+					Message: "Downloaded artifacts do not match the current model spec",
+				}
+			}
 
 			if downloadState == "Pending" && job.Status.Active == 0 && job.Status.Succeeded == 0 && job.Status.Failed == 0 {
 				downloadCond.Reason = "JobCreated"
@@ -132,12 +164,13 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		} else {
 			// Preserve last known terminal state when the Job no longer exists (e.g. TTL expired)
 			prevState := strings.ToLower(obj.Status.DownloadState)
-			if obj.Status.ObservedGeneration == obj.Generation && prevState == strings.ToLower("Succeeded") {
+			if downloadCurrent && prevState == strings.ToLower("Succeeded") {
 				downloadCond.Status = metav1.ConditionTrue
 				downloadCond.Reason = "JobSucceeded"
 				downloadCond.Message = "Model download completed"
 				downloadState = "Succeeded"
-			} else if obj.Status.ObservedGeneration == obj.Generation && prevState == strings.ToLower("Failed") {
+				updated.Status.DownloadHash = currentDownloadHash
+			} else if downloadCurrent && prevState == strings.ToLower("Failed") {
 				downloadCond.Status = metav1.ConditionFalse
 				downloadCond.Reason = "JobFailed"
 				downloadCond.Message = "Model download job failed"
@@ -156,19 +189,41 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 		conversionCond.Reason = "WaitingForDownload"
 		conversionCond.Message = "Conversion waits until download completes"
 
-		downloadSucceeded := strings.EqualFold(downloadState, "Succeeded") && obj.Status.ObservedGeneration == obj.Generation
+		downloadSucceeded := strings.EqualFold(downloadState, "Succeeded") && downloadCurrent
 		if downloadSucceeded {
 			if job, err := h.jobs.Cache().Get(obj.Namespace, conversionJobName); err == nil && job != nil {
+				jobMatches := jobArtifactHash(job) == currentArtifactHash
+				if jobArtifactHash(job) == "" {
+					generation := jobGeneration(job)
+					jobMatches = generation == "" ||
+						generation == fmt.Sprintf("%d", obj.Generation) ||
+						legacyJobMatchesObservedGeneration(obj, job)
+				}
 				updated.Status.ConversionJobName = job.Name
 				conversionState, conversionCond = summarizeJob(job, conditionConverted)
+
+				if jobMatches && strings.EqualFold(conversionState, "Succeeded") {
+					artifactsCurrent = true
+					updated.Status.ArtifactHash = currentArtifactHash
+				} else if strings.EqualFold(conversionState, "Succeeded") {
+					updated.Status.ConversionJobName = ""
+					conversionState = "Pending"
+					conversionCond = metav1.Condition{
+						Type:    conditionConverted,
+						Status:  metav1.ConditionFalse,
+						Reason:  "ArtifactsOutdated",
+						Message: "Converted artifacts do not match the current model spec",
+					}
+				}
 			} else {
 				prevState := strings.ToLower(obj.Status.ConversionState)
-				if obj.Status.ObservedGeneration == obj.Generation && prevState == strings.ToLower("Succeeded") {
+				if artifactsCurrent && prevState == strings.ToLower("Succeeded") {
 					conversionCond.Status = metav1.ConditionTrue
 					conversionCond.Reason = "JobSucceeded"
 					conversionCond.Message = "Conversion job completed"
 					conversionState = "Succeeded"
-				} else if obj.Status.ObservedGeneration == obj.Generation && prevState == strings.ToLower("Failed") {
+					updated.Status.ArtifactHash = currentArtifactHash
+				} else if artifactsCurrent && prevState == strings.ToLower("Failed") {
 					conversionCond.Status = metav1.ConditionFalse
 					conversionCond.Reason = "JobFailed"
 					conversionCond.Message = "Conversion job failed"
@@ -190,21 +245,43 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	}
 
 	updated.Status.ConversionState = conversionState
-	if obj.Spec.Conversion != nil && strings.EqualFold(conversionState, "Succeeded") {
-		updated.Status.OutputPVCName = fmt.Sprintf("%s-s3-output-pvc", obj.Name)
+	if obj.Spec.Conversion != nil {
+		if strings.EqualFold(conversionState, "Succeeded") && artifactsCurrent {
+			updated.Status.ArtifactHash = currentArtifactHash
+			updated.Status.OutputPVCName = fmt.Sprintf("%s-s3-output-pvc", obj.Name)
+		}
+	} else if strings.EqualFold(downloadState, "Succeeded") && downloadCurrent {
+		// Without conversion the downloaded artifacts are the final artifacts.
+		updated.Status.ArtifactHash = currentArtifactHash
 	}
 
 	if obj.Spec.Conversion != nil {
-		if strings.EqualFold(conversionState, "Succeeded") {
+		if strings.EqualFold(conversionState, "Succeeded") && artifactsCurrent {
 			sizeState = "Pending"
 			sizeCond.Reason = "SizingPending"
 			sizeCond.Message = "Sizing job pending"
 
 			if job, err := h.jobs.Cache().Get(obj.Namespace, sizeJobName); err == nil && job != nil {
+				jobMatches := jobArtifactHash(job) == currentArtifactHash
+				if jobArtifactHash(job) == "" {
+					generation := jobGeneration(job)
+					jobMatches = generation == "" ||
+						generation == fmt.Sprintf("%d", obj.Generation) ||
+						legacyJobMatchesObservedGeneration(obj, job)
+				}
 				updated.Status.ConversionSizeJobName = job.Name
 				sizeState, sizeCond = summarizeJob(job, conditionSized)
 
-				if strings.EqualFold(sizeState, "Succeeded") {
+				if !jobMatches && strings.EqualFold(sizeState, "Succeeded") {
+					updated.Status.ConversionSizeJobName = ""
+					sizeState = "Pending"
+					sizeCond = metav1.Condition{
+						Type:    conditionSized,
+						Status:  metav1.ConditionFalse,
+						Reason:  "ArtifactsOutdated",
+						Message: "Sizing result does not match the current model spec",
+					}
+				} else if strings.EqualFold(sizeState, "Succeeded") {
 					measurement, err := h.collectSizeMeasurement(obj.Namespace, job.Name)
 					if err != nil {
 						if reuseExistingSizeMeasurement(obj, updated, &sizeCond) {
@@ -231,6 +308,7 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 						updated.Status.ConversionSizeBytes = measurement.Bytes
 						updated.Status.ConversionSizeHuman = measurement.Human
 						updated.Status.ConversionSizeGeneration = obj.Generation
+						updated.Status.ArtifactHash = currentArtifactHash
 						updated.Status.ConversionSizeForceToken = forceToken
 						if forceAnnotationPresent {
 							shouldClearForceAnnotation = true
@@ -238,36 +316,25 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 					}
 				}
 			} else {
-				prevGenMatch := obj.Status.ConversionSizeGeneration == obj.Generation
+				// The sizing block is only entered when the conversion artifacts
+				// are current, so the recorded measurement belongs to them.
 				switch strings.ToLower(obj.Status.ConversionSizeState) {
 				case "succeeded":
-					if prevGenMatch {
-						sizeCond.Status = metav1.ConditionTrue
-						sizeCond.Reason = "SizingSucceeded"
-						sizeCond.Message = fmt.Sprintf("Converted artifacts size: %s", obj.Status.ConversionSizeHuman)
-						sizeState = "Succeeded"
-						updated.Status.ConversionSizeBytes = obj.Status.ConversionSizeBytes
-						updated.Status.ConversionSizeHuman = obj.Status.ConversionSizeHuman
-						updated.Status.ConversionSizeGeneration = obj.Status.ConversionSizeGeneration
-						updated.Status.ConversionSizeJobName = obj.Status.ConversionSizeJobName
-						updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
-					} else {
-						sizeCond.Reason = "SizingPending"
-						sizeCond.Message = "Waiting for sizing job to appear"
-						sizeState = "Pending"
-					}
+					sizeCond.Status = metav1.ConditionTrue
+					sizeCond.Reason = "SizingSucceeded"
+					sizeCond.Message = fmt.Sprintf("Converted artifacts size: %s", obj.Status.ConversionSizeHuman)
+					sizeState = "Succeeded"
+					updated.Status.ConversionSizeBytes = obj.Status.ConversionSizeBytes
+					updated.Status.ConversionSizeHuman = obj.Status.ConversionSizeHuman
+					updated.Status.ConversionSizeGeneration = obj.Status.ConversionSizeGeneration
+					updated.Status.ConversionSizeJobName = obj.Status.ConversionSizeJobName
+					updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
 				case "failed":
-					if prevGenMatch {
-						sizeCond.Status = metav1.ConditionFalse
-						sizeCond.Reason = "SizingFailed"
-						sizeCond.Message = "Sizing job failed"
-						sizeState = "Failed"
-						updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
-					} else {
-						sizeCond.Reason = "SizingPending"
-						sizeCond.Message = "Waiting for sizing job to appear"
-						sizeState = "Pending"
-					}
+					sizeCond.Status = metav1.ConditionFalse
+					sizeCond.Reason = "SizingFailed"
+					sizeCond.Message = "Sizing job failed"
+					sizeState = "Failed"
+					updated.Status.ConversionSizeForceToken = obj.Status.ConversionSizeForceToken
 				default:
 					sizeCond.Reason = "SizingPending"
 					sizeCond.Message = "Waiting for sizing job to appear"
@@ -358,6 +425,12 @@ func (h *modelHandler) ensureStatus(obj *v1.Model) (*v1.Model, error) {
 	if obj.Status.OutputPVCName != updated.Status.OutputPVCName {
 		changed = true
 	}
+	if obj.Status.ArtifactHash != updated.Status.ArtifactHash {
+		changed = true
+	}
+	if obj.Status.DownloadHash != updated.Status.DownloadHash {
+		changed = true
+	}
 
 	if shouldClearForceAnnotation {
 		changed = true
@@ -407,7 +480,7 @@ func reuseExistingSizeMeasurement(obj *v1.Model, updated *v1.Model, cond *metav1
 	if obj == nil || updated == nil || cond == nil {
 		return false
 	}
-	if obj.Status.ConversionSizeGeneration != obj.Generation {
+	if !modelArtifactsCurrent(obj, modelArtifactHash(obj)) {
 		return false
 	}
 

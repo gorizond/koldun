@@ -1,6 +1,9 @@
 package controllers
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,6 +13,78 @@ import (
 
 // model_helpers.go contains utility functions for the model controller.
 // These are pure functions with no side effects, making them easy to test and reuse.
+
+// modelArtifactSpec captures the ModelSpec fields that influence the artifact
+// pipeline. pipProxy is included because it is injected into the download and
+// conversion containers: fixing a broken proxy must allow a retry.
+type modelArtifactSpec struct {
+	SourceURL             string                     `json:"sourceUrl"`
+	LocalPath             string                     `json:"localPath"`
+	ObjectStorage         *v1.ModelObjectStorageSpec `json:"objectStorage,omitempty"`
+	Download              *v1.ModelDownloadSpec      `json:"download,omitempty"`
+	Conversion            *v1.ModelConversionSpec    `json:"conversion,omitempty"`
+	PV                    *v1.ModelPVSpec            `json:"pv,omitempty"`
+	PreConverted          bool                       `json:"preConverted,omitempty"`
+	PreConvertedPVCName   string                     `json:"preConvertedPVCName,omitempty"`
+	PreConvertedSizeBytes int64                      `json:"preConvertedSizeBytes,omitempty"`
+	PipProxy              string                     `json:"pipProxy,omitempty"`
+}
+
+func modelSpecHash(obj *v1.Model, includeConversion bool) string {
+	payload := modelArtifactSpec{
+		SourceURL:             obj.Spec.SourceURL,
+		LocalPath:             obj.Spec.LocalPath,
+		ObjectStorage:         obj.Spec.ObjectStorage,
+		Download:              obj.Spec.Download,
+		PV:                    obj.Spec.PV,
+		PreConverted:          obj.Spec.PreConverted,
+		PreConvertedPVCName:   obj.Spec.PreConvertedPVCName,
+		PreConvertedSizeBytes: obj.Spec.PreConvertedSizeBytes,
+		PipProxy:              obj.Spec.PipProxy,
+	}
+	if includeConversion {
+		payload.Conversion = obj.Spec.Conversion
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// modelDownloadHash covers the fields that determine the downloaded source
+// artifacts. Conversion-only changes keep this hash stable, so a finished
+// download job is not recreated (and the source bucket is not rewritten).
+func modelDownloadHash(obj *v1.Model) string {
+	return modelSpecHash(obj, false)
+}
+
+// modelArtifactHash covers the downloaded artifacts plus conversion settings.
+// Runtime-only fields (maxSeqLen, replicaPower, launchOptions) are deliberately
+// excluded so tuning them does not restart multi-hour jobs.
+func modelArtifactHash(obj *v1.Model) string {
+	return modelSpecHash(obj, true)
+}
+
+func modelStageCurrent(recorded string, obj *v1.Model, hash string) bool {
+	if recorded != "" {
+		return recorded == hash
+	}
+	// Missing hash means legacy status written before hashes existed: fall
+	// back to the generation gate so the first rollout does not restart jobs.
+	return obj.Status.ObservedGeneration == obj.Generation
+}
+
+// modelDownloadCurrent reports whether Status.DownloadHash matches hash.
+func modelDownloadCurrent(obj *v1.Model, hash string) bool {
+	return modelStageCurrent(obj.Status.DownloadHash, obj, hash)
+}
+
+// modelArtifactsCurrent reports whether Status.ArtifactHash matches hash.
+func modelArtifactsCurrent(obj *v1.Model, hash string) bool {
+	return modelStageCurrent(obj.Status.ArtifactHash, obj, hash)
+}
 
 // normalizeForceToken generates a unique token for force size rerun requests.
 // If requested is true but value is empty, it generates a token based on resourceVersion.

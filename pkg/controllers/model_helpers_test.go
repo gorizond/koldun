@@ -348,3 +348,59 @@ func TestValueFromSecret(t *testing.T) {
 		})
 	}
 }
+
+func TestModelArtifactHashIgnoresRuntimeFields(t *testing.T) {
+	base := &v1.Model{Spec: v1.ModelSpec{
+		SourceURL: "https://example.com/model.gguf",
+		LocalPath: "models/example",
+		ObjectStorage: &v1.ModelObjectStorageSpec{
+			Endpoint:         "https://s3.example.com",
+			BucketForSource:  "source",
+			BucketForConvert: "convert",
+		},
+		Download:   &v1.ModelDownloadSpec{Image: "downloader:1"},
+		Conversion: &v1.ModelConversionSpec{Image: "converter:1", WeightsFloatType: "q40"},
+	}}
+	baseHash := modelArtifactHash(base)
+	if baseHash == "" {
+		t.Fatal("modelArtifactHash returned an empty hash")
+	}
+
+	runtimeOnly := base.DeepCopy()
+	runtimeOnly.Spec.MaxSeqLen = 8192
+	runtimeOnly.Spec.ReplicaPower = 4
+	runtimeOnly.Spec.LaunchOptions = []string{"--ctx", "8192"}
+	if got := modelArtifactHash(runtimeOnly); got != baseHash {
+		t.Fatalf("runtime-only spec change altered artifact hash: %s != %s", got, baseHash)
+	}
+
+	baseDownloadHash := modelDownloadHash(base)
+	conversionChanged := base.DeepCopy()
+	conversionChanged.Spec.Conversion.WeightsFloatType = "q4_1"
+	if got := modelDownloadHash(conversionChanged); got != baseDownloadHash {
+		t.Fatalf("conversion-only change altered download hash: %s != %s", got, baseDownloadHash)
+	}
+	if got := modelArtifactHash(conversionChanged); got == baseHash {
+		t.Fatal("conversion change did not alter artifact hash")
+	}
+
+	artifactChanges := map[string]func(*v1.Model){
+		"sourceUrl":           func(m *v1.Model) { m.Spec.SourceURL = "https://example.com/other.gguf" },
+		"localPath":           func(m *v1.Model) { m.Spec.LocalPath = "models/other" },
+		"download":            func(m *v1.Model) { m.Spec.Download.Image = "downloader:2" },
+		"conversion":          func(m *v1.Model) { m.Spec.Conversion.ConverterVersion = "v0.17.0" },
+		"objectStorage":       func(m *v1.Model) { m.Spec.ObjectStorage.BucketForSource = "other" },
+		"pv":                  func(m *v1.Model) { m.Spec.PV = &v1.ModelPVSpec{Capacity: "20Gi"} },
+		"preConverted":        func(m *v1.Model) { m.Spec.PreConverted = true },
+		"preConvertedPVCName": func(m *v1.Model) { m.Spec.PreConvertedPVCName = "pvc" },
+		"preConvertedSize":    func(m *v1.Model) { m.Spec.PreConvertedSizeBytes = 1024 },
+		"pipProxy":            func(m *v1.Model) { m.Spec.PipProxy = "http://proxy:3128" },
+	}
+	for name, mutate := range artifactChanges {
+		mutated := base.DeepCopy()
+		mutate(mutated)
+		if got := modelArtifactHash(mutated); got == baseHash {
+			t.Errorf("%s change did not alter artifact hash", name)
+		}
+	}
+}
