@@ -664,6 +664,15 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Contains(t, rootContainer.Args, "--workers")
 	require.Contains(t, rootContainer.Args, "mistral-workers-0.mistral-workers.models.svc.cluster.local:9999")
 	require.Equal(t, "llm", sts.Spec.Template.Spec.Containers[1].Name)
+
+	require.Len(t, sts.Spec.Template.Spec.TopologySpreadConstraints, 1)
+	spread := sts.Spec.Template.Spec.TopologySpreadConstraints[0]
+	require.Equal(t, int32(1), spread.MaxSkew)
+	require.Equal(t, "kubernetes.io/hostname", spread.TopologyKey)
+	require.Equal(t, corev1.ScheduleAnyway, spread.WhenUnsatisfiable)
+	require.NotNil(t, spread.LabelSelector)
+	require.Equal(t, map[string]string{labelDllamaName: "mistral"}, spread.LabelSelector.MatchLabels)
+
 	require.Equal(t, fmt.Sprintf("root-%s-statefulset", root.Name), fakeApply.setID)
 }
 

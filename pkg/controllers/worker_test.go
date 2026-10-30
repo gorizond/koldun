@@ -98,6 +98,14 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 		require.Equal(t, "7", sts.Spec.Template.Annotations[annotationSlotKey])
 
 		pod := sts.Spec.Template.Spec
+		require.Len(t, pod.TopologySpreadConstraints, 1)
+		spread := pod.TopologySpreadConstraints[0]
+		require.Equal(t, int32(1), spread.MaxSkew)
+		require.Equal(t, "kubernetes.io/hostname", spread.TopologyKey)
+		require.Equal(t, corev1.ScheduleAnyway, spread.WhenUnsatisfiable)
+		require.NotNil(t, spread.LabelSelector)
+		require.Equal(t, map[string]string{labelDllamaName: "mistral"}, spread.LabelSelector.MatchLabels)
+
 		require.Len(t, pod.Containers, 1)
 		container := pod.Containers[0]
 		require.Equal(t, "dllama", strings.Join(container.Command, " "))
@@ -1633,6 +1641,36 @@ func TestWorkerContainer(t *testing.T) {
 			tt.validate(t, container)
 		})
 	}
+}
+
+func TestWorkerHandlerEnsureStatefulSetOmitsSpreadWithoutDllamaLabel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	mockApply := newGomockApply(ctrl)
+	handler := &workerHandler{apply: mockApply}
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "orphan-workers",
+			Namespace: "models",
+		},
+		Spec: v1.WorkerSpec{
+			Image: "ghcr.io/gorizond/dllama:latest",
+		},
+	}
+
+	mockApply.EXPECT().ApplyObjects(
+		gomock.AssignableToTypeOf(&corev1.Service{}),
+		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
+	).DoAndReturn(func(objs ...interface{}) error {
+		sts, ok := objs[1].(*appsv1.StatefulSet)
+		require.True(t, ok)
+		require.Empty(t, sts.Spec.Template.Spec.TopologySpreadConstraints)
+		return nil
+	})
+
+	require.NoError(t, handler.ensureStatefulSet(worker))
 }
 
 func mustParseQuantity(s string) resource.Quantity {

@@ -306,6 +306,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
+					TopologySpreadConstraints:     dllamaTopologySpread(labels[labelDllamaName]),
 					Volumes: []corev1.Volume{
 						{
 							Name: "model-output",
