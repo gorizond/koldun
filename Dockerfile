@@ -1,5 +1,5 @@
 ARG DL_REPOSITORY=https://github.com/gorizond/distributed-llama.git
-ARG DL_VERSION=v0.16.5-koldun.1
+ARG DL_VERSION=v0.16.5-koldun.2
 
 FROM alpine:3.20 AS dllama-builder
 ARG TARGETARCH

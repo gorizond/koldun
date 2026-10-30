@@ -576,6 +576,10 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		// Outlive the llm sidecar request timeout (ingress responseTimeout) and
 		// worker weight loading. The patched dllama-api also defaults to 20m.
 		{Name: "DLLAMA_HTTP_READ_TIMEOUT_SECONDS", Value: fmt.Sprint(int(httpReadTimeout.Seconds()))},
+		// Progress logging cadence (tokens), implemented by the fork patch
+		// 0002-progress-logging; 0/unset disables it.
+		{Name: "DLLAMA_PROGRESS_EVERY", Value: "128"},
+		{Name: "DLLAMA_GEN_PROGRESS_EVERY", Value: "16"},
 	}
 
 	if root.Spec.CacheSpec != nil {
