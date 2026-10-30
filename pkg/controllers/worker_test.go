@@ -98,6 +98,15 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 		require.Equal(t, "7", sts.Spec.Template.Annotations[annotationSlotKey])
 
 		pod := sts.Spec.Template.Spec
+		require.Len(t, pod.TopologySpreadConstraints, 1)
+		spread := pod.TopologySpreadConstraints[0]
+		require.Equal(t, int32(1), spread.MaxSkew)
+		require.Equal(t, "kubernetes.io/hostname", spread.TopologyKey)
+		require.Equal(t, corev1.ScheduleAnyway, spread.WhenUnsatisfiable)
+		require.NotNil(t, spread.LabelSelector)
+		require.Equal(t, sts.Spec.Template.Labels[labelDllamaName], spread.LabelSelector.MatchLabels[labelDllamaName])
+		require.Equal(t, "mistral", spread.LabelSelector.MatchLabels[labelDllamaName])
+
 		require.Len(t, pod.Containers, 1)
 		container := pod.Containers[0]
 		require.Equal(t, "dllama", strings.Join(container.Command, " "))

@@ -238,6 +238,7 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 				},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
+					TopologySpreadConstraints:     dllamaTopologySpread(labels[labelDllamaName]),
 					Volumes:                       volumes,
 					Containers:                    []corev1.Container{h.workerContainer(worker, threads, workerResources)},
 				},
