@@ -488,14 +488,15 @@ func TestConversationHashFromHeadersScopesByModel(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, small, stable, "same model and headers must produce a stable hash")
 
-	// An empty model keeps the legacy header-only hash.
-	legacy, err := conversationHashFromHeaders(req, "", nil)
+	// An empty model still gets a fixed domain separator; it never falls back
+	// to the legacy header-only hash.
+	empty, err := conversationHashFromHeaders(req, "", nil)
 	require.NoError(t, err)
 	pairs := []string{"user-agent=ingress-test", "x-chat-id=shared-chat"}
 	sort.Strings(pairs)
-	sum := sha256.Sum256([]byte(strings.Join(pairs, "&")))
-	require.Equal(t, hex.EncodeToString(sum[:]), legacy)
-	require.NotEqual(t, small, legacy)
+	sum := sha256.Sum256([]byte("model=\n" + strings.Join(pairs, "&")))
+	require.Equal(t, hex.EncodeToString(sum[:]), empty)
+	require.NotEqual(t, small, empty)
 }
 
 // TestSessionBacklogSubject validates backlog subject generation.
@@ -3186,6 +3187,64 @@ func TestHandleChatCompletionsRejectsInvalidConversationHash(t *testing.T) {
 	var errResp openai.ErrorResponse
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
 	assert.Contains(t, strings.ToLower(errResp.Error.Message), "conversation id")
+}
+
+func TestHandleChatCompletionsHashesCanonicalModel(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			ResponseTimeout: 100 * time.Millisecond,
+			Namespace:       "tenant",
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 0, errors.New("not used")
+				},
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				name := "chat-1"
+				if strings.HasSuffix(key, "/chat-2") {
+					name = "chat-2"
+				}
+				data, _ := json.Marshal(&registry.Model{
+					Namespace:           "tenant",
+					Name:                name,
+					OutputPVCName:       "pvc",
+					ConversionSizeHuman: "1Gi",
+				})
+				return &kvEntryStub{value: data}, nil
+			},
+		},
+	}
+
+	hashFor := func(model string) string {
+		body := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"ping"}]}`, model)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Chat-Id", "shared-chat")
+		req.Header.Set("User-Agent", "ingress-test")
+
+		var captured string
+		srv.ensureConversationHook = func(_ context.Context, hash string, _ *registry.Model, _ int32) (*conversation.Record, error) {
+			captured = hash
+			return nil, errors.New("stop after hash")
+		}
+
+		rec := httptest.NewRecorder()
+		srv.handleChatCompletions(rec, req)
+		require.Equal(t, http.StatusInternalServerError, rec.Code)
+		require.NotEmpty(t, captured, "ensureConversation must receive the derived hash")
+		return captured
+	}
+
+	explicit := hashFor("tenant/chat-1")
+	implicit := hashFor("chat-1")
+	other := hashFor("tenant/chat-2")
+
+	require.Equal(t, explicit, implicit, "namespace-qualified and default-namespace forms must resolve to the same session")
+	require.NotEqual(t, explicit, other, "different models must not share a session")
 }
 
 func TestHandleChatCompletionsRejectsUnknownModel(t *testing.T) {

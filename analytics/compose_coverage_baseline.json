@@ -1,6 +1,6 @@
 {
   "total": 86.5,
-  "updated_at": "2026-10-30T10:26:02Z",
-  "commit": "39e01e9c4d8643657d47ed427a19855b340a9398",
-  "source": "39e01e9 \u2014 fix(ingress): never slice the think buffer with lowercased offsets"
+  "updated_at": "2026-10-30T14:24:11Z",
+  "commit": "d6aa898a728a916a7cbd21434254c718c329adf4",
+  "source": "d6aa898 \u2014 fix(ingress): scope conversation hash by resolved model"
 }

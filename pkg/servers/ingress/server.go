@@ -692,7 +692,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// The model is part of the conversation identity: the same client headers
 	// must not route a request to a session pinned to another model.
-	hash, err := conversationHashFromHeaders(r, model.Namespace+"/"+model.Name, s.cfg.HashSecret)
+	hash, err := conversationHashFromHeaders(r, canonicalModelID(model, s.cfg.Namespace), s.cfg.HashSecret)
 	if err != nil {
 		s.log.WithError(err).Warn("conversation hash from headers")
 		writeError(w, http.StatusBadRequest, "failed to derive conversation id")
@@ -1036,11 +1036,6 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 
 	requiredReplica := s.replicaPowerForModel(model)
 
-	modelNamespace := model.Namespace
-	if strings.TrimSpace(modelNamespace) == "" {
-		modelNamespace = s.cfg.Namespace
-	}
-
 	desired := active
 	if desired < s.cfg.SessionMinDllamas {
 		desired = s.cfg.SessionMinDllamas
@@ -1053,7 +1048,7 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 		Hash:                    hash,
 		Session:                 fmt.Sprintf("session-%s", sanitizeSessionHash(hash)),
 		Namespace:               s.cfg.Namespace,
-		Model:                   fmt.Sprintf("%s/%s", modelNamespace, model.Name),
+		Model:                   canonicalModelID(model, s.cfg.Namespace),
 		CreatedAt:               time.Now().Unix(),
 		ReplicaPower:            requiredReplica,
 		RootImage:               s.cfg.RootImage,
@@ -2269,6 +2264,30 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// canonicalModelID returns the namespace-qualified identifier shared by the
+// conversation hash and the Session modelRef. Both must use the same value so
+// a session cannot be pinned to a model other than the one that produced its
+// hash.
+func canonicalModelID(model *registry.Model, fallbackNamespace string) string {
+	namespace := ""
+	name := ""
+	if model != nil {
+		namespace = strings.TrimSpace(model.Namespace)
+		name = strings.TrimSpace(model.Name)
+	}
+	if namespace == "" {
+		namespace = strings.TrimSpace(fallbackNamespace)
+	}
+	switch {
+	case namespace == "":
+		return name
+	case name == "":
+		return namespace
+	default:
+		return namespace + "/" + name
+	}
+}
+
 func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (string, error) {
 	pairs := make([]string, 0, len(r.Header))
 	for name, values := range r.Header {
@@ -2292,13 +2311,10 @@ func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (
 		return "", fmt.Errorf("no identifying headers provided")
 	}
 	sort.Strings(pairs)
-	payload := strings.Join(pairs, "&")
-	if trimmed := strings.TrimSpace(model); trimmed != "" {
-		// Domain separator keeps model-scoped hashes disjoint from the legacy
-		// header-only input. An empty model preserves the previous behaviour.
-		payload = "model=" + trimmed + "\n" + payload
-	}
-	message := []byte(payload)
+	// The model is always part of the signed input. An empty value still gets
+	// a fixed "model=\n" prefix, so there is no header-only fallback that could
+	// silently restore cross-model session sharing.
+	message := []byte("model=" + strings.TrimSpace(model) + "\n" + strings.Join(pairs, "&"))
 	if len(secret) == 0 {
 		sum := sha256.Sum256(message)
 		return hex.EncodeToString(sum[:]), nil
