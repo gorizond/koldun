@@ -177,7 +177,6 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 
 	params := scalingParamsFromSession(sess)
 	state := computeSessionPoolState(sess, dllamas)
-	defer h.scheduleScaleDownCheck(sess, params, state)
 
 	if int32(state.total()) < params.min {
 		if err := h.createDllamaForSession(sess); err != nil {
@@ -222,25 +221,6 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 	}
 
 	return h.ensureDispatcher(sess)
-}
-
-// scheduleScaleDownCheck arranges a wake-up at lastActivity+scaleDownIdle.
-// Reconciliation is event-driven, so without this an idle session with no
-// further spec/status changes would never be re-evaluated.
-func (h *sessionHandler) scheduleScaleDownCheck(sess *v1.Session, params sessionScalingParams, state sessionPoolState) {
-	if h.sessions == nil || params.scaleDownIdle <= 0 {
-		return
-	}
-	if int32(state.total()) <= params.min || state.lastActivity.IsZero() || state.activeRequests > 0 || state.backlog > 0 {
-		return
-	}
-	delay := time.Until(state.lastActivity.Add(params.scaleDownIdle))
-	if delay < time.Second {
-		// Already due (or nearly so); re-check shortly. Avoids a tight loop
-		// when a reconcile cannot delete a worker yet.
-		delay = time.Second
-	}
-	h.sessions.EnqueueAfter(sess.Namespace, sess.Name, delay)
 }
 
 func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
@@ -478,6 +458,9 @@ func (p sessionScalingParams) shouldScaleDown(state sessionPoolState) bool {
 		return false
 	}
 	if int32(state.total()) <= p.min {
+		return false
+	}
+	if p.desired > p.min {
 		return false
 	}
 	if state.activeRequests > 0 {

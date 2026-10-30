@@ -415,6 +415,21 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 			expected: true,
 		},
 		{
+			name: "don't scale down while desired is above min",
+			params: sessionScalingParams{
+				min:           0,
+				desired:       1,
+				scaleDownIdle: 5 * time.Minute,
+			},
+			state: sessionPoolState{
+				dllamas:      makeDllamas(1),
+				ready:        makeDllamas(1),
+				idleReady:    makeDllamas(1),
+				lastActivity: pastActivity,
+			},
+			expected: false,
+		},
+		{
 			name: "don't scale down with an in-flight request",
 			params: sessionScalingParams{
 				min:           0,
@@ -428,36 +443,6 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 				lastActivity:   pastActivity,
 			},
 			expected: false,
-		},
-		{
-			name: "scale down below desired count",
-			params: sessionScalingParams{
-				min:           1,
-				desired:       3,
-				scaleDownIdle: 5 * time.Minute,
-			},
-			state: sessionPoolState{
-				dllamas:      makeDllamas(3),
-				ready:        makeDllamas(3),
-				idleReady:    makeDllamas(2),
-				lastActivity: pastActivity,
-			},
-			expected: true,
-		},
-		{
-			name: "scale down when above desired count",
-			params: sessionScalingParams{
-				min:           1,
-				desired:       2,
-				scaleDownIdle: 5 * time.Minute,
-			},
-			state: sessionPoolState{
-				dllamas:      makeDllamas(3),
-				ready:        makeDllamas(3),
-				idleReady:    makeDllamas(2),
-				lastActivity: pastActivity,
-			},
-			expected: true,
 		},
 	}
 

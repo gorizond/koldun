@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
@@ -360,6 +361,14 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 	if rm := spec.Backend.RootMemory; rm != nil && rm.OverheadMaxRatio != nil {
 		if *rm.OverheadMaxRatio <= 0 {
 			return fmt.Errorf("backend.rootMemory.overheadMaxRatio must be > 0")
+		}
+	}
+	if ttl := spec.Backend.ConversationTTL; ttl != nil {
+		if ttl.Duration < 10*time.Second {
+			return fmt.Errorf("backend.conversationTTL must be >= 10s")
+		}
+		if timeout := spec.Backend.ResponseTimeout; timeout != nil && ttl.Duration <= timeout.Duration {
+			return fmt.Errorf("backend.conversationTTL must be greater than backend.responseTimeout")
 		}
 	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {

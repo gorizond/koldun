@@ -4663,6 +4663,20 @@ func TestTouchConversationActivity(t *testing.T) {
 	require.Equal(t, int32(1), parsed.Scaling.ActiveRequests, "activity refresh must not clobber in-flight count")
 
 	(&Server{}).touchConversationActivity("conv", completed) // nil KV is a no-op
+
+	expired := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: keyValueStub{getFn: func(string) (nats.KeyValueEntry, error) { return nil, nats.ErrKeyNotFound }},
+		log:    logrus.New().WithField("component", "test"),
+	}
+	expired.touchConversationActivity("conv", completed) // expired record is only debug-logged
+
+	failing := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: keyValueStub{getFn: func(string) (nats.KeyValueEntry, error) { return nil, errors.New("kv down") }},
+		log:    logrus.New().WithField("component", "test"),
+	}
+	failing.touchConversationActivity("conv", completed) // transient errors are warned
 }
 
 func TestEnsureConversationRetriesRevisionConflicts(t *testing.T) {
@@ -4716,4 +4730,60 @@ func TestEnsureConversationRetriesRevisionConflicts(t *testing.T) {
 	require.NotNil(t, record.Scaling.DesiredDllamas)
 	require.Equal(t, int32(1), *record.Scaling.DesiredDllamas, "desired must not stay 0 after a conflict")
 	require.Equal(t, 2, updates, "revision conflict should be retried")
+}
+
+func TestEnsureConversationRecreatesRecordAfterTTLExpiry(t *testing.T) {
+	old := &conversation.Record{
+		Hash:        "expired",
+		Session:     "session-expired",
+		Namespace:   "test-ns",
+		Model:       "ns/model",
+		RootImage:   "root:v1",
+		WorkerImage: "worker:v1",
+	}
+	data, err := old.Marshal()
+	require.NoError(t, err)
+
+	gets := 0
+	var putValue []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			gets++
+			if gets == 1 {
+				return &kvEntryStub{value: data, revision: 1}, nil
+			}
+			return nil, nats.ErrKeyNotFound
+		},
+		KeyValue: &mockKV{
+			putFn: func(key string, value []byte) (uint64, error) {
+				putValue = append([]byte(nil), value...)
+				return 2, nil
+			},
+		},
+	}
+	srv := &Server{
+		cfg: Config{
+			Namespace:         "test-ns",
+			RootImage:         "root:v1",
+			WorkerImage:       "worker:v1",
+			NATSURL:           "nats://test:4222",
+			TTLPrefix:         "conv:",
+			OutPrefix:         "out.",
+			SessionMinDllamas: 0,
+			SessionMaxDllamas: 5,
+		},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "expired", &registry.Model{
+		Name:      "model",
+		Namespace: "ns",
+	}, 1)
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	require.NotNil(t, putValue, "expired record should be recreated")
+	require.GreaterOrEqual(t, gets, 2)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	require.Equal(t, int32(1), *record.Scaling.DesiredDllamas)
 }

@@ -358,6 +358,7 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 	}
 
 	r.syncSessionLastActivity(record)
+	r.enqueueScaleDownIfDue(record)
 	return nil
 }
 
@@ -383,31 +384,73 @@ func (r *conversationReconciler) syncSessionLastActivity(record *conversation.Re
 		return
 	}
 
+	const attempts = 3
+	for attempt := 0; attempt < attempts; attempt++ {
+		session, err := r.sessions.Cache().Get(record.Namespace, record.SessionName())
+		if err != nil || session == nil {
+			if err != nil && !apierrors.IsNotFound(err) {
+				r.log.WithError(err).WithField("session", record.SessionName()).Warn("get session for status sync")
+			}
+			return
+		}
+
+		needsActivity := record.LastActivityAt > 0 &&
+			(session.Status.LastActivity == nil || session.Status.LastActivity.Unix() < record.LastActivityAt)
+		needsActive := session.Status.ActiveRequests != activeRequests
+		if !needsActivity && !needsActive {
+			return
+		}
+
+		updated := session.DeepCopy()
+		if needsActivity {
+			updated.Status.LastActivity = &metav1.Time{Time: time.Unix(record.LastActivityAt, 0).UTC()}
+		}
+		if needsActive {
+			updated.Status.ActiveRequests = activeRequests
+		}
+		if _, err := r.sessions.UpdateStatus(updated); err == nil {
+			return
+		} else if !apierrors.IsConflict(err) {
+			r.log.WithError(err).WithField("session", record.SessionName()).Warn("update session status")
+			return
+		}
+	}
+	r.log.WithField("session", record.SessionName()).Warn("update session status: revision conflicts exhausted")
+}
+
+// enqueueScaleDownIfDue wakes the session controller when the conversation
+// record (the fresh source of truth) says the pool is idle past its deadline.
+// Reconciliation is event-driven, so the session controller cannot discover
+// this on its own from the eventually-consistent Session status.
+func (r *conversationReconciler) enqueueScaleDownIfDue(record *conversation.Record) {
+	if record == nil || r.sessions == nil || record.Scaling == nil {
+		return
+	}
+	idle := record.Scaling.ScaleDownIdleSeconds
+	if idle <= 0 || record.Scaling.ActiveRequests > 0 || record.LastActivityAt <= 0 {
+		return
+	}
+	due := time.Unix(record.LastActivityAt, 0).Add(time.Duration(idle) * time.Second)
+	if time.Now().Before(due) {
+		return
+	}
+
+	min := int32(1)
+	if record.Scaling.MinDllamas != nil {
+		min = *record.Scaling.MinDllamas
+	}
+	if min < 0 {
+		min = 0
+	}
+
 	session, err := r.sessions.Cache().Get(record.Namespace, record.SessionName())
 	if err != nil || session == nil {
-		if err != nil && !apierrors.IsNotFound(err) {
-			r.log.WithError(err).WithField("session", record.SessionName()).Warn("get session for status sync")
-		}
 		return
 	}
-
-	needsActivity := record.LastActivityAt > 0 &&
-		(session.Status.LastActivity == nil || session.Status.LastActivity.Unix() < record.LastActivityAt)
-	needsActive := session.Status.ActiveRequests != activeRequests
-	if !needsActivity && !needsActive {
+	if session.Status.ReadyWorkers <= min {
 		return
 	}
-
-	updated := session.DeepCopy()
-	if needsActivity {
-		updated.Status.LastActivity = &metav1.Time{Time: time.Unix(record.LastActivityAt, 0).UTC()}
-	}
-	if needsActive {
-		updated.Status.ActiveRequests = activeRequests
-	}
-	if _, err := r.sessions.UpdateStatus(updated); err != nil {
-		r.log.WithError(err).WithField("session", record.SessionName()).Warn("update session status")
-	}
+	r.sessions.Enqueue(record.Namespace, record.SessionName())
 }
 
 func (r *conversationReconciler) openConnection() error {

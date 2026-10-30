@@ -1066,10 +1066,15 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 				return s.applyConversationUpdates(fresh, hash, model, active)
 			})
 			if updateErr != nil {
-				s.log.WithError(updateErr).Warn("update conversation record")
-				return record, nil
+				if !errors.Is(updateErr, nats.ErrKeyNotFound) {
+					s.log.WithError(updateErr).Warn("update conversation record")
+					return record, nil
+				}
+				// The record expired between Get and Update (KV TTL boundary):
+				// fall through and recreate it.
+			} else {
+				return updated, nil
 			}
-			return updated, nil
 		}
 		// fallthrough to create new record if parsing failed
 	} else if err != nil && err != nats.ErrKeyNotFound {
@@ -1550,6 +1555,23 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 	keepalive := time.NewTicker(interval)
 	defer keepalive.Stop()
 
+	// Run the TTL heartbeat off the SSE write path: KV calls (with retries)
+	// must not delay chunks. Ticks are dropped while a heartbeat is in flight.
+	var heartbeatCh chan struct{}
+	if heartbeat != nil {
+		heartbeatCh = make(chan struct{}, 1)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-heartbeatCh:
+					heartbeat()
+				}
+			}
+		}()
+	}
+
 	for {
 		select {
 		case msg := <-msgs:
@@ -1582,8 +1604,11 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 			writeChunk("[DONE]")
 			return
 		case <-keepalive.C:
-			if heartbeat != nil {
-				heartbeat()
+			if heartbeatCh != nil {
+				select {
+				case heartbeatCh <- struct{}{}:
+				default:
+				}
 			}
 			_, _ = fmt.Fprint(w, ": \n\n")
 			flusher.Flush()
@@ -2188,6 +2213,10 @@ func (s *Server) touchConversationActivity(hash string, now time.Time) {
 		return true
 	})
 	if err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			s.log.WithError(err).WithField("hash", hash).Debug("refresh conversation activity: record expired")
+			return
+		}
 		s.log.WithError(err).WithField("hash", hash).Warn("refresh conversation activity")
 	}
 }

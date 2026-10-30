@@ -25,7 +25,7 @@ import (
 )
 
 func newIngressSpec() *v1.IngressSpec {
-	conversationTTL := metav1.Duration{Duration: 30 * time.Second}
+	conversationTTL := metav1.Duration{Duration: 60 * time.Second}
 	responseTimeout := metav1.Duration{Duration: 45 * time.Second}
 
 	return &v1.IngressSpec{
@@ -387,7 +387,7 @@ func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {
 		"--backend-model-prefix=models",
 		"--backend-token-prefix=tokens",
 		"--backend-ttl-prefix=nats_ttl_",
-		"--backend-conversation-ttl=30s",
+		"--backend-conversation-ttl=1m0s",
 		"--backend-response-timeout=45s",
 		"--backend-session-min-dllamas=1",
 		"--backend-session-max-dllamas=3",
@@ -763,6 +763,22 @@ func TestValidateIngressSpec(t *testing.T) {
 				}
 			},
 			wantErr: "backend.sessionScaling.maxDllamas must be >= 0",
+		},
+		{
+			name: "conversation TTL below heartbeat interval",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 5 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+			},
+			wantErr: "backend.conversationTTL must be >= 10s",
+		},
+		{
+			name: "conversation TTL not greater than response timeout",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 45 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
 		},
 		{
 			name: "max dllamas less than min",
