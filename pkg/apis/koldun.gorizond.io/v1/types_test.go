@@ -2135,6 +2135,17 @@ func TestRootSpec_DeepCopy(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.spec) {
 				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.spec)
 			}
+
+			if tt.spec.SidecarTimeout != nil {
+				if got.SidecarTimeout == tt.spec.SidecarTimeout {
+					t.Error("DeepCopy() shared SidecarTimeout pointer")
+				}
+				original := tt.spec.SidecarTimeout.Duration
+				got.SidecarTimeout.Duration = time.Hour
+				if tt.spec.SidecarTimeout.Duration != original {
+					t.Error("mutating copied SidecarTimeout changed the original")
+				}
+			}
 		})
 	}
 }

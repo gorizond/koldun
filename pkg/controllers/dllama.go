@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
@@ -362,7 +363,7 @@ func workersForReplicaPower(power int32) int32 {
 
 func (h *dllamaHandler) getIngressNatsURL(dllama *v1.Dllama) string {
 	// Get all ingresses in the same namespace
-	ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything())
+	ingresses, err := h.cachedIngresses(dllama.Namespace)
 	if err != nil {
 		return ""
 	}
@@ -375,7 +376,7 @@ func (h *dllamaHandler) getIngressNatsURL(dllama *v1.Dllama) string {
 	}
 
 	// If no ingress found in same namespace, try cluster-wide search
-	allIngresses, err := h.ingresses.Cache().List("", labels.Everything())
+	allIngresses, err := h.cachedIngresses("")
 	if err != nil {
 		return ""
 	}
@@ -400,12 +401,12 @@ func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float
 		return nil
 	}
 
-	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
+	if ingresses, err := h.cachedIngresses(dllama.Namespace); err == nil {
 		if v := lookup(ingresses); v != nil {
 			return v
 		}
 	}
-	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
+	if allIngresses, err := h.cachedIngresses(""); err == nil {
 		if v := lookup(allIngresses); v != nil {
 			return v
 		}
@@ -429,12 +430,12 @@ func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
 		return 0
 	}
 
-	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
+	if ingresses, err := h.cachedIngresses(dllama.Namespace); err == nil {
 		if v := lookup(ingresses); v > 0 {
 			return v
 		}
 	}
-	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
+	if allIngresses, err := h.cachedIngresses(""); err == nil {
 		if v := lookup(allIngresses); v > 0 {
 			return v
 		}
@@ -442,33 +443,56 @@ func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
 	return 0
 }
 
+// minimumSidecarTimeout preserves the historical sidecar default. Ingresses
+// with a shorter responseTimeout (or streams, which have no backend timeout)
+// must not cause generations to be cut off sooner than before.
+const minimumSidecarTimeout = 2 * time.Minute
+
 // getIngressSidecarTimeout mirrors Ingress backend.responseTimeout so the llm
-// sidecar waits at least as long as the ingress frontend for slow generations.
-// Returns nil when no Ingress configures a positive timeout (sidecar default).
+// sidecar waits as long as the ingress frontend for slow generations.
+//
+// Selection is deterministic: only Ingresses in the Dllama namespace are
+// considered (the cluster-wide fallback used by older helpers could attach a
+// 2m timeout from an unrelated Ingress), the maximum positive timeout wins,
+// and ties are broken by Ingress name. The duration is copied, never returned
+// from the informer cache. Returns nil when nothing is configured, leaving the
+// sidecar on its 2m default.
 func (h *dllamaHandler) getIngressSidecarTimeout(dllama *v1.Dllama) *metav1.Duration {
-	if h.ingresses == nil {
-		return nil
-	}
-	lookup := func(ings []*v1.Ingress) *metav1.Duration {
-		for _, ing := range ings {
-			if ing.Spec.Backend.ResponseTimeout != nil && ing.Spec.Backend.ResponseTimeout.Duration > 0 {
-				return ing.Spec.Backend.ResponseTimeout
-			}
-		}
+	ingresses, err := h.cachedIngresses(dllama.Namespace)
+	if err != nil {
 		return nil
 	}
 
-	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
-		if v := lookup(ingresses); v != nil {
-			return v
+	var selected *v1.Ingress
+	for _, ing := range ingresses {
+		timeout := ing.Spec.Backend.ResponseTimeout
+		if timeout == nil || timeout.Duration <= 0 {
+			continue
+		}
+		if selected == nil ||
+			timeout.Duration > selected.Spec.Backend.ResponseTimeout.Duration ||
+			(timeout.Duration == selected.Spec.Backend.ResponseTimeout.Duration && ing.Name < selected.Name) {
+			selected = ing
 		}
 	}
-	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
-		if v := lookup(allIngresses); v != nil {
-			return v
-		}
+	if selected == nil {
+		return nil
 	}
-	return nil
+
+	duration := selected.Spec.Backend.ResponseTimeout.Duration
+	if duration < minimumSidecarTimeout {
+		duration = minimumSidecarTimeout
+	}
+	return &metav1.Duration{Duration: duration}
+}
+
+// cachedIngresses centralises informer lookups. A nil controller yields no
+// results instead of panicking when the Ingress controller is not wired.
+func (h *dllamaHandler) cachedIngresses(namespace string) ([]*v1.Ingress, error) {
+	if h.ingresses == nil {
+		return nil, nil
+	}
+	return h.ingresses.Cache().List(namespace, labels.Everything())
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
