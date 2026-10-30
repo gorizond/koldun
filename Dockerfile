@@ -2,12 +2,15 @@ ARG DL_REPOSITORY=https://github.com/b4rtaz/distributed-llama.git
 ARG DL_VERSION=v0.16.5
 
 FROM alpine:3.20 AS dllama-builder
+ARG TARGETARCH
 ARG DL_REPOSITORY
 ARG DL_VERSION
 RUN apk add --no-cache git make build-base
 WORKDIR /src
 RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
-RUN sed -i 's/-march=native -mtune=native/-march=x86-64-v3 -mno-abm -mtune=generic/' Makefile && \
+RUN if [ "${TARGETARCH}" = "amd64" ]; then \
+      sed -i 's/-march=native -mtune=native/-march=x86-64-v3 -mno-abm -mtune=generic/' Makefile; \
+    fi && \
     make dllama && make dllama-api && \
     DLLAMA_BIN=$(find . -maxdepth 4 -type f -name dllama -perm /111 | head -n1) && \
     DLLAMA_API_BIN=$(find . -maxdepth 4 -type f -name dllama-api -perm /111 | head -n1) && \
