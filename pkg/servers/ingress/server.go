@@ -2398,7 +2398,33 @@ func int32PointerMatches(ptr *int32, value int32) bool {
 	return ptr != nil && *ptr == value
 }
 
+// volatileConversationHeaders change between automatic retries of the same
+// logical request. When a stable conversation header is present they must not
+// split the conversation into a new Session.
+var volatileConversationHeaders = map[string]struct{}{
+	"x-request-id":            {},
+	"x-trace-id":              {},
+	"x-stainless-retry-count": {},
+}
+
+func isVolatileConversationHeader(name string) bool {
+	if _, ok := volatileConversationHeaders[name]; ok {
+		return true
+	}
+	return strings.HasPrefix(name, "x-stainless-")
+}
+
+func hasStableConversationHeader(r *http.Request) bool {
+	for _, name := range []string{"x-chat-id", "x-session-id", "x-conversation-id"} {
+		if strings.TrimSpace(r.Header.Get(name)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (string, error) {
+	stableIdentity := hasStableConversationHeader(r)
 	pairs := make([]string, 0, len(r.Header))
 	for name, values := range r.Header {
 		lower := strings.ToLower(name)
@@ -2406,6 +2432,9 @@ func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (
 			continue
 		}
 		if lower == "x-forwarded-server" {
+			continue
+		}
+		if stableIdentity && isVolatileConversationHeader(lower) {
 			continue
 		}
 		for _, v := range values {

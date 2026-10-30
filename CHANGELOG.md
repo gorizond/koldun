@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Worker CRD now persists `spec.nThreads`; `backend.nThreads` reaches worker pods instead of being pruned to `--nthreads 1`.
+- `dllama-api` serves each HTTP connection on its own thread (chat inference serialised) so `/v1/models` and health checks stay responsive during long prefills.
+- Conversation hashes ignore per-request retry headers when a stable chat id is present, preventing one retried request from creating a second Session/Dllama.
+- dllama workers retry a partially established root connection instead of exiting with code 1 during startup.
 - dllama workers now report readiness only after their weight shards are loaded (patched worker marker + readiness probe); the llm sidecar waits for `status.readyWorkers` before accepting requests.
 - `dllama-api` survives HTTP client disconnects/timeouts with a retriable 503 instead of terminating; socket read timeout is tied to the ingress sidecar timeout.
 - Existing OrderedReady worker StatefulSets are detected and rolled automatically: the worker and root StatefulSets are deleted and recreated (worker first, then root) with Parallel pod management and the weights-loaded readiness probe.

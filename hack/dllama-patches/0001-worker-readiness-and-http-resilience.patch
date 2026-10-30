@@ -1,21 +1,26 @@
 diff --git a/src/app.cpp b/src/app.cpp
-index 74016a6..26adb28 100644
+index 74016a6..8f9be1b 100644
 --- a/src/app.cpp
 +++ b/src/app.cpp
-@@ -1,5 +1,7 @@
+@@ -1,7 +1,11 @@
  #include "app.hpp"
  #include <cassert>
++#include <chrono>
 +#include <cstdio>
 +#include <cstdlib>
  #include <cstring>
  #include <stdexcept>
++#include <thread>
  #if defined(DLLAMA_VULKAN)
-@@ -304,7 +306,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
+     #include "nn/nn-vulkan.hpp"
+ #endif
+@@ -304,7 +308,14 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
  }
  
  void runWorkerApp(AppCliArgs *args) {
 +    const char *readyFilePath = std::getenv("DLLAMA_READY_FILE");
      while (true) {
++        try {
 +        // Clear the readiness marker before (re)loading so Kubernetes marks the
 +        // worker not-ready during a reload instead of advertising stale weights.
 +        if (readyFilePath != nullptr)
@@ -24,7 +29,7 @@ index 74016a6..26adb28 100644
          std::unique_ptr<NnNetwork> networkPtr = NnNetwork::serve(args->host, args->port);
          NnNetwork *network = networkPtr.get();
  
-@@ -325,6 +333,19 @@ void runWorkerApp(AppCliArgs *args) {
+@@ -325,6 +336,19 @@ void runWorkerApp(AppCliArgs *args) {
          NnWorkerWeightReader weightReader(&executor, network);
          weightReader.read();
  
@@ -44,11 +49,33 @@ index 74016a6..26adb28 100644
          WorkerLlmInference inference(&execution, network);
          bool isFirstAttempt = true;
          bool isTurboEnabled = false;
+@@ -361,5 +385,13 @@ void runWorkerApp(AppCliArgs *args) {
+                 break;
+             }
+         }
++        } catch (const NnTransferSocketException &e) {
++            // A root retry can abandon a partially established connection. Go
++            // back to accept instead of exiting/restarting the container.
++            printf("🚨 Worker connection error: %s; retrying\n", e.what());
++        } catch (const NnConnectionSocketException &e) {
++            printf("🚨 Worker connection error: %s; retrying\n", e.what());
++        }
++        std::this_thread::sleep_for(std::chrono::seconds(1));
+     }
+ }
 diff --git a/src/dllama-api.cpp b/src/dllama-api.cpp
-index a170e91..2d0de24 100644
+index a170e91..663ba42 100644
 --- a/src/dllama-api.cpp
 +++ b/src/dllama-api.cpp
-@@ -17,6 +17,7 @@
+@@ -9,6 +9,7 @@
+ #include <vector>
+ #include <string>
+ #include <csignal>
++#include <mutex>
+ #include <thread>
+ #include <chrono>
+ 
+@@ -17,6 +18,7 @@
  #include <ws2tcpip.h>
  #else
  #include <sys/socket.h>
@@ -56,7 +83,7 @@ index a170e91..2d0de24 100644
  #include <netinet/in.h>
  #include <unistd.h>
  #endif
-@@ -598,6 +599,24 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
+@@ -598,6 +600,55 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
      request.writeJson(response);
  }
  
@@ -78,35 +105,60 @@ index a170e91..2d0de24 100644
 +#endif
 +}
 +
++static void handleHttpClient(int fd, std::vector<Route> *routes, std::mutex *inferenceMutex) {
++    NnSocket clientSocket(fd);
++    try {
++        configureHttpClientSocket(clientSocket.fd);
++
++        HttpRequest request = HttpRequest::read(clientSocket.fd);
++        printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
++        if (request.path == "/v1/chat/completions") {
++            // Inference is stateful; serialise chat requests while still
++            // serving /v1/models and health checks from other threads.
++            std::lock_guard<std::mutex> lock(*inferenceMutex);
++            Router::resolve(request, *routes);
++        } else {
++            Router::resolve(request, *routes);
++        }
++    } catch (const NnTransferSocketException& e) {
++        printf("Socket error: %d %s\n", e.code, e.what());
++    } catch (const NnExecutorException &e) {
++        printf("🚨 Inference error: %s\n", e.what());
++    } catch (const std::exception &e) {
++        // A client disconnect (llm sidecar timeout, pod shutdown) must not
++        // terminate dllama-api: answer 503 so callers can retry and keep
++        // serving subsequent requests.
++        printf("🚨 HTTP client error: %s\n", e.what());
++        if (clientSocket.fd >= 0) {
++            const char *response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
++            send(clientSocket.fd, response, std::strlen(response), 0);
++        }
++    }
++}
++
  static void server(AppInferenceContext *context) {
      NnSocket serverSocket(createServerSocket(context->args->host, context->args->port));
  
-@@ -624,8 +643,11 @@ static void server(AppInferenceContext *context) {
+@@ -623,16 +674,14 @@ static void server(AppInferenceContext *context) {
+         }
      };
  
++    std::mutex inferenceMutex;
      while (true) {
-+        NnSocket clientSocket;
++        int clientFd = acceptSocket(serverSocket.fd);
          try {
 -            NnSocket clientSocket(acceptSocket(serverSocket.fd));
-+            clientSocket.assign(acceptSocket(serverSocket.fd));
-+            configureHttpClientSocket(clientSocket.fd);
-+
-             HttpRequest request = HttpRequest::read(clientSocket.fd);
-             printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
-             Router::resolve(request, routes);
-@@ -633,6 +655,15 @@ static void server(AppInferenceContext *context) {
-             printf("Socket error: %d %s\n", e.code, e.what());
-         } catch (const NnExecutorException &e) {
-             throw;
+-            HttpRequest request = HttpRequest::read(clientSocket.fd);
+-            printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
+-            Router::resolve(request, routes);
+-        } catch (const NnTransferSocketException& e) {
+-            printf("Socket error: %d %s\n", e.code, e.what());
+-        } catch (const NnExecutorException &e) {
+-            throw;
++            std::thread(handleHttpClient, clientFd, &routes, &inferenceMutex).detach();
 +        } catch (const std::exception &e) {
-+            // A client disconnect (llm sidecar timeout, pod shutdown) must not
-+            // terminate dllama-api: answer 503 so callers can retry and keep
-+            // serving subsequent requests.
-+            printf("🚨 HTTP client error: %s\n", e.what());
-+            if (clientSocket.fd >= 0) {
-+                const char *response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-+                send(clientSocket.fd, response, std::strlen(response), 0);
-+            }
++            printf("🚨 Cannot spawn HTTP handler: %s\n", e.what());
++            close(clientFd);
          }
      }
  }

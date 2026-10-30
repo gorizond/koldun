@@ -571,6 +571,37 @@ func TestConversationHashFromHeadersWithSecret(t *testing.T) {
 	assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), actual)
 }
 
+func TestConversationHashStableAcrossRetriesWithChatID(t *testing.T) {
+	hashFor := func(requestID, traceID, retry string) string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("X-Chat-Id", "stable-chat")
+		req.Header.Set("X-Request-Id", requestID)
+		req.Header.Set("X-Trace-Id", traceID)
+		req.Header.Set("X-Stainless-Retry-Count", retry)
+		req.Header.Set("User-Agent", "ingress-test")
+		hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+		require.NoError(t, err)
+		return hash
+	}
+
+	first := hashFor("req-1", "trace-1", "0")
+	require.Equal(t, first, hashFor("req-2", "trace-2", "1"),
+		"retries with the same stable chat id must keep one session")
+}
+
+func TestConversationHashKeepsRequestIDWithoutStableChatID(t *testing.T) {
+	hashFor := func(requestID string) string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		req.Header.Set("X-Request-Id", requestID)
+		req.Header.Set("User-Agent", "ingress-test")
+		hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
+		require.NoError(t, err)
+		return hash
+	}
+	require.NotEqual(t, hashFor("req-1"), hashFor("req-2"),
+		"without a stable chat id, request ids remain the conversation identity")
+}
+
 func TestConversationHashFromHeadersScopesByModel(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set("X-Chat-Id", "shared-chat")
