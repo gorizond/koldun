@@ -1,7 +1,10 @@
 # distributed-llama patches
 
-`Dockerfile` clones upstream `b4rtaz/distributed-llama` at `DL_VERSION`
-(currently v0.16.5) and applies `*.patch` from this directory.
+`Dockerfile` builds dllama from the fork `gorizond/distributed-llama`, pinned by
+the annotated tag `v0.16.5-koldun.1` (commit `e4d522a6`). That tag already
+contains `0001-worker-readiness-and-http-resilience.patch`, so the `Dockerfile`
+no longer clones upstream or applies `*.patch`. This directory is kept as the
+source of truth for the patch and its history.
 
 - `0001-worker-readiness-and-http-resilience.patch`:
   - worker writes `$DLLAMA_READY_FILE` after `weightReader.read()` (and removes
