@@ -1,5 +1,5 @@
 diff --git a/src/app.cpp b/src/app.cpp
-index 74016a6..8f9be1b 100644
+index 74016a6..6822892 100644
 --- a/src/app.cpp
 +++ b/src/app.cpp
 @@ -1,7 +1,11 @@
@@ -49,7 +49,7 @@ index 74016a6..8f9be1b 100644
          WorkerLlmInference inference(&execution, network);
          bool isFirstAttempt = true;
          bool isTurboEnabled = false;
-@@ -361,5 +385,13 @@ void runWorkerApp(AppCliArgs *args) {
+@@ -361,5 +385,16 @@ void runWorkerApp(AppCliArgs *args) {
                  break;
              }
          }
@@ -60,22 +60,31 @@ index 74016a6..8f9be1b 100644
 +        } catch (const NnConnectionSocketException &e) {
 +            printf("🚨 Worker connection error: %s; retrying\n", e.what());
 +        }
++        // Do not advertise loaded weights while backing off.
++        if (readyFilePath != nullptr)
++            std::remove(readyFilePath);
 +        std::this_thread::sleep_for(std::chrono::seconds(1));
      }
  }
 diff --git a/src/dllama-api.cpp b/src/dllama-api.cpp
-index a170e91..663ba42 100644
+index a170e91..712ce10 100644
 --- a/src/dllama-api.cpp
 +++ b/src/dllama-api.cpp
-@@ -9,6 +9,7 @@
+@@ -8,15 +8,20 @@
+ #include <algorithm>
  #include <vector>
  #include <string>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
  #include <csignal>
++#include <memory>
 +#include <mutex>
  #include <thread>
- #include <chrono>
+-#include <chrono>
  
-@@ -17,6 +18,7 @@
+ #ifdef _WIN32
+ #include <winsock2.h>
  #include <ws2tcpip.h>
  #else
  #include <sys/socket.h>
@@ -83,7 +92,7 @@ index a170e91..663ba42 100644
  #include <netinet/in.h>
  #include <unistd.h>
  #endif
-@@ -598,6 +600,55 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
+@@ -598,6 +603,78 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
      request.writeJson(response);
  }
  
@@ -105,25 +114,48 @@ index a170e91..663ba42 100644
 +#endif
 +}
 +
-+static void handleHttpClient(int fd, std::vector<Route> *routes, std::mutex *inferenceMutex) {
++const int maxHttpConnections = 8;
++
++// Inference is stateful; /v1/models and other metadata routes do not touch the
++// inference engine and may run concurrently with a long chat prefill.
++static bool requiresInferenceLock(const char *path) {
++    return std::strcmp(path, "/v1/chat/completions") == 0;
++}
++
++struct HttpServerState {
++    std::vector<Route> routes;
++    std::mutex inferenceMutex;
++    std::mutex activeMutex;
++    std::condition_variable activeCv;
++    std::atomic<bool> fatal{false};
++    int listenFd = -1;
++    int active = 0;
++};
++
++static void handleHttpClient(int fd, std::shared_ptr<HttpServerState> state) {
 +    NnSocket clientSocket(fd);
 +    try {
 +        configureHttpClientSocket(clientSocket.fd);
 +
 +        HttpRequest request = HttpRequest::read(clientSocket.fd);
 +        printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
-+        if (request.path == "/v1/chat/completions") {
-+            // Inference is stateful; serialise chat requests while still
-+            // serving /v1/models and health checks from other threads.
-+            std::lock_guard<std::mutex> lock(*inferenceMutex);
-+            Router::resolve(request, *routes);
++        if (requiresInferenceLock(request.path.c_str())) {
++            // Serialise chat requests while still serving /v1/models and
++            // health checks from other threads.
++            std::lock_guard<std::mutex> lock(state->inferenceMutex);
++            Router::resolve(request, state->routes);
 +        } else {
-+            Router::resolve(request, *routes);
++            Router::resolve(request, state->routes);
 +        }
 +    } catch (const NnTransferSocketException& e) {
 +        printf("Socket error: %d %s\n", e.code, e.what());
 +    } catch (const NnExecutorException &e) {
-+        printf("🚨 Inference error: %s\n", e.what());
++        // The root must rebuild its network, exactly as the upstream main loop
++        // did before HTTP serving became threaded. Signal server() to stop
++        // accepting and wake it from acceptSocket().
++        printf("🚨 Inference error: %s; restarting network\n", e.what());
++        state->fatal.store(true);
++        shutdown(state->listenFd, 2);
 +    } catch (const std::exception &e) {
 +        // A client disconnect (llm sidecar timeout, pod shutdown) must not
 +        // terminate dllama-api: answer 503 so callers can retry and keep
@@ -139,13 +171,16 @@ index a170e91..663ba42 100644
  static void server(AppInferenceContext *context) {
      NnSocket serverSocket(createServerSocket(context->args->host, context->args->port));
  
-@@ -623,16 +674,14 @@ static void server(AppInferenceContext *context) {
+@@ -623,18 +700,66 @@ static void server(AppInferenceContext *context) {
          }
      };
  
-+    std::mutex inferenceMutex;
++    auto state = std::make_shared<HttpServerState>();
++    state->routes = std::move(routes);
++    state->listenFd = serverSocket.fd;
++
      while (true) {
-+        int clientFd = acceptSocket(serverSocket.fd);
++        int clientFd = -1;
          try {
 -            NnSocket clientSocket(acceptSocket(serverSocket.fd));
 -            HttpRequest request = HttpRequest::read(clientSocket.fd);
@@ -155,10 +190,68 @@ index a170e91..663ba42 100644
 -            printf("Socket error: %d %s\n", e.code, e.what());
 -        } catch (const NnExecutorException &e) {
 -            throw;
-+            std::thread(handleHttpClient, clientFd, &routes, &inferenceMutex).detach();
++            clientFd = acceptSocket(serverSocket.fd);
 +        } catch (const std::exception &e) {
++            if (state->fatal.load())
++                break;
++            // Transient accept errors (ECONNABORTED, EMFILE, ...) must not
++            // abort the root; pause briefly and keep accepting.
++            printf("🚨 Accept error: %s\n", e.what());
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            continue;
++        }
++        if (state->fatal.load()) {
++            close(clientFd);
++            break;
++        }
++
++        bool admitted = false;
++        {
++            std::lock_guard<std::mutex> lock(state->activeMutex);
++            if (state->active < maxHttpConnections) {
++                state->active++;
++                admitted = true;
++            }
++        }
++        if (!admitted) {
++            const char *busy = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
++            send(clientFd, busy, std::strlen(busy), 0);
++            close(clientFd);
++            continue;
++        }
++
++        try {
++            std::thread([state, clientFd]() {
++                handleHttpClient(clientFd, state);
++                {
++                    std::lock_guard<std::mutex> lock(state->activeMutex);
++                    state->active--;
++                }
++                state->activeCv.notify_all();
++            }).detach();
++        } catch (const std::exception &e) {
++            {
++                std::lock_guard<std::mutex> lock(state->activeMutex);
++                state->active--;
++            }
 +            printf("🚨 Cannot spawn HTTP handler: %s\n", e.what());
 +            close(clientFd);
          }
      }
++
++    // Keep the state (and the ApiServer captured by routes) alive until all
++    // handlers have returned; upstream then rebuilds NnNetwork on retry.
++    std::unique_lock<std::mutex> lock(state->activeMutex);
++    state->activeCv.wait(lock, [&state] { return state->active == 0; });
  }
+ 
+ #ifdef _WIN32
+@@ -675,6 +800,8 @@ int main(int argc, char *argv[]) {
+ 
+     initQuants();
+     initSockets();
++    assert(requiresInferenceLock("/v1/chat/completions"));
++    assert(!requiresInferenceLock("/v1/models"));
+ 
+     while (true) {
+         try {
