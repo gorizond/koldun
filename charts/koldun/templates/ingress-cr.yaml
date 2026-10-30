@@ -25,6 +25,10 @@ spec:
 {{- if and $metrics (not (hasKey $spec.backend "dispatcherMetricsListen")) }}
   {{- $_ := set $spec.backend "dispatcherMetricsListen" $metrics }}
 {{- end }}
+{{- $payload := $.Values.ingressDefaults.natsMaxPayload }}
+{{- if and $payload (not (hasKey $spec.backend "natsMaxPayload")) }}
+  {{- $_ := set $spec.backend "natsMaxPayload" $payload }}
+{{- end }}
 {{ toYaml $spec | indent 2 }}
 ---
 {{- end }}

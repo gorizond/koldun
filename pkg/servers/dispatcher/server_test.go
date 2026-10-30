@@ -260,18 +260,19 @@ func TestSelectWorker_IdleWorkerSelected(t *testing.T) {
 
 	worker := srv.selectWorker()
 	assert.NotEmpty(t, worker, "should select an idle worker")
-	// Should select the least recently used idle worker (worker1)
-	assert.Equal(t, "worker1", worker)
+	assert.NotEqual(t, "worker2", worker, "busy workers must not be selected")
+	// Deterministic selection keeps the same instance for a stable pool.
+	assert.Equal(t, worker, srv.selectWorker())
 }
 
 // TestSnapshotWorkerStats validates worker statistics calculation.
 func TestSnapshotWorkerStats(t *testing.T) {
 	srv := &Server{
 		workers: map[string]*workerState{
-			"worker1": {state: "idle", active: 0},
-			"worker2": {state: "busy", active: 1},
-			"worker3": {state: "idle", active: 0},
-			"worker4": {state: "processing", active: 1},
+			"worker1": {state: "idle", active: 0, lastHeartbeat: time.Now()},
+			"worker2": {state: "busy", active: 1, lastHeartbeat: time.Now()},
+			"worker3": {state: "idle", active: 0, lastHeartbeat: time.Now()},
+			"worker4": {state: "processing", active: 1, lastHeartbeat: time.Now()},
 		},
 		inflight: map[string]*assignment{
 			"assign-1": {assignmentID: "assign-1"},
@@ -1249,8 +1250,8 @@ func TestRecoverAssignmentsDeleteError(t *testing.T) {
 
 	// Verify message was still requeued despite delete error
 	rec := srv.nc.(*testhelpers.RecordingNATSConn)
-	assert.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, 2*time.Second, 10*time.Millisecond)
+	assert.Equal(t, "test.backlog", rec.Messages()[0].Subject)
 }
 
 func TestRecoverAssignmentsNoKeysFound(t *testing.T) {
@@ -1285,13 +1286,14 @@ func TestRequeueAssignmentPublishesBacklog(t *testing.T) {
 		payload:   []byte(`{"foo":"bar"}`),
 	}
 
-	srv.requeueAssignment(asn)
+	srv.requeueAssignment(asn, "requeue test")
 
-	require.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, time.Second, 10*time.Millisecond)
+	published := rec.Messages()
+	assert.Equal(t, "test.backlog", published[0].Subject)
 
 	var backlog conversation.BacklogMessage
-	require.NoError(t, json.Unmarshal(rec.Published[0].Data, &backlog))
+	require.NoError(t, json.Unmarshal(published[0].Data, &backlog))
 	assert.Equal(t, "req-1", backlog.ID)
 	assert.NotEmpty(t, backlog.Payload)
 }
@@ -1313,10 +1315,10 @@ func TestRequeueAssignmentLogsPublishError(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		srv.requeueAssignment(asn)
+		srv.requeueAssignment(asn, "requeue test")
 	})
-	require.Len(t, rec.Published, 1)
-	assert.Equal(t, "test.backlog", rec.Published[0].Subject)
+	require.Eventually(t, func() bool { return len(rec.Messages()) == 1 }, time.Second, 10*time.Millisecond)
+	assert.Equal(t, "test.backlog", rec.Messages()[0].Subject)
 }
 
 func TestDispatcherIntegration(t *testing.T) {

@@ -1,9 +1,25 @@
 package conversation
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/nats-io/nats.go"
+)
+
+const (
+	// DefaultBucket is the JetStream KeyValue bucket holding conversation records.
+	DefaultBucket = "koldun_ttl"
+	// DefaultTTLPrefix is the key prefix used for conversation records.
+	DefaultTTLPrefix = "nats_ttl_"
+
+	updateRecordRetries = 3
 )
 
 // Record is persisted in JetStream KeyValue entries (nats_ttl_<hash>) to describe
@@ -23,6 +39,15 @@ type Record struct {
 	NATS                    NATSConfig            `json:"nats"`
 	Queue                   *QueueConfig          `json:"queue,omitempty"`
 	Scaling                 *SessionScalingConfig `json:"scaling,omitempty"`
+
+	// PinnedDllama records the worker the dispatcher prefers for this conversation.
+	PinnedDllama string `json:"pinnedDllama,omitempty"`
+	// Cursor is the number of chat messages already acknowledged by the client.
+	Cursor int `json:"cursor,omitempty"`
+	// MessageHash is the prefix hash of the first Cursor messages.
+	MessageHash string `json:"messageHash,omitempty"`
+	// LastActivityAt is the unix timestamp of the most recent request.
+	LastActivityAt int64 `json:"lastActivityAt,omitempty"`
 }
 
 // QueueConfig stores optional NATS backlog configuration for a session.
@@ -30,6 +55,7 @@ type QueueConfig struct {
 	BacklogSubject        string `json:"backlogSubject,omitempty"`
 	ResponseSubjectPrefix string `json:"responseSubjectPrefix,omitempty"`
 	AssignmentsBucket     string `json:"assignmentsBucket,omitempty"`
+	ConversationBucket    string `json:"conversationBucket,omitempty"`
 	DllamaSubjectPrefix   string `json:"dllamaSubjectPrefix,omitempty"`
 	StateStream           string `json:"stateStream,omitempty"`
 }
@@ -259,4 +285,118 @@ func truncateIdentifier(value string, max int) string {
 		return value
 	}
 	return value[:max]
+}
+
+// MessageCount returns the number of entries in the request "messages" array.
+func MessageCount(raw []byte) (int, error) {
+	var envelope struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return 0, fmt.Errorf("unmarshal messages: %w", err)
+	}
+	return len(envelope.Messages), nil
+}
+
+// CanonicalMessages returns the canonical JSON encoding of a chat-completion
+// body: compacted and HTML-escaped exactly the way encoding/json re-encodes
+// json.RawMessage. It is idempotent, so hashing canonical bytes on both the
+// ingress and the worker side yields the same value even when the client sends
+// pretty-printed JSON or strings containing <, > or &.
+func CanonicalMessages(raw []byte) []byte {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(json.RawMessage(raw))
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	return encoded
+}
+
+// PrefixHash returns a stable SHA-256 hash over the raw bytes of the first n
+// messages. Working on raw JSON preserves unknown fields, so the hash matches
+// byte-for-byte across requests.
+func PrefixHash(raw []byte, n int) (string, error) {
+	if n <= 0 {
+		return "", nil
+	}
+	var envelope struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", fmt.Errorf("unmarshal messages: %w", err)
+	}
+	if n > len(envelope.Messages) {
+		n = len(envelope.Messages)
+	}
+	digest := sha256.New()
+	var size [8]byte
+	for i := 0; i < n; i++ {
+		binary.BigEndian.PutUint64(size[:], uint64(len(envelope.Messages[i])))
+		_, _ = digest.Write(size[:])
+		_, _ = digest.Write(envelope.Messages[i])
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// KV is the subset of the NATS KeyValue API required to update conversation
+// records. Both nats.KeyValue and natsutil.NATSKeyValue satisfy it.
+type KV interface {
+	Get(key string) (nats.KeyValueEntry, error)
+	Update(key string, value []byte, revision uint64) (uint64, error)
+}
+
+// UpdateRecord reads, mutates and writes a record using compare-and-swap so
+// concurrent writers (ingress, dispatcher, operator) do not lose fields.
+// The record is never created; a missing key returns ErrKeyNotFound.
+func UpdateRecord(kv KV, key string, mutate func(*Record) bool) (*Record, error) {
+	if kv == nil {
+		return nil, errors.New("kv is required")
+	}
+	if mutate == nil {
+		return nil, errors.New("mutate is required")
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < updateRecordRetries; attempt++ {
+		entry, err := kv.Get(key)
+		if err != nil {
+			return nil, fmt.Errorf("get record %s: %w", key, err)
+		}
+		record, err := ParseRecord(entry.Value())
+		if err != nil {
+			return nil, err
+		}
+		if !mutate(record) {
+			return record, nil
+		}
+		data, err := record.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := kv.Update(key, data, entry.Revision()); err != nil {
+			if !isRevisionConflict(err) {
+				return nil, fmt.Errorf("update record %s: %w", key, err)
+			}
+			lastErr = err
+			continue
+		}
+		return record, nil
+	}
+	return nil, fmt.Errorf("update record %s: %w", key, lastErr)
+}
+
+func isRevisionConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, nats.ErrKeyExists) {
+		return true
+	}
+	var apiErr *nats.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode == nats.JSErrCodeStreamWrongLastSequence
+	}
+	return false
 }

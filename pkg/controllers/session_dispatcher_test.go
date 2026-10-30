@@ -47,7 +47,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-queue-group=session-dispatchers",
 				"--dispatcher-ack-wait=30s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "trimmed hash and URL",
@@ -70,7 +70,7 @@ func TestDispatcherArgs(t *testing.T) {
 				"--dispatcher-nats-url=nats://localhost:4222",
 				"--dispatcher-ack-wait=1m0s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "different ack wait durations",
@@ -91,7 +91,7 @@ func TestDispatcherArgs(t *testing.T) {
 			expectedContains: []string{
 				"--dispatcher-ack-wait=5m0s",
 			},
-			expectedLen: 9,
+			expectedLen: 10,
 		},
 		{
 			name: "metrics listener flag is appended",
@@ -113,7 +113,7 @@ func TestDispatcherArgs(t *testing.T) {
 			expectedContains: []string{
 				"--dispatcher-metrics-listen=:9100",
 			},
-			expectedLen: 10,
+			expectedLen: 11,
 		},
 	}
 
@@ -294,4 +294,42 @@ func TestEnsureTrailingDot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDispatcherArgsConversationBucket(t *testing.T) {
+	sess := &v1.Session{
+		Spec: v1.SessionSpec{
+			Hash:  "hash",
+			NATS:  &v1.SessionNATSConfig{URL: "nats://nats:4222"},
+			Queue: &v1.SessionQueueSpec{ConversationBucket: "custom_conversations"},
+		},
+	}
+
+	args := dispatcherArgs(sess, "backlog", "assignments", "dllama.", "state.", "group", time.Minute)
+	if !containsString(args, "--dispatcher-conversation-bucket=custom_conversations") {
+		t.Fatalf("expected custom conversation bucket in %v", args)
+	}
+
+	sess.Spec.Queue = nil
+	args = dispatcherArgs(sess, "backlog", "assignments", "dllama.", "state.", "group", time.Minute)
+	if !containsString(args, "--dispatcher-conversation-bucket=koldun_ttl") {
+		t.Fatalf("expected default conversation bucket in %v", args)
+	}
+
+	sess.Spec.Queue = &v1.SessionQueueSpec{ConversationBucket: "   "}
+	if got := sessionConversationBucket(sess); got != "koldun_ttl" {
+		t.Fatalf("blank bucket should fall back to the default, got %q", got)
+	}
+	if got := sessionConversationBucket(nil); got != "koldun_ttl" {
+		t.Fatalf("nil session should fall back to the default, got %q", got)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

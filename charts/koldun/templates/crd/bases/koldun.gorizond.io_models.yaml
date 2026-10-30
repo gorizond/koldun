@@ -176,6 +176,12 @@ spec:
                 description: LocalPath is the path/prefix on the cache backend where
                   the artifacts will reside.
                 type: string
+              maxSeqLen:
+                description: |-
+                  MaxSeqLen is the model context window passed to distributed-llama
+                  (--max-seq-len) and the local llm sidecar. Defaults to 4096.
+                format: int32
+                type: integer
               objectStorage:
                 description: ObjectStorage describes access to object storage buckets
                   used for downloading and conversion output.

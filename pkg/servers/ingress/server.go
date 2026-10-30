@@ -80,6 +80,9 @@ const (
 	defaultModelPrefix        = registry.DefaultModelPrefix
 	defaultTokenPrefix        = registry.DefaultTokenPrefix
 	tokenCacheTTL             = 5 * time.Minute
+	defaultMaxSeqLen          = 4096
+	defaultNATSMaxPayload     = 1 << 20 // stock NATS max_payload (bytes)
+	backlogEnvelopeReserve    = 512     // room for ids/subjects when sizing the backlog message
 
 	llmRequestStreamName = "KOLDUN_LLM_REQUESTS"
 
@@ -121,6 +124,12 @@ type Config struct {
 	AllowAnonymous bool
 
 	ReplicaPower int32
+
+	// MaxSeqLen caps the prompt token budget accepted by the backend.
+	MaxSeqLen int
+	// NATSMaxPayload is the NATS max_payload budget in bytes. Backlog messages
+	// are capped at half of it, leaving headroom for assignment envelopes.
+	NATSMaxPayload int
 
 	DisableThinkFilter bool
 
@@ -234,6 +243,12 @@ func New(cfg Config) (*Server, error) {
 	if cfg.ReplicaPower < 0 {
 		cfg.ReplicaPower = 0
 	}
+	if cfg.MaxSeqLen <= 0 {
+		cfg.MaxSeqLen = defaultMaxSeqLen
+	}
+	if cfg.NATSMaxPayload <= 0 {
+		cfg.NATSMaxPayload = defaultNATSMaxPayload
+	}
 
 	log := cfg.Logger
 	if log == nil {
@@ -261,7 +276,7 @@ func New(cfg Config) (*Server, error) {
 		Bucket:  cfg.ConversationBucket,
 		TTL:     cfg.ConversationTTL,
 		History: 1,
-	})
+	}, log)
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("conversation kv bucket: %w", err)
@@ -270,7 +285,7 @@ func New(cfg Config) (*Server, error) {
 	modelsKV, err := ensureBucket(js, &nats.KeyValueConfig{
 		Bucket:  cfg.ModelsBucket,
 		History: 1,
-	})
+	}, log)
 	if err != nil {
 		raw.Close()
 		return nil, fmt.Errorf("models kv bucket: %w", err)
@@ -281,7 +296,7 @@ func New(cfg Config) (*Server, error) {
 		tokensKV, err = ensureBucket(js, &nats.KeyValueConfig{
 			Bucket:  cfg.TokensBucket,
 			History: 1,
-		})
+		}, log)
 		if err != nil {
 			raw.Close()
 			return nil, fmt.Errorf("tokens kv bucket: %w", err)
@@ -309,7 +324,7 @@ func New(cfg Config) (*Server, error) {
 	return srv, nil
 }
 
-func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig) (nats.KeyValue, error) {
+func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig, log *logrus.Entry) (nats.KeyValue, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("bucket name cannot be empty")
 	}
@@ -328,10 +343,15 @@ func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig) (nats.KeyV
 	if desired := cfg.TTL; desired > 0 {
 		current := status.TTL()
 		if current <= 0 || absDuration(current-desired) > time.Second {
-			if dErr := js.DeleteKeyValue(cfg.Bucket); dErr != nil {
-				return nil, fmt.Errorf("delete kv bucket %s: %w", cfg.Bucket, dErr)
+			// Never delete an existing bucket: it holds pins, cursors and
+			// session state. Keep using it and surface the mismatch instead.
+			if log != nil {
+				log.WithFields(logrus.Fields{
+					"bucket":     cfg.Bucket,
+					"want_ttl":   desired,
+					"actual_ttl": current,
+				}).Warn("conversation bucket TTL differs from configuration; keeping existing bucket")
 			}
-			return js.CreateKeyValue(cfg)
 		}
 	}
 
@@ -633,10 +653,24 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		tokenHash = sha256Hex(token)
 	}
 
-	payload, err := readAll(r)
+	payload, err := readAll(r, s.maxRequestBodyBytes())
 	if err != nil {
+		if errors.Is(err, errBodyTooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
+			return
+		}
 		s.log.WithError(err).Warn("read request body")
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	// Canonicalise once: the hash and the bytes forwarded to the sidecar must
+	// be identical (compaction and HTML escaping are not stable across
+	// marshal/unmarshal round trips otherwise).
+	canonical := conversation.CanonicalMessages(payload)
+	// HTML escaping can inflate the body several times over, so admission is
+	// decided on the canonical size, not on what the client uploaded.
+	if int64(len(canonical)) > s.maxCanonicalBodyBytes() {
+		writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
 		return
 	}
 
@@ -663,6 +697,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	model, err := s.resolveModel(req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	maxSeqLen := s.cfg.MaxSeqLen
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	if tokens := estimatePromptTokens(&req); tokens > maxSeqLen {
+		metrics.ContextOverflowTotal.WithLabelValues("ingress").Inc()
+		writeJSON(w, http.StatusBadRequest, contextLengthExceededBody(maxSeqLen))
 		return
 	}
 
@@ -745,16 +789,28 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	requestID := newRequestID()
 
+	// The conversation record carries the client cursor and the hash of the
+	// prefix it already knows, so workers can detect instance changes.
+	messageCount := len(req.Messages)
+	prefixHash := ""
+	if messageCount > 0 {
+		prefixHash, _ = conversation.PrefixHash(canonical, messageCount)
+	}
+
+	// Send the raw body only: duplicating the parsed request would roughly
+	// double the NATS payload and hit max_payload much earlier.
 	reqPayload := struct {
-		Hash            string                       `json:"hash"`
-		ChatID          string                       `json:"chatId"`
-		ChatStart       string                       `json:"chatStart"`
-		TokenHash       string                       `json:"tokenHash"`
-		Model           string                       `json:"model"`
-		Namespace       string                       `json:"namespace"`
-		Request         openai.ChatCompletionRequest `json:"request"`
-		ResponseSubject string                       `json:"responseSubject"`
-		RequestID       string                       `json:"requestId"`
+		Hash            string          `json:"hash"`
+		ChatID          string          `json:"chatId"`
+		ChatStart       string          `json:"chatStart"`
+		TokenHash       string          `json:"tokenHash"`
+		Model           string          `json:"model"`
+		Namespace       string          `json:"namespace"`
+		ResponseSubject string          `json:"responseSubject"`
+		RequestID       string          `json:"requestId"`
+		Cursor          int             `json:"cursor,omitempty"`
+		PrefixHash      string          `json:"prefixHash,omitempty"`
+		Raw             json.RawMessage `json:"raw,omitempty"`
 	}{
 		Hash:            hash,
 		ChatID:          chatID,
@@ -762,9 +818,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		TokenHash:       tokenHash,
 		Model:           record.Model,
 		Namespace:       record.Namespace,
-		Request:         req,
 		ResponseSubject: responseSubject,
 		RequestID:       requestID,
+		Cursor:          record.Cursor,
+		PrefixHash:      record.MessageHash,
+		Raw:             json.RawMessage(canonical),
 	}
 
 	payloadBody, err := json.Marshal(reqPayload)
@@ -783,12 +841,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to marshal backlog envelope")
 		return
 	}
+	if int64(len(body)) > s.maxBacklogBytes() {
+		writeJSON(w, http.StatusRequestEntityTooLarge, bodyTooLargeBody(s.maxCanonicalBodyBytes()))
+		return
+	}
 
 	if err := s.raw.Publish(backlogSubject, body); err != nil {
 		s.log.WithError(err).Error("publish request")
 		writeError(w, http.StatusBadGateway, "failed to enqueue request")
 		return
 	}
+
+	s.touchConversationRecord(hash, messageCount, prefixHash, time.Now())
 
 	if req.Stream {
 		s.streamResponse(respCtx, w, msgs)
@@ -801,9 +865,36 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if status := errorResponseStatus(msg.Data); status != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(msg.Data)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(msg.Data)
+}
+
+// errorResponseStatus maps structured error payloads to HTTP statuses so
+// non-streaming clients do not receive a 200 with an error body.
+func errorResponseStatus(body []byte) int {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return 0
+	}
+	switch envelope.Error.Code {
+	case "context_length_exceeded":
+		return http.StatusBadRequest
+	case "inference_failed":
+		return http.StatusBadGateway
+	}
+	return 0
 }
 
 func (s *Server) ensureConversation(ctx context.Context, hash string, model *registry.Model, active int32) (*conversation.Record, error) {
@@ -879,6 +970,10 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 			assignmentsBucket := assignmentsBucketName(hash)
 			if record.Queue.AssignmentsBucket != assignmentsBucket {
 				record.Queue.AssignmentsBucket = assignmentsBucket
+				recordChanged = true
+			}
+			if record.Queue.ConversationBucket != s.cfg.ConversationBucket {
+				record.Queue.ConversationBucket = s.cfg.ConversationBucket
 				recordChanged = true
 			}
 			stateStream := stateStreamName(hash)
@@ -968,6 +1063,7 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 			BacklogSubject:        sessionBacklogSubject(hash),
 			ResponseSubjectPrefix: responseSubjectPrefix(s.cfg.OutPrefix, hash),
 			AssignmentsBucket:     assignmentsBucketName(hash),
+			ConversationBucket:    s.cfg.ConversationBucket,
 			DllamaSubjectPrefix:   dllamaSubjectPrefix(hash),
 			StateStream:           stateStreamName(hash),
 		},
@@ -1847,6 +1943,12 @@ func longestDetailsSuffix(s string) int {
 }
 
 func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (string, error) {
+	// Error payloads (sidecar failures, context overflow) have no choices and
+	// must reach the client untouched.
+	if hasErrorField([]byte(raw)) {
+		return raw, nil
+	}
+
 	var chunk streamingChunk
 	if err := json.Unmarshal([]byte(raw), &chunk); err != nil {
 		return raw, nil
@@ -1895,6 +1997,9 @@ func normaliseStreamingChunk(raw string, state *streamingNormaliserState) (strin
 }
 
 func isEmptyDeltaChunk(payload string) bool {
+	if hasErrorField([]byte(payload)) {
+		return false
+	}
 	var chunk streamingChunk
 	if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 		return false
@@ -1910,14 +2015,151 @@ func isEmptyDeltaChunk(payload string) bool {
 	return true
 }
 
+// hasErrorField reports whether the JSON object carries a non-empty error.
+func hasErrorField(raw []byte) bool {
+	var envelope struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return false
+	}
+	value := strings.TrimSpace(string(envelope.Error))
+	return value != "" && value != "null" && value != `""`
+}
+
+// estimatePromptTokens approximates the prompt token count from the UTF-8 byte
+// size of roles, content, tool calls and tool definitions (4 bytes per token).
+func estimatePromptTokens(req *openai.ChatCompletionRequest) int {
+	if req == nil {
+		return 2
+	}
+	total := 0
+	for _, message := range req.Messages {
+		total += len(message.Role) + len(message.Content) + 4
+		if len(message.ToolCalls) > 0 {
+			if data, err := json.Marshal(message.ToolCalls); err == nil {
+				total += len(data)
+			}
+		}
+	}
+	if len(req.Tools) > 0 {
+		if data, err := json.Marshal(req.Tools); err == nil {
+			total += len(data)
+		}
+	}
+	if req.ToolChoice != nil {
+		if data, err := json.Marshal(req.ToolChoice); err == nil {
+			total += len(data)
+		}
+	}
+	return total/4 + 2
+}
+
+func contextLengthExceededBody(maxSeqLen int) map[string]any {
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	return map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("context_length_exceeded: maximum context length is %d tokens", maxSeqLen),
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    "context_length_exceeded",
+		},
+	}
+}
+
+// touchConversationRecord persists the client cursor after the request is
+// enqueued. Failures are logged only: the request already has a worker.
+func (s *Server) touchConversationRecord(hash string, count int, prefixHash string, now time.Time) {
+	if s.convKV == nil {
+		return
+	}
+	key := s.cfg.TTLPrefix + hash
+	activity := now.Unix()
+	_, err := conversation.UpdateRecord(s.convKV, key, func(record *conversation.Record) bool {
+		changed := false
+		if record.Cursor != count {
+			record.Cursor = count
+			changed = true
+		}
+		if record.MessageHash != prefixHash {
+			record.MessageHash = prefixHash
+			changed = true
+		}
+		if record.LastActivityAt != activity {
+			record.LastActivityAt = activity
+			changed = true
+		}
+		return changed
+	})
+	if err != nil {
+		s.log.WithError(err).WithField("hash", hash).Warn("update conversation cursor")
+	}
+}
+
 func sha256Hex(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }
 
-func readAll(r *http.Request) ([]byte, error) {
+var errBodyTooLarge = errors.New("request body exceeds the configured limit")
+
+// readAll reads at most limit bytes and fails instead of truncating.
+func readAll(r *http.Request, limit int64) ([]byte, error) {
 	defer r.Body.Close()
-	return io.ReadAll(io.LimitReader(r.Body, 20<<20))
+	if limit <= 0 {
+		limit = defaultNATSMaxPayload / 2
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errBodyTooLarge
+	}
+	return data, nil
+}
+
+func (s *Server) natsPayloadBudget() int64 {
+	budget := s.cfg.NATSMaxPayload
+	if budget <= 0 {
+		budget = defaultNATSMaxPayload
+	}
+	return int64(budget)
+}
+
+// maxBacklogBytes is the largest marshaled backlog message we publish: half of
+// the NATS budget, so assignment envelopes and headers still fit.
+func (s *Server) maxBacklogBytes() int64 {
+	return s.natsPayloadBudget() / 2
+}
+
+// maxCanonicalBodyBytes is the largest canonical request body that still
+// leaves room for the backlog envelope.
+func (s *Server) maxCanonicalBodyBytes() int64 {
+	limit := s.maxBacklogBytes() - backlogEnvelopeReserve
+	if limit <= 0 {
+		return s.maxBacklogBytes()
+	}
+	return limit
+}
+
+// maxRequestBodyBytes bounds how much we read before canonicalisation; pretty
+// printed JSON shrinks during canonicalisation, so allow a multiple of the
+// effective limit.
+func (s *Server) maxRequestBodyBytes() int64 {
+	return s.maxBacklogBytes() * 4
+}
+
+func bodyTooLargeBody(limit int64) map[string]any {
+	return map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("request body exceeds %d bytes", limit),
+			"type":    "invalid_request_error",
+			"code":    "request_too_large",
+		},
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

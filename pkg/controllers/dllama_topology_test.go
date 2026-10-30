@@ -1084,3 +1084,37 @@ func TestEnsureStatusZeroReplicaPowerDefaultsToOne(t *testing.T) {
 	_, err := handler.ensureStatus(dllama)
 	require.NoError(t, err)
 }
+
+func TestDesiredRootUsesModelMaxSeqLen(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+	ingressCache.EXPECT().List("models", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
+	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{{}}, nil).AnyTimes()
+
+	handler := &dllamaHandler{ingresses: ingressController}
+
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+		Spec: v1.DllamaSpec{
+			ModelRef:    v1.ModelReference{Kind: "Model", Name: "demo-model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+		},
+	}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-model", Namespace: "models"},
+		Spec:       v1.ModelSpec{MaxSeqLen: 8192},
+		Status:     v1.ModelStatus{OutputPVCName: "model-pvc"},
+	}
+
+	root := handler.desiredRoot(dllama, model)
+	require.Equal(t, int32(8192), root.Spec.MaxSeqLen, "the model defines the context window")
+
+	model.Spec.MaxSeqLen = 0
+	root = handler.desiredRoot(dllama, model)
+	require.Equal(t, defaultMaxSeqLen, root.Spec.MaxSeqLen)
+}

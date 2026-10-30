@@ -121,6 +121,10 @@ spec:
                   backlogSubject:
                     description: BacklogSubject stores pending user messages.
                     type: string
+                  conversationBucket:
+                    description: ConversationBucket stores conversation records (worker
+                      affinity, cursors).
+                    type: string
                   dllamaSubjectPrefix:
                     description: DllamaSubjectPrefix prefixes per-dllama request subjects
                       (must end with '.').

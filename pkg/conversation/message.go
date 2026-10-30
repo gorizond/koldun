@@ -7,12 +7,15 @@ type BacklogMessage struct {
 	ID        string          `json:"id"`
 	Payload   json.RawMessage `json:"payload"`
 	CreatedAt int64           `json:"createdAt,omitempty"`
+	// Attempts counts how many times the dispatcher has requeued this request.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // AssignmentEnvelope wraps a backlog payload for delivery to a specific Dllama worker.
 type AssignmentEnvelope struct {
 	AssignmentID string          `json:"assignmentId"`
 	RequestID    string          `json:"requestId"`
+	Attempts     int             `json:"attempts,omitempty"`
 	Payload      json.RawMessage `json:"payload"`
 }
 

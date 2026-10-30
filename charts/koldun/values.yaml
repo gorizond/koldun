@@ -241,6 +241,10 @@ ingresses: []
 ingressDefaults:
   # Dispatcher metrics listener added to spec.backend.dispatcherMetricsListen when not overridden per ingress.
   dispatcherMetricsListen: ":9090"
+  # NATS max_payload budget added to spec.backend.natsMaxPayload when not
+  # overridden per ingress. Backlog messages are capped at half of this value;
+  # raise it together with the NATS server max_payload (stock NATS is 1 MiB).
+  natsMaxPayload: 1048576
 # - name: example
 #   namespace: default
 #   dispatcherMetricsListen: ":9090" # override per-ingress or set to "" to disable while leaving defaults intact.

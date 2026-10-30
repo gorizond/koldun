@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorizond/koldun/pkg/api/openai"
@@ -93,6 +94,8 @@ type Config struct {
 	SidecarMonitorInterval  time.Duration
 	SidecarFailureThreshold int
 	HeartbeatInterval       time.Duration
+	// MaxSeqLen is the model context window used for overflow detection.
+	MaxSeqLen int
 
 	Logger *logrus.Entry
 }
@@ -125,6 +128,11 @@ type Server struct {
 	sidecarMonitorInterval  time.Duration
 	sidecarFailureThreshold int
 
+	sessionOnce sync.Once
+	chats       *chatCache
+	dedup       *dedupCache
+	inFlight    atomic.Bool
+
 	wg sync.WaitGroup
 }
 
@@ -138,6 +146,12 @@ type inboundRequest struct {
 	Request         openai.ChatCompletionRequest `json:"request"`
 	ResponseSubject string                       `json:"responseSubject"`
 	RequestID       string                       `json:"requestId,omitempty"`
+	// Cursor is the number of chat messages the record already knows about.
+	Cursor int `json:"cursor,omitempty"`
+	// PrefixHash is the hash of the first Cursor messages supplied by ingress.
+	PrefixHash string `json:"prefixHash,omitempty"`
+	// Raw preserves the original chat-completion JSON for byte-exact proxying.
+	Raw json.RawMessage `json:"raw,omitempty"`
 }
 
 // New constructs the LLM server and initialises the required clients.
@@ -189,6 +203,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = defaultHeartbeatInterval
+	}
+	if cfg.MaxSeqLen <= 0 {
+		cfg.MaxSeqLen = defaultMaxSeqLen
 	}
 
 	log := cfg.Logger
@@ -245,7 +262,23 @@ func New(cfg Config) (*Server, error) {
 		sidecarMonitorInterval:  cfg.SidecarMonitorInterval,
 		sidecarFailureThreshold: cfg.SidecarFailureThreshold,
 	}
+	srv.initSessionState()
+	metrics.LLMMaxSeqLen.Set(float64(cfg.MaxSeqLen))
+	log.WithField("maxSeqLen", cfg.MaxSeqLen).Info("llm context accounting configured")
 	return srv, nil
+}
+
+// initSessionState lazily initialises the per-pod caches. Tests construct
+// Server values directly, so nil caches must remain usable.
+func (s *Server) initSessionState() {
+	s.sessionOnce.Do(func() {
+		if s.chats == nil {
+			s.chats = newChatCache(chatCacheMaxEntries, chatCacheTTL)
+		}
+		if s.dedup == nil {
+			s.dedup = newDedupCache(dedupMaxEntries, dedupTTL, dedupMaxBytes)
+		}
+	})
 }
 
 // Run starts the subscription loop and health endpoint until the context is cancelled.
@@ -437,6 +470,7 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 
 	s.wg.Add(1)
 	defer s.wg.Done()
+	s.initSessionState()
 
 	var envelope conversation.AssignmentEnvelope
 	if err := json.Unmarshal(msg.Data, &envelope); err != nil {
@@ -456,6 +490,16 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		_ = msg.Term()
 		return
 	}
+	// Ingress sends the raw body only; canonicalise it once so the bytes we
+	// hash are exactly the bytes the sidecar receives. Older payloads without
+	// raw fall back to the parsed request.
+	if len(bytes.TrimSpace(payload.Raw)) > 0 {
+		payload.Raw = conversation.CanonicalMessages(payload.Raw)
+		var decoded openai.ChatCompletionRequest
+		if err := json.Unmarshal(payload.Raw, &decoded); err == nil {
+			payload.Request = decoded
+		}
+	}
 
 	assignmentID := envelope.AssignmentID
 	if assignmentID == "" {
@@ -465,6 +509,11 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		assignmentID = durableName(fmt.Sprintf("%s-%d", s.cfg.DllamaName, time.Now().UnixNano()))
 	}
 
+	target := strings.TrimSpace(payload.ResponseSubject)
+	if target == "" {
+		target = s.outSubject
+	}
+
 	s.log.WithFields(logrus.Fields{
 		"hash":         payload.Hash,
 		"chatId":       payload.ChatID,
@@ -472,47 +521,87 @@ func (s *Server) handleMessage(msg *nats.Msg) {
 		"assignmentId": assignmentID,
 	}).Info("processing request")
 
+	// JetStream redelivers the same request id after a worker restart; never
+	// execute it twice. Completed entries replay, running entries are dropped.
+	requestKey := strings.TrimSpace(payload.RequestID)
+	if replay, proceed := s.dedup.Begin(requestKey, target); !proceed {
+		if replay != nil {
+			for _, chunk := range replay {
+				if err := s.nc.Publish(target, chunk); err != nil {
+					s.log.WithError(err).Warn("replay duplicate chunk")
+				}
+			}
+			if err := s.nc.Publish(target, []byte("[DONE]")); err != nil {
+				s.log.WithError(err).Warn("replay duplicate done marker")
+			}
+			metrics.LLMDedupTotal.WithLabelValues("replayed").Inc()
+			s.log.WithField("requestId", requestKey).Info("replayed completed request")
+		} else {
+			metrics.LLMDedupTotal.WithLabelValues("skipped").Inc()
+			s.log.WithField("requestId", requestKey).Info("skipped duplicate request")
+		}
+		// Duplicates never reach the normal completion path; publish idle so
+		// the dispatcher does not leak the inflight assignment.
+		s.publishState("idle", assignmentID, 0, "")
+		if err := msg.Ack(); err != nil {
+			s.log.WithError(err).Warn("ack duplicate request")
+		}
+		return
+	}
+
 	// Track active requests
 	metrics.LLMRequestsActive.Inc()
 	defer metrics.LLMRequestsActive.Dec()
 
 	start := time.Now()
+	s.inFlight.Store(true)
 	s.publishState("busy", assignmentID, 1, "")
-	ackMode := "ack"
 	defer func() {
-		duration := time.Since(start)
-		metrics.LLMRequestDuration.Observe(duration.Seconds())
-
-		if ackMode == "ack" {
-			if err := msg.Ack(); err != nil {
-				s.log.WithError(err).Warn("ack request message")
-			}
-			return
-		}
-		if err := msg.Nak(); err != nil {
-			s.log.WithError(err).Warn("nak request message")
+		s.inFlight.Store(false)
+		metrics.LLMRequestDuration.Observe(time.Since(start).Seconds())
+		// Always ack: the dispatcher requeues on state=error, while NAKing a
+		// partially delivered stream would duplicate text.
+		if err := msg.Ack(); err != nil {
+			s.log.WithError(err).Warn("ack request message")
 		}
 	}()
 
+	class := s.classify(&payload)
+	s.recordHistoryMetrics(&payload, class)
+
+	recorder := &chunkRecorder{coldStart: class.cold, startedAt: start}
 	var err error
 	if payload.Request.Stream {
-		err = s.streamToSidecar(payload)
+		err = s.streamToSidecar(payload, recorder)
 	} else {
-		err = s.executeOnce(payload)
+		err = s.executeOnce(payload, recorder)
 	}
 	if err != nil {
 		metrics.LLMRequestsTotal.WithLabelValues("error").Inc()
+		if errors.Is(err, errStreamCommitted) {
+			s.log.WithError(err).Warn("stream aborted after response started")
+			chunks, truncated := recorder.snapshot()
+			s.dedup.Complete(requestKey, chunks, truncated)
+			s.publishState("idle", assignmentID, 0, "")
+			return
+		}
+		s.dedup.Fail(requestKey)
 		s.publishState("error", assignmentID, 0, err.Error())
 		s.log.WithError(err).Warn("request handling failed")
-		ackMode = "nak"
 		return
 	}
 
 	metrics.LLMRequestsTotal.WithLabelValues("success").Inc()
+	s.rememberChat(&payload)
+	chunks, truncated := recorder.snapshot()
+	s.dedup.Complete(requestKey, chunks, truncated)
 	s.publishState("idle", assignmentID, 0, "")
 }
 
-func (s *Server) streamToSidecar(payload inboundRequest) error {
+func (s *Server) streamToSidecar(payload inboundRequest, recorder *chunkRecorder) error {
+	if recorder == nil {
+		recorder = &chunkRecorder{}
+	}
 	target := strings.TrimSpace(payload.ResponseSubject)
 	if target == "" {
 		target = s.outSubject
@@ -524,10 +613,13 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 		return err
 	}
 
-	body, err := json.Marshal(payload.Request)
-	if err != nil {
-		s.log.WithError(err).Error("marshal request")
-		return err
+	body := payload.Raw
+	if len(bytes.TrimSpace(body)) == 0 {
+		body, err = json.Marshal(payload.Request)
+		if err != nil {
+			s.log.WithError(err).Error("marshal request")
+			return err
+		}
 	}
 
 	req, err := http.NewRequest(http.MethodPost, endpoint.String(), bytes.NewReader(body))
@@ -542,17 +634,21 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 
 	res, err := s.client.Do(req)
 	if err != nil {
+		metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token").Inc()
 		s.log.WithError(err).Error("sidecar request failed")
-		s.publishError(target, fmt.Sprintf("sidecar request failed: %v", err))
-		return err
+		return fmt.Errorf("sidecar request failed: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
-		s.publishError(target, err.Error())
-		return err
+		sidecarErr := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		if isContextOverflowText(sidecarErr.Error()) {
+			s.publishContextOverflow(target, recorder)
+			return errStreamCommitted
+		}
+		metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token").Inc()
+		return sidecarErr
 	}
 
 	scanner := bufio.NewScanner(res.Body)
@@ -565,23 +661,51 @@ func (s *Server) streamToSidecar(payload inboundRequest) error {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
+		if strings.EqualFold(line, "[DONE]") {
+			continue
+		}
 		normalized := normalizeStreamingChunk([]byte(line), payload.Request.Model)
-		if err := s.nc.Publish(target, normalized); err != nil {
+		if text := streamingErrorText(normalized); text != "" && isContextOverflowText(text) {
+			s.publishContextOverflow(target, recorder)
+			return errStreamCommitted
+		}
+		if err := s.publishChunk(target, recorder, normalized, chunkHasContent(normalized)); err != nil {
 			s.log.WithError(err).Warn("publish chunk")
+			if recorder.hasToken() {
+				metrics.LLMStreamAbortsTotal.WithLabelValues("post_token").Inc()
+				return errStreamCommitted
+			}
+			metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token").Inc()
+			return err
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		s.log.WithError(err).Warn("stream read error")
+		if recorder.hasToken() {
+			metrics.LLMStreamAbortsTotal.WithLabelValues("post_token").Inc()
+			s.publishStreamInterrupted(target, err, recorder)
+			return errStreamCommitted
+		}
+		metrics.LLMStreamAbortsTotal.WithLabelValues("pre_token").Inc()
 		return err
 	}
 	if err := s.nc.Publish(target, []byte("[DONE]")); err != nil {
 		s.log.WithError(err).Warn("publish done marker")
+		if recorder.hasToken() {
+			// The client already received the full text; retrying would
+			// duplicate it, so treat the stream as committed.
+			metrics.LLMStreamAbortsTotal.WithLabelValues("post_token").Inc()
+			return errStreamCommitted
+		}
 		return err
 	}
 	return nil
 }
 
-func (s *Server) executeOnce(payload inboundRequest) error {
+func (s *Server) executeOnce(payload inboundRequest, recorder *chunkRecorder) error {
+	if recorder == nil {
+		recorder = &chunkRecorder{}
+	}
 	target := strings.TrimSpace(payload.ResponseSubject)
 	if target == "" {
 		target = s.outSubject
@@ -593,10 +717,13 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 		return err
 	}
 
-	body, err := json.Marshal(payload.Request)
-	if err != nil {
-		s.log.WithError(err).Error("marshal request")
-		return err
+	body := payload.Raw
+	if len(bytes.TrimSpace(body)) == 0 {
+		body, err = json.Marshal(payload.Request)
+		if err != nil {
+			s.log.WithError(err).Error("marshal request")
+			return err
+		}
 	}
 
 	reqCtx := context.Background()
@@ -622,9 +749,13 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 
 	if res.StatusCode < http.StatusOK || res.StatusCode >= http.StatusMultipleChoices {
 		respBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		err := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
-		s.publishError(target, err.Error())
-		return err
+		sidecarErr := fmt.Errorf("sidecar responded %d: %s", res.StatusCode, strings.TrimSpace(string(respBody)))
+		if isContextOverflowText(sidecarErr.Error()) {
+			s.publishContextOverflow(target, recorder)
+			return errStreamCommitted
+		}
+		s.publishError(target, sidecarErr.Error())
+		return sidecarErr
 	}
 
 	limit := int64(maxNonStreamResponseSize)
@@ -649,7 +780,7 @@ func (s *Server) executeOnce(payload inboundRequest) error {
 	// Normalize response for OpenAI API compatibility
 	normalized := normalizeChatCompletionResponse(trimmed, payload.Request.Model)
 
-	if err := s.nc.Publish(target, normalized); err != nil {
+	if err := s.publishChunk(target, recorder, normalized, true); err != nil {
 		return fmt.Errorf("publish response: %w", err)
 	}
 
@@ -708,8 +839,8 @@ func (s *Server) startConsumerCleanup(ctx context.Context) {
 }
 
 func (s *Server) startHeartbeatLoop(ctx context.Context) {
-	// Emit an immediate idle heartbeat so the dispatcher can register this worker.
-	s.publishState("idle", "", 0, "")
+	// Emit an immediate heartbeat so the dispatcher can register this worker.
+	s.publishHeartbeat()
 
 	s.wg.Add(1)
 	go func() {
@@ -728,10 +859,21 @@ func (s *Server) startHeartbeatLoop(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.publishState("idle", "", 0, "")
+				s.publishHeartbeat()
 			}
 		}
 	}()
+}
+
+// publishHeartbeat reports busy while a request is in flight. An unconditional
+// idle heartbeat would make a busy worker look free within one interval and
+// defeat per-worker serialisation.
+func (s *Server) publishHeartbeat() {
+	if s.inFlight.Load() {
+		s.publishState("busy", "", 1, "")
+		return
+	}
+	s.publishState("idle", "", 0, "")
 }
 
 func (s *Server) ensureQueueSubscription(queueName string, ackWait time.Duration) (*nats.Subscription, error) {

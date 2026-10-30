@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorizond/koldun/pkg/controllers"
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/gorizond/koldun/pkg/kube"
 	"github.com/gorizond/koldun/pkg/servers/dispatcher"
 	"github.com/gorizond/koldun/pkg/servers/ingress"
@@ -106,6 +107,7 @@ func main() {
 		llmNamespace               string
 		llmSidecarMonitorInterval  time.Duration
 		llmSidecarFailureThreshold int
+		llmMaxSeqLen               int
 
 		// Backend flags
 		backendListen                         string
@@ -133,17 +135,20 @@ func main() {
 		backendRootImage                      string
 		backendWorkerImage                    string
 		backendDisableThinkFilter             bool
+		backendMaxSeqLen                      int
+		backendNATSMaxPayload                 int
 
 		// Dispatcher flags
-		dispatcherHash              string
-		dispatcherNATSURL           string
-		dispatcherBacklogSubject    string
-		dispatcherAssignmentsBucket string
-		dispatcherDllamaPrefix      string
-		dispatcherStatePrefix       string
-		dispatcherQueueGroup        string
-		dispatcherAckWait           time.Duration
-		dispatcherMetricsListen     string
+		dispatcherHash               string
+		dispatcherNATSURL            string
+		dispatcherBacklogSubject     string
+		dispatcherAssignmentsBucket  string
+		dispatcherDllamaPrefix       string
+		dispatcherStatePrefix        string
+		dispatcherQueueGroup         string
+		dispatcherAckWait            time.Duration
+		dispatcherMetricsListen      string
+		dispatcherConversationBucket string
 
 		// Operator conversation/registry flags
 		operatorNATSURL             string
@@ -176,6 +181,7 @@ func main() {
 	fs.StringVar(&llmNamespace, "llm-namespace", os.Getenv("POD_NAMESPACE"), "Namespace containing the dllama resource (defaults to pod namespace when available)")
 	fs.DurationVar(&llmSidecarMonitorInterval, "llm-sidecar-monitor-interval", 60*time.Second, "Interval between dllama-api health probes")
 	fs.IntVar(&llmSidecarFailureThreshold, "llm-sidecar-failure-threshold", 10, "Consecutive failed dllama-api probes before the worker evicts itself")
+	fs.IntVar(&llmMaxSeqLen, "llm-max-seq-len", 4096, "Maximum sequence length of the local dllama-api model (used for context accounting)")
 
 	fs.StringVar(&dispatcherHash, "dispatcher-hash", "", "Conversation hash this dispatcher serves")
 	fs.StringVar(&dispatcherNATSURL, "dispatcher-nats-url", "nats://nats.default:4222", "NATS endpoint for dispatcher")
@@ -186,6 +192,7 @@ func main() {
 	fs.StringVar(&dispatcherQueueGroup, "dispatcher-queue-group", "", "Queue group name for backlog consumption")
 	fs.DurationVar(&dispatcherAckWait, "dispatcher-ack-wait", 2*time.Minute, "Ack wait for backlog messages")
 	fs.StringVar(&dispatcherMetricsListen, "dispatcher-metrics-listen", "", "Listen address for dispatcher metrics and health endpoints (empty disables)")
+	fs.StringVar(&dispatcherConversationBucket, "dispatcher-conversation-bucket", conversation.DefaultBucket, "JetStream KV bucket holding conversation records (worker affinity)")
 
 	fs.StringVar(&backendListen, "backend-listen", ":8082", "Backend HTTP listen address")
 	fs.StringVar(&backendNamespace, "backend-namespace", "default", "Namespace for Dllama resources")
@@ -212,6 +219,8 @@ func main() {
 	fs.StringVar(&backendWorkerImage, "backend-worker-image", "", "Container image for Dllama worker pods")
 	fs.BoolVar(&backendDisableThinkFilter, "backend-disable-think-filter", false, "Disable think tag redaction in streaming responses")
 	fs.IntVar(&backendReplicaPower, "backend-replica-power", 0, "Override replica power for Sessions created by the backend (0 uses model setting)")
+	fs.IntVar(&backendMaxSeqLen, "backend-max-seq-len", 4096, "Maximum context length accepted by the backend (prompt tokens)")
+	fs.IntVar(&backendNATSMaxPayload, "backend-nats-max-payload", 1<<20, "NATS max_payload budget in bytes; backlog messages are capped at half of it (raise together with NATS max_payload)")
 
 	fs.StringVar(&operatorNATSURL, "operator-nats-url", "", "NATS endpoint used by the operator to reconcile conversations and publish registry data")
 	fs.StringVar(&operatorKVBucket, "operator-kv-bucket", "", "JetStream KeyValue bucket containing conversation records")
@@ -277,6 +286,7 @@ func main() {
 			SidecarTimeout:          llmSidecarTimeout,
 			SidecarMonitorInterval:  llmSidecarMonitorInterval,
 			SidecarFailureThreshold: llmSidecarFailureThreshold,
+			MaxSeqLen:               llmMaxSeqLen,
 			HealthOnly:              llmHealthOnly,
 		})
 	case "backend", "ingress":
@@ -306,6 +316,8 @@ func main() {
 			AllowAnonymous:                 backendAllowAnonymous,
 			DisableThinkFilter:             backendDisableThinkFilter,
 			ReplicaPower:                   int32(backendReplicaPower),
+			MaxSeqLen:                      backendMaxSeqLen,
+			NATSMaxPayload:                 backendNATSMaxPayload,
 		})
 	case "dispatcher":
 		statePrefix := strings.TrimSpace(dispatcherStatePrefix)
@@ -326,6 +338,7 @@ func main() {
 			QueueGroup:          dispatcherQueueGroup,
 			AckWait:             dispatcherAckWait,
 			MetricsAddr:         dispatcherMetricsListen,
+			ConversationBucket:  dispatcherConversationBucket,
 		})
 	default:
 		logrus.Fatalf("unknown mode %q", mode)

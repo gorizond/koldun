@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -357,7 +358,7 @@ func TestResponseSubjectPrefix(t *testing.T) {
 	}
 }
 
-func TestEnsureBucketCreatesAndRecreates(t *testing.T) {
+func TestEnsureBucketKeepsExistingBucketOnTTLChange(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping JetStream integration test in short mode")
 	}
@@ -365,7 +366,7 @@ func TestEnsureBucketCreatesAndRecreates(t *testing.T) {
 	ns := startIngressJetStream(t)
 	js, _ := connectIngressJetStream(t, ns)
 
-	_, err := ensureBucket(js, &nats.KeyValueConfig{})
+	_, err := ensureBucket(js, &nats.KeyValueConfig{}, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "bucket name cannot be empty")
 
@@ -373,20 +374,29 @@ func TestEnsureBucketCreatesAndRecreates(t *testing.T) {
 		Bucket: "testbucket",
 		TTL:    time.Minute,
 	}
-	kv, err := ensureBucket(js, cfg)
+	kv, err := ensureBucket(js, cfg, nil)
 	require.NoError(t, err)
 
 	status, err := kv.Status()
 	require.NoError(t, err)
 	require.InDelta(t, cfg.TTL.Seconds(), status.TTL().Seconds(), 1.0)
 
-	cfg.TTL = 2 * time.Minute
-	kv, err = ensureBucket(js, cfg)
+	_, err = kv.Put("conv", []byte("pinned"))
 	require.NoError(t, err)
+
+	// A TTL mismatch must not delete the bucket: pins and cursors live there.
+	cfg.TTL = 2 * time.Minute
+	kv, err = ensureBucket(js, cfg, logrus.NewEntry(logrus.New()))
+	require.NoError(t, err)
+	require.Equal(t, "testbucket", kv.Bucket())
 
 	status, err = kv.Status()
 	require.NoError(t, err)
-	require.InDelta(t, cfg.TTL.Seconds(), status.TTL().Seconds(), 1.0)
+	require.InDelta(t, time.Minute.Seconds(), status.TTL().Seconds(), 1.0)
+
+	entry, err := kv.Get("conv")
+	require.NoError(t, err)
+	require.Equal(t, []byte("pinned"), entry.Value())
 }
 
 func TestEnsureRequestStreamCreatesAndUpdates(t *testing.T) {
@@ -3835,4 +3845,536 @@ func TestRegistryModelReadyReturnsTrueForValidModelWithBytes(t *testing.T) {
 
 	ready := registryModelReady(model)
 	assert.True(t, ready)
+}
+
+func TestHandleChatCompletionsRejectsOversizedPrompt(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous: true,
+			MaxSeqLen:      8,
+			Namespace:      "test-ns",
+			TTLPrefix:      "nats_ttl_",
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				model := &registry.Model{
+					Namespace:           "test-ns",
+					Name:                "test-model",
+					OutputPVCName:       "pvc",
+					ConversionSizeHuman: "1Gi",
+				}
+				data, _ := json.Marshal(model)
+				return &kvEntryStub{value: data}, nil
+			},
+		},
+	}
+
+	body := strings.NewReader(`{"model":"test-ns/test-model","messages":[{"role":"user","content":"` + strings.Repeat("x", 200) + `"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var payload struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Equal(t, "context_length_exceeded", payload.Error.Code)
+	require.Equal(t, "invalid_request_error", payload.Error.Type)
+	require.Contains(t, payload.Error.Message, "maximum context length is 8 tokens")
+}
+
+func TestServeTouchConversationRecord(t *testing.T) {
+	t.Parallel()
+
+	record := &conversation.Record{
+		Hash:        "conv",
+		Namespace:   "ns",
+		Model:       "ns/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+	}
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+
+	var stored []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 7}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			require.Equal(t, uint64(7), revision)
+			stored = append([]byte(nil), value...)
+			return 8, nil
+		},
+	}
+
+	srv := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	now := time.Unix(1700000123, 0)
+	srv.touchConversationRecord("conv", 3, "deadbeef", now)
+
+	require.NotNil(t, stored)
+	parsed, err := conversation.ParseRecord(stored)
+	require.NoError(t, err)
+	require.Equal(t, 3, parsed.Cursor)
+	require.Equal(t, "deadbeef", parsed.MessageHash)
+	require.Equal(t, now.Unix(), parsed.LastActivityAt)
+}
+
+func TestNormaliseStreamingChunkPreservesErrorPayload(t *testing.T) {
+	t.Parallel()
+
+	state := &streamingNormaliserState{}
+	raw := `{"error":{"message":"upstream stream interrupted: boom","type":"server_error","code":"stream_interrupted"}}`
+
+	normalised, err := normaliseStreamingChunk(raw, state)
+	require.NoError(t, err)
+	require.JSONEq(t, raw, normalised)
+	require.False(t, isEmptyDeltaChunk(normalised), "error payloads must reach the client")
+
+	stringError := `{"error":"sidecar responded 500"}`
+	normalised, err = normaliseStreamingChunk(stringError, state)
+	require.NoError(t, err)
+	require.JSONEq(t, stringError, normalised)
+	require.False(t, isEmptyDeltaChunk(normalised))
+}
+
+func TestEstimatePromptTokensCountsBytesAndTools(t *testing.T) {
+	t.Parallel()
+
+	// "привет" is 12 UTF-8 bytes, not 6 runes.
+	req := &openai.ChatCompletionRequest{
+		Messages: []openai.ChatMessage{{Role: "user", Content: "привет"}},
+	}
+	require.Equal(t, (4+12+4)/4+2, estimatePromptTokens(req))
+
+	withToolCall := &openai.ChatCompletionRequest{
+		Messages: []openai.ChatMessage{{
+			Role:    "assistant",
+			Content: "",
+			ToolCalls: []openai.ToolCall{{
+				ID:       "call-1",
+				Type:     "function",
+				Function: openai.FunctionCall{Name: "lookup", Arguments: `{"q":"weather"}`},
+			}},
+		}},
+	}
+	require.Greater(t, estimatePromptTokens(withToolCall), estimatePromptTokens(req))
+
+	withTools := &openai.ChatCompletionRequest{
+		Messages: []openai.ChatMessage{{Role: "user", Content: "hi"}},
+		Tools: []openai.Tool{{
+			Type:     "function",
+			Function: openai.Function{Name: "lookup", Parameters: map[string]interface{}{"type": "object"}},
+		}},
+	}
+	require.Greater(t, estimatePromptTokens(withTools), estimatePromptTokens(req))
+}
+
+func TestErrorResponseStatus(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, http.StatusBadRequest, errorResponseStatus([]byte(`{"error":{"code":"context_length_exceeded","message":"x"}}`)))
+	require.Equal(t, http.StatusBadGateway, errorResponseStatus([]byte(`{"error":{"code":"inference_failed","message":"x"}}`)))
+	require.Zero(t, errorResponseStatus([]byte(`{"error":"plain failure"}`)))
+	require.Zero(t, errorResponseStatus([]byte(`{"object":"chat.completion"}`)))
+}
+
+func TestHandleChatCompletionsRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			NATSMaxPayload:  100, // 50-byte body cap
+			ResponseTimeout: time.Second,
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(strings.Repeat("x", 200)))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	var payload map[string]map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Equal(t, "request_too_large", payload["error"]["code"])
+}
+
+func TestHandleChatCompletionsPublishesCanonicalRawOnly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  true,
+		ResponseTimeout: 3 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+	})
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelPayload, err := json.Marshal(registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	})
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	pretty := "{\n  \"model\": \"tenant/chat-1\",\n  \"messages\": [{\"role\": \"user\", \"content\": \"a & b <tag>\"}]\n}"
+	extended := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"a & b <tag>"},{"role":"assistant","content":"ok"},{"role":"user","content":"next"}]}`
+
+	newRequest := func(body string) *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "ingress-test")
+		return req
+	}
+
+	hash, err := conversationHashFromHeaders(newRequest(pretty), nil)
+	require.NoError(t, err)
+	backlogSubject := sessionBacklogSubject(hash)
+
+	// Keep the load above one so the handler does not spend the response
+	// timeout waiting for a worker that does not exist in this test.
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	backlogConn, err := nats.Connect(srv.cfg.NATSURL, nats.Timeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { backlogConn.Close() })
+
+	sub, err := backlogConn.SubscribeSync(backlogSubject)
+	require.NoError(t, err)
+	require.NoError(t, backlogConn.Flush())
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	type captured struct {
+		raw        []byte
+		prefixHash string
+		cursor     int
+		hasRequest bool
+	}
+	resultCh := make(chan captured, 2)
+	errCh := make(chan error, 2)
+
+	go func() {
+		pubConn, pubErr := nats.Connect(srv.cfg.NATSURL, nats.Timeout(2*time.Second))
+		if pubErr != nil {
+			errCh <- pubErr
+			return
+		}
+		defer pubConn.Close()
+
+		for i := 0; i < 2; i++ {
+			msg, msgErr := sub.NextMsg(5 * time.Second)
+			if msgErr != nil {
+				errCh <- msgErr
+				return
+			}
+			var backlog conversation.BacklogMessage
+			if uErr := json.Unmarshal(msg.Data, &backlog); uErr != nil {
+				errCh <- uErr
+				return
+			}
+			var payload map[string]json.RawMessage
+			if uErr := json.Unmarshal(backlog.Payload, &payload); uErr != nil {
+				errCh <- uErr
+				return
+			}
+			var raw json.RawMessage
+			if value, ok := payload["raw"]; ok {
+				if uErr := json.Unmarshal(value, &raw); uErr != nil {
+					errCh <- uErr
+					return
+				}
+			}
+			var prefix string
+			if value, ok := payload["prefixHash"]; ok {
+				if uErr := json.Unmarshal(value, &prefix); uErr != nil {
+					errCh <- uErr
+					return
+				}
+			}
+			var cursor int
+			if value, ok := payload["cursor"]; ok {
+				if uErr := json.Unmarshal(value, &cursor); uErr != nil {
+					errCh <- uErr
+					return
+				}
+			}
+			_, hasRequest := payload["request"]
+			resultCh <- captured{raw: raw, prefixHash: prefix, cursor: cursor, hasRequest: hasRequest}
+
+			var subject string
+			if value, ok := payload["responseSubject"]; ok {
+				_ = json.Unmarshal(value, &subject)
+			}
+			if pubErr = pubConn.Publish(subject, []byte(`{"object":"chat.completion"}`)); pubErr != nil {
+				errCh <- pubErr
+				return
+			}
+			_ = pubConn.Flush()
+		}
+	}()
+
+	first := httptest.NewRecorder()
+	srv.handleChatCompletions(first, newRequest(pretty))
+	require.Equal(t, http.StatusOK, first.Code)
+
+	second := httptest.NewRecorder()
+	srv.handleChatCompletions(second, newRequest(extended))
+	require.Equal(t, http.StatusOK, second.Code)
+
+	canonical1 := conversation.CanonicalMessages([]byte(pretty))
+	canonical2 := conversation.CanonicalMessages([]byte(extended))
+	hash1, err := conversation.PrefixHash(canonical1, 1)
+	require.NoError(t, err)
+	hash2, err := conversation.PrefixHash(canonical2, 1)
+	require.NoError(t, err)
+	require.Equal(t, hash1, hash2, "canonical prefix hashes must agree across formatting")
+	storedHash, err := conversation.PrefixHash(canonical2, 3)
+	require.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err)
+		case captured := <-resultCh:
+			require.False(t, captured.hasRequest, "the parsed request must not be duplicated in the payload")
+			require.NotContains(t, string(captured.raw), "\n", "raw body must be compact")
+			if i == 0 {
+				require.Equal(t, canonical1, []byte(captured.raw))
+				require.Zero(t, captured.cursor)
+				require.Empty(t, captured.prefixHash, "the first request has no previous prefix")
+			} else {
+				require.Equal(t, canonical2, []byte(captured.raw))
+				require.Equal(t, 1, captured.cursor)
+				require.Equal(t, hash1, captured.prefixHash, "the second request must carry the stored prefix hash")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for backlog payload")
+		}
+	}
+
+	require.Contains(t, string(canonical1), `\u0026`)
+	require.Contains(t, string(canonical1), `\u003c`)
+
+	entry, err := srv.convKV.Get(srv.cfg.TTLPrefix + hash)
+	require.NoError(t, err)
+	record, err := conversation.ParseRecord(entry.Value())
+	require.NoError(t, err)
+	require.Equal(t, 3, record.Cursor)
+	require.Equal(t, storedHash, record.MessageHash, "the record must store the hash of the full history")
+}
+
+func TestHandleNonStreamReturns400OnContextOverflow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	cfg := Config{
+		ListenAddress:   "127.0.0.1:0",
+		Namespace:       "tenant",
+		RootImage:       "test/root:latest",
+		WorkerImage:     "test/worker:latest",
+		NATSURL:         ns.ClientURL(),
+		AllowAnonymous:  true,
+		ResponseTimeout: 3 * time.Second,
+		Logger:          logrus.NewEntry(logger),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = srv.raw.Drain()
+		srv.raw.Close()
+	})
+
+	modelKey := srv.modelKey(cfg.Namespace, "chat-1")
+	modelPayload, err := json.Marshal(registry.Model{
+		Namespace:           cfg.Namespace,
+		Name:                "chat-1",
+		OutputPVCName:       "models-pvc",
+		ConversionSizeHuman: "1Gi",
+	})
+	require.NoError(t, err)
+	_, err = srv.modelsKV.Put(modelKey, modelPayload)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"tenant/chat-1","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	hash, err := conversationHashFromHeaders(req, nil)
+	require.NoError(t, err)
+	backlogSubject := sessionBacklogSubject(hash)
+
+	// Keep the load above one so the handler does not spend the response
+	// timeout waiting for a worker that does not exist in this test.
+	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
+	defer srv.decrementSessionLoad(hash)
+
+	backlogConn, err := nats.Connect(srv.cfg.NATSURL, nats.Timeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { backlogConn.Close() })
+
+	sub, err := backlogConn.SubscribeSync(backlogSubject)
+	require.NoError(t, err)
+	require.NoError(t, backlogConn.Flush())
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	go func() {
+		msg, msgErr := sub.NextMsg(5 * time.Second)
+		if msgErr != nil {
+			return
+		}
+		var backlog conversation.BacklogMessage
+		if json.Unmarshal(msg.Data, &backlog) != nil {
+			return
+		}
+		var payload struct {
+			ResponseSubject string `json:"responseSubject"`
+		}
+		if json.Unmarshal(backlog.Payload, &payload) != nil || payload.ResponseSubject == "" {
+			return
+		}
+		pubConn, pubErr := nats.Connect(srv.cfg.NATSURL, nats.Timeout(2*time.Second))
+		if pubErr != nil {
+			return
+		}
+		defer pubConn.Close()
+		body, _ := json.Marshal(contextLengthExceededBody(2048))
+		_ = pubConn.Publish(payload.ResponseSubject, body)
+		_ = pubConn.Publish(payload.ResponseSubject, []byte("[DONE]"))
+		_ = pubConn.Flush()
+	}()
+
+	recorder := httptest.NewRecorder()
+	srv.handleChatCompletions(recorder, req)
+
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	var response map[string]map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
+	require.Equal(t, "context_length_exceeded", response["error"]["code"])
+}
+
+func TestHandleChatCompletionsRejectsCanonicalInflation(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			NATSMaxPayload:  8192,
+			MaxSeqLen:       1 << 20,
+			ResponseTimeout: time.Second,
+		},
+		log: logrus.New().WithField("component", "test"),
+	}
+
+	limit := srv.maxCanonicalBodyBytes()
+
+	base := `{"model":"tenant/chat-1","messages":[{"role":"user","content":""}]}`
+	baseSize := int64(len(conversation.CanonicalMessages([]byte(base))))
+	content := strings.Repeat("&", 700) // each & becomes \u0026 (6 bytes)
+	body := fmt.Sprintf(`{"model":"tenant/chat-1","messages":[{"role":"user","content":%q}]}`, content)
+
+	// The uploaded body fits, but canonicalisation (HTML escaping) inflates it
+	// past the effective limit.
+	require.Less(t, int64(len(body)), limit, "raw body must be under the limit")
+	canonical := conversation.CanonicalMessages([]byte(body))
+	require.Greater(t, int64(len(canonical)), limit, "canonical body must exceed the limit")
+	require.Greater(t, int64(len(canonical)), baseSize+700)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
+	var payload map[string]map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
+	require.Equal(t, "request_too_large", payload["error"]["code"])
+	require.Contains(t, payload["error"]["message"], fmt.Sprintf("%d bytes", limit))
+}
+
+func TestHandleChatCompletionsAcceptsBoundaryBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		cfg: Config{
+			AllowAnonymous:  true,
+			NATSMaxPayload:  8192,
+			MaxSeqLen:       1 << 20,
+			ResponseTimeout: time.Second,
+		},
+		log: logrus.New().WithField("component", "test"),
+		modelsKV: keyValueStub{
+			getFn: func(string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+		},
+	}
+
+	limit := srv.maxCanonicalBodyBytes()
+	base := `{"model":"tenant/chat-1","messages":[{"role":"user","content":""}]}`
+	baseSize := int64(len(conversation.CanonicalMessages([]byte(base))))
+	require.Less(t, baseSize, limit)
+
+	padding := int(limit - baseSize)
+	body := fmt.Sprintf(`{"model":"tenant/chat-1","messages":[{"role":"user","content":"%s"}]}`, strings.Repeat("x", padding))
+	require.Equal(t, limit, int64(len(conversation.CanonicalMessages([]byte(body)))), "body must sit exactly on the effective limit")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	w := httptest.NewRecorder()
+	srv.handleChatCompletions(w, req)
+
+	require.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code, "a body at the limit must pass admission")
+	require.Equal(t, http.StatusBadRequest, w.Code, "the request should fail later on model resolution")
 }

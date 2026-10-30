@@ -23,11 +23,14 @@ type Config struct {
 	NATSURL             string
 	BacklogSubject      string
 	AssignmentsBucket   string
+	ConversationBucket  string
 	DllamaSubjectPrefix string
 	StateSubjectPrefix  string
 	QueueGroup          string
 	AckWait             time.Duration
-	MetricsAddr         string // Address for metrics HTTP server (e.g., ":9090")
+	WorkerStaleAfter    time.Duration // Heartbeats older than this are ignored (default 90s)
+	RequeueDelay        time.Duration // Delay before requeueing capacity/transport failures (default 300ms)
+	MetricsAddr         string        // Address for metrics HTTP server (e.g., ":9090")
 	Logger              *logrus.Entry
 }
 
@@ -36,15 +39,17 @@ type Server struct {
 	cfg Config
 	log *logrus.Entry
 
-	nc          natsutil.NATSConn
-	js          nats.JetStreamContext
-	backlogSub  backlogSubscription
-	stateSub    *nats.Subscription
-	assignments natsutil.NATSKeyValue
+	nc            natsutil.NATSConn
+	js            nats.JetStreamContext
+	backlogSub    backlogSubscription
+	stateSub      *nats.Subscription
+	assignments   natsutil.NATSKeyValue
+	conversations conversation.KV
 
 	mu            sync.Mutex
 	workers       map[string]*workerState
 	inflight      map[string]*assignment
+	fallbacks     map[string]int
 	lastNoIdleLog time.Time
 
 	retryConfig   natsutil.RetryConfig
@@ -84,9 +89,19 @@ type assignment struct {
 	requestID    string
 	worker       string
 	payload      []byte
+	attempts     int
 }
 
 var ErrQueueMisconfigured = errors.New("dispatcher queue misconfigured")
+
+const (
+	// maxBacklogAttempts bounds retries of a request that a worker reported as
+	// failed before the dispatcher emits a terminal error.
+	maxBacklogAttempts = 3
+	// defaultRequeueDelay paces capacity/transport requeues so a busy pool does
+	// not spin on a hot loop.
+	defaultRequeueDelay = 300 * time.Millisecond
+)
 
 // New constructs a dispatcher instance.
 func New(cfg Config) (*Server, error) {
@@ -148,15 +163,33 @@ func New(cfg Config) (*Server, error) {
 	nc := natsutil.NewNATSConnWrapper(natsConn)
 	kv := natsutil.NewNATSKeyValueWrapper(kvRaw)
 
+	// Conversation affinity lives on the existing conversation record. Never
+	// create the bucket here: ingress/operator own its lifecycle.
+	var convKV conversation.KV
+	if bucket := strings.TrimSpace(cfg.ConversationBucket); bucket != "" {
+		rawConvKV, convErr := js.KeyValue(bucket)
+		switch {
+		case convErr == nil:
+			convKV = natsutil.NewNATSKeyValueWrapper(rawConvKV)
+		case errors.Is(convErr, nats.ErrBucketNotFound):
+			logger.WithField("bucket", bucket).Debug("conversation bucket not found; worker affinity disabled")
+		default:
+			natsConn.Close()
+			return nil, fmt.Errorf("conversation bucket %s: %w", bucket, convErr)
+		}
+	}
+
 	srv := &Server{
-		cfg:         cfg,
-		log:         logger,
-		nc:          nc,
-		js:          js,
-		assignments: kv,
-		workers:     make(map[string]*workerState),
-		inflight:    make(map[string]*assignment),
-		retryConfig: natsutil.DefaultRetryConfig(),
+		cfg:           cfg,
+		log:           logger,
+		nc:            nc,
+		js:            js,
+		assignments:   kv,
+		conversations: convKV,
+		workers:       make(map[string]*workerState),
+		inflight:      make(map[string]*assignment),
+		fallbacks:     make(map[string]int),
+		retryConfig:   natsutil.DefaultRetryConfig(),
 	}
 	return srv, nil
 }
@@ -232,7 +265,9 @@ func (s *Server) startBacklogSubscription() error {
 	if err != nil {
 		return fmt.Errorf("subscribe backlog: %w", err)
 	}
+	s.mu.Lock()
 	s.backlogSub = sub
+	s.mu.Unlock()
 	return nil
 }
 
@@ -242,7 +277,9 @@ func (s *Server) startStateSubscription() error {
 	if err != nil {
 		return fmt.Errorf("subscribe state: %w", err)
 	}
+	s.mu.Lock()
 	s.stateSub = sub
+	s.mu.Unlock()
 	return nil
 }
 
@@ -263,7 +300,9 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 
 	idleWorkers, totalWorkers, inflight := s.snapshotWorkerStats()
 
-	worker := s.selectWorker()
+	pin := s.pinnedWorker()
+	worker, affinity := s.selectWorkerFor(pin)
+	recordAffinityMetrics(pin, affinity)
 	if worker == "" {
 		if s.shouldLogNoIdle(time.Now()) {
 			s.log.WithFields(logrus.Fields{
@@ -271,11 +310,13 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 				"idleWorkers":  idleWorkers,
 				"totalWorkers": totalWorkers,
 				"inflight":     inflight,
+				"affinity":     affinity,
+				"pin":          pin,
 			}).Info("dispatcher backlog: no idle workers available, requeuing")
 		}
-		if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); err != nil {
-			s.log.WithError(err).Error("failed to requeue backlog message after retries")
-		}
+		// Capacity pressure is not a failure: requeue without consuming the
+		// worker-failure budget and pace the retry.
+		s.scheduleRequeue(backlog)
 		return
 	}
 
@@ -283,6 +324,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 	env := conversation.AssignmentEnvelope{
 		AssignmentID: assignmentID,
 		RequestID:    backlog.ID,
+		Attempts:     backlog.Attempts,
 		Payload:      backlog.Payload,
 	}
 	payload, err := json.Marshal(env)
@@ -294,11 +336,15 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 	subject := fmt.Sprintf("%s%s.in", s.cfg.DllamaSubjectPrefix, worker)
 	if err := PublishWithRetry(s.nc, subject, payload, s.retryConfig, s.log); err != nil {
 		s.log.WithError(err).WithField("subject", subject).Error("failed to publish assignment after retries")
-		// Requeue the backlog item since we couldn't dispatch it
-		if requeueErr := PublishWithRetry(s.nc, s.cfg.BacklogSubject, msg.Data, s.retryConfig, s.log); requeueErr != nil {
-			s.log.WithError(requeueErr).Error("failed to requeue after publish failure")
-		}
+		// Transport failures are not the request's fault; retry without
+		// consuming the failure budget.
+		s.scheduleRequeue(backlog)
 		return
+	}
+
+	switch affinity {
+	case "pinned", "repin", "no_pin":
+		s.pinWorker(worker)
 	}
 
 	if _, err := KVPutWithRetry(s.assignments, backlog.ID, payload, s.retryConfig, s.log); err != nil {
@@ -312,6 +358,7 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		requestID:    backlog.ID,
 		worker:       worker,
 		payload:      backlog.Payload,
+		attempts:     backlog.Attempts,
 	}
 	s.mu.Unlock()
 
@@ -321,6 +368,8 @@ func (s *Server) handleBacklog(msg *nats.Msg) {
 		"assignmentId": assignmentID,
 		"requestId":    backlog.ID,
 		"worker":       worker,
+		"affinity":     affinity,
+		"pin":          pin,
 		"idleWorkers":  nowIdle,
 		"totalWorkers": total,
 		"inflight":     nowInflight,
@@ -362,12 +411,12 @@ func (s *Server) handleState(msg *nats.Msg) {
 		}
 	case "error":
 		if assignmentID != "" {
-			s.finishAssignment(assignmentID, true)
+			s.finishAssignment(assignmentID, true, event.Error)
 		}
 	}
 }
 
-func (s *Server) finishAssignment(assignmentID string, requeue bool) {
+func (s *Server) finishAssignment(assignmentID string, requeue bool, reasons ...string) {
 	s.mu.Lock()
 	asn, ok := s.inflight[assignmentID]
 	if ok {
@@ -379,7 +428,14 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 	}
 
 	if requeue {
-		s.requeueAssignment(asn)
+		// The worker failed before delivering a token; drop the pin so the
+		// retry cannot land on the same instance once it reports idle again.
+		s.clearPin(asn.worker)
+		reason := "worker reported an error"
+		if len(reasons) > 0 && strings.TrimSpace(reasons[0]) != "" {
+			reason = strings.TrimSpace(reasons[0])
+		}
+		s.requeueAssignment(asn, reason)
 	}
 
 	if err := KVDeleteWithRetry(s.assignments, asn.requestID, s.retryConfig, s.log); err != nil {
@@ -388,40 +444,105 @@ func (s *Server) finishAssignment(assignmentID string, requeue bool) {
 	}
 }
 
-func (s *Server) requeueAssignment(asn *assignment) {
+// requeueAssignment retries a request that a worker reported as failed. Each
+// worker-reported failure consumes one attempt; after maxBacklogAttempts the
+// request is terminally failed instead of retried forever.
+func (s *Server) requeueAssignment(asn *assignment, reason string) {
+	attempts := asn.attempts + 1
 	backlog := conversation.BacklogMessage{
 		ID:        asn.requestID,
 		Payload:   asn.payload,
 		CreatedAt: time.Now().Unix(),
+		Attempts:  attempts,
 	}
-	body, err := json.Marshal(backlog)
-	if err != nil {
-		s.log.WithError(err).Warn("marshal backlog retry")
+	if attempts >= maxBacklogAttempts {
+		s.failBacklog(backlog, attempts, reason)
 		return
 	}
-	if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, body, s.retryConfig, s.log); err != nil {
-		s.log.WithError(err).Error("failed to republish backlog after retries")
-	}
+	s.scheduleRequeue(backlog)
 }
 
-func (s *Server) selectWorker() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var selected string
-	var selectedTime time.Time
-	for name, st := range s.workers {
-		if strings.ToLower(st.state) != "idle" {
-			continue
+// scheduleRequeue republishes a backlog item after a short delay. It is used
+// for capacity and transport pressure, which must never terminally fail a
+// request: the backend may not have seen it at all.
+func (s *Server) scheduleRequeue(backlog conversation.BacklogMessage) {
+	delay := s.requeueDelay()
+	time.AfterFunc(delay, func() {
+		body, err := json.Marshal(backlog)
+		if err != nil {
+			s.log.WithError(err).WithField("requestId", backlog.ID).Warn("marshal backlog retry")
+			return
 		}
-		if st.active > 0 {
-			continue
+		if err := PublishWithRetry(s.nc, s.cfg.BacklogSubject, body, s.retryConfig, s.log); err != nil {
+			s.log.WithError(err).WithFields(logrus.Fields{
+				"requestId": backlog.ID,
+				"attempts":  backlog.Attempts,
+			}).Error("failed to republish backlog after retries")
 		}
-		if selected == "" || st.lastHeartbeat.Before(selectedTime) {
-			selected = name
-			selectedTime = st.lastHeartbeat
-		}
+	})
+}
+
+func (s *Server) requeueDelay() time.Duration {
+	if s.cfg.RequeueDelay > 0 {
+		return s.cfg.RequeueDelay
 	}
-	return selected
+	return defaultRequeueDelay
+}
+
+// failBacklog publishes a terminal error to the request's response subject so
+// streaming clients are unblocked instead of hanging on a dead request.
+func (s *Server) failBacklog(backlog conversation.BacklogMessage, attempts int, reason string) {
+	var payload struct {
+		ResponseSubject string `json:"responseSubject"`
+	}
+	_ = json.Unmarshal(backlog.Payload, &payload)
+	subject := strings.TrimSpace(payload.ResponseSubject)
+	if subject == "" {
+		s.log.WithFields(logrus.Fields{
+			"requestId": backlog.ID,
+			"attempts":  attempts,
+			"reason":    reason,
+		}).Warn("dropping failed backlog without a response subject")
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("inference failed after %d attempts: %s", attempts, reason),
+			"type":    "server_error",
+			"code":    "inference_failed",
+		},
+	})
+	if err != nil {
+		s.log.WithError(err).Warn("marshal terminal failure")
+		return
+	}
+	// A failed terminal publish leaves a streaming client without a response;
+	// make that visible with the request and subject it should have reached.
+	if err := PublishWithRetry(s.nc, subject, body, s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithFields(logrus.Fields{
+			"requestId":       backlog.ID,
+			"responseSubject": subject,
+		}).Error("failed to publish terminal inference error")
+	}
+	if err := PublishWithRetry(s.nc, subject, []byte("[DONE]"), s.retryConfig, s.log); err != nil {
+		s.log.WithError(err).WithFields(logrus.Fields{
+			"requestId":       backlog.ID,
+			"responseSubject": subject,
+		}).Error("failed to publish terminal done marker")
+	}
+	s.log.WithFields(logrus.Fields{
+		"requestId": backlog.ID,
+		"attempts":  attempts,
+		"reason":    reason,
+		"subject":   subject,
+	}).Warn("backlog failed permanently")
+}
+
+// selectWorker returns the deterministic worker pick without affinity.
+func (s *Server) selectWorker() string {
+	worker, _ := s.selectWorkerFor("")
+	return worker
 }
 
 func (s *Server) recoverAssignments() {
@@ -444,10 +565,13 @@ func (s *Server) recoverAssignments() {
 			s.log.WithError(err).WithField("key", key).Warn("parse assignment entry")
 			continue
 		}
-		s.requeueAssignment(&assignment{
-			assignmentID: env.AssignmentID,
-			requestID:    env.RequestID,
-			payload:      env.Payload,
+		// Recovery is not a failure: preserve the persisted attempt count and
+		// requeue without consuming another attempt.
+		s.scheduleRequeue(conversation.BacklogMessage{
+			ID:        env.RequestID,
+			Payload:   env.Payload,
+			CreatedAt: time.Now().Unix(),
+			Attempts:  env.Attempts,
 		})
 		if err := KVDeleteWithRetry(s.assignments, key, s.retryConfig, s.log); err != nil {
 			s.log.WithError(err).WithField("key", key).Error("failed to cleanup assignment entry after retries")
@@ -458,9 +582,11 @@ func (s *Server) recoverAssignments() {
 func (s *Server) snapshotWorkerStats() (idle int, total int, inflight int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
+	staleAfter := s.staleAfter()
 	for _, st := range s.workers {
 		total++
-		if strings.ToLower(st.state) == "idle" && st.active == 0 {
+		if workerLive(st, now, staleAfter) {
 			idle++
 		}
 	}
@@ -547,14 +673,15 @@ func (s *Server) updateMetrics() {
 		}
 	}
 	inflightCount := len(s.inflight)
+	backlogSub := s.backlogSub
 	s.mu.Unlock()
 
 	metrics.DispatcherWorkersActive.Set(float64(activeWorkers))
 	metrics.DispatcherAssignmentsInflight.Set(float64(inflightCount))
 
 	// Update backlog size if possible
-	if s.backlogSub != nil {
-		if pending, _, err := s.backlogSub.Pending(); err == nil {
+	if backlogSub != nil {
+		if pending, _, err := backlogSub.Pending(); err == nil {
 			metrics.DispatcherBacklogSize.Set(float64(pending))
 		}
 	}

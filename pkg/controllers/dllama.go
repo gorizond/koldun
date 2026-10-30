@@ -257,6 +257,13 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	} else {
 		root.Spec.NThreads = 1
 	}
+	// The context window belongs to the model, not to whichever Ingress
+	// happened to be listed first.
+	if model.Spec.MaxSeqLen > 0 {
+		root.Spec.MaxSeqLen = model.Spec.MaxSeqLen
+	} else {
+		root.Spec.MaxSeqLen = defaultMaxSeqLen
+	}
 	return root
 }
 

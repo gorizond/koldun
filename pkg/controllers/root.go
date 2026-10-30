@@ -23,6 +23,11 @@ const (
 	dllamaStartupProbeFailureSeconds int32 = 43200 // allow up to 12h before declaring startup failure
 
 	statefulSetRevisionSuffixLength = 11 // "-" + 10 char hash
+
+	// defaultMaxSeqLen is the fallback context window for distributed-llama.
+	defaultMaxSeqLen int32 = 4096
+	// defaultNATSMaxPayload matches stock NATS max_payload (1 MiB).
+	defaultNATSMaxPayload int32 = 1 << 20
 )
 
 var (
@@ -438,7 +443,11 @@ func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int
 func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, weightsFloatType string, threads int32, workers []string, resources corev1.ResourceRequirements) corev1.Container {
 	// distributed-llama requires q80 sync type for inter-node communication regardless of weights type
 	bufferFloatType := "q80"
-	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", bufferFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", "4096"}
+	maxSeqLen := root.Spec.MaxSeqLen
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	args := []string{"--port", "9999", "--model", modelFile, "--tokenizer", tokenizerFile, "--buffer-float-type", bufferFloatType, "--nthreads", fmt.Sprintf("%d", threads), "--max-seq-len", fmt.Sprint(maxSeqLen)}
 	if len(workers) > 0 {
 		args = append(args, "--workers")
 		args = append(args, workers...)
@@ -551,6 +560,11 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 	if dllamaName != "" {
 		args = append(args, "--llm-dllama-name", dllamaName)
 	}
+	maxSeqLen := root.Spec.MaxSeqLen
+	if maxSeqLen <= 0 {
+		maxSeqLen = defaultMaxSeqLen
+	}
+	args = append(args, "--llm-max-seq-len", fmt.Sprint(maxSeqLen))
 
 	env := []corev1.EnvVar{
 		{Name: "HASH_KOLDUN", Value: hash},

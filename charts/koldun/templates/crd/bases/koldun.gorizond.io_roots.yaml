@@ -75,6 +75,12 @@ spec:
                 type: object
               image:
                 type: string
+              maxSeqLen:
+                description: |-
+                  MaxSeqLen configures the model context window (--max-seq-len).
+                  Defaults to 4096.
+                format: int32
+                type: integer
               memory:
                 description: Memory allows overriding root memory planning parameters.
                 properties:
@@ -85,6 +91,12 @@ spec:
                 type: object
               modelRef:
                 type: string
+              nThreads:
+                description: |-
+                  NThreads configures the number of threads for dllama-api.
+                  Defaults to 1. This controls the --nthreads flag.
+                format: int32
+                type: integer
               nats:
                 description: NATS contains connection information inherited by the
                   LLM sidecar.

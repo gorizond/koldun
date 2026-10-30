@@ -108,6 +108,18 @@ spec:
                       required:
                         - url
                       type: object
+                    maxSeqLen:
+                      description:
+                        MaxSeqLen configures the maximum prompt length accepted
+                        by the backend. Default is 4096.
+                      format: int32
+                      type: integer
+                    natsMaxPayload:
+                      description: |-
+                        NATSMaxPayload is the NATS max_payload budget in bytes; backlog messages
+                        are capped at half of it. Default is 1 MiB (stock NATS).
+                      format: int32
+                      type: integer
                     nThreads:
                       description:
                         NThreads configures the number of threads for dllama-api

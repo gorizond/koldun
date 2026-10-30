@@ -326,6 +326,7 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 					BacklogSubject:        record.Queue.BacklogSubject,
 					ResponseSubjectPrefix: record.Queue.ResponseSubjectPrefix,
 					AssignmentsBucket:     record.Queue.AssignmentsBucket,
+					ConversationBucket:    record.Queue.ConversationBucket,
 					DllamaSubjectPrefix:   record.Queue.DllamaSubjectPrefix,
 					StateStream:           record.Queue.StateStream,
 				}

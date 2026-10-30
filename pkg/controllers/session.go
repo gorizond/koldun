@@ -16,6 +16,7 @@ import (
 	"k8s.io/utils/pointer"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/rancher/wrangler/v3/pkg/apply"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	"github.com/sirupsen/logrus"
@@ -790,6 +791,7 @@ func dispatcherArgs(sess *v1.Session, backlogSubject, assignmentsBucket, dllamaP
 		fmt.Sprintf("--dispatcher-state-prefix=%s", statePrefix),
 		fmt.Sprintf("--dispatcher-queue-group=%s", queueGroup),
 		fmt.Sprintf("--dispatcher-ack-wait=%s", ackWait.String()),
+		fmt.Sprintf("--dispatcher-conversation-bucket=%s", sessionConversationBucket(sess)),
 	}
 
 	if metricsAddr := strings.TrimSpace(sess.Spec.DispatcherMetricsListen); metricsAddr != "" {
@@ -797,6 +799,17 @@ func dispatcherArgs(sess *v1.Session, backlogSubject, assignmentsBucket, dllamaP
 	}
 
 	return args
+}
+
+// sessionConversationBucket returns the bucket recorded by ingress for this
+// conversation, falling back to the shared default.
+func sessionConversationBucket(sess *v1.Session) string {
+	if sess != nil && sess.Spec.Queue != nil {
+		if bucket := strings.TrimSpace(sess.Spec.Queue.ConversationBucket); bucket != "" {
+			return bucket
+		}
+	}
+	return conversation.DefaultBucket
 }
 
 func dispatcherMetricsPort(listenAddr string) int32 {
