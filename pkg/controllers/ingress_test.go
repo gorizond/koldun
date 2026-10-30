@@ -765,12 +765,30 @@ func TestValidateIngressSpec(t *testing.T) {
 			wantErr: "backend.sessionScaling.maxDllamas must be >= 0",
 		},
 		{
-			name: "conversation TTL below heartbeat interval",
+			name: "conversation TTL at heartbeat interval",
 			mutate: func(spec *v1.IngressSpec) {
-				ttl := metav1.Duration{Duration: 5 * time.Second}
+				ttl := metav1.Duration{Duration: 10 * time.Second}
 				spec.Backend.ConversationTTL = &ttl
 			},
-			wantErr: "backend.conversationTTL must be >= 10s",
+			wantErr: "backend.conversationTTL must be greater than 10s",
+		},
+		{
+			name: "conversation TTL below default response timeout",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 30 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+				spec.Backend.ResponseTimeout = nil
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
+		},
+		{
+			name: "response timeout above default conversation TTL",
+			mutate: func(spec *v1.IngressSpec) {
+				timeout := metav1.Duration{Duration: 15 * time.Minute}
+				spec.Backend.ConversationTTL = nil
+				spec.Backend.ResponseTimeout = &timeout
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
 		},
 		{
 			name: "conversation TTL not greater than response timeout",

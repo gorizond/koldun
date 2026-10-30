@@ -29,7 +29,7 @@ spec:
     allowAnonymous: true
 
     # Session lifecycle
-    conversationTTL: 10m
+    conversationTTL: 30m
     responseTimeout: 10m
 
     # Scaling configuration: MAX 1 DLLAMA

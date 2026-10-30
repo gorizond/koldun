@@ -363,13 +363,19 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 			return fmt.Errorf("backend.rootMemory.overheadMaxRatio must be > 0")
 		}
 	}
-	if ttl := spec.Backend.ConversationTTL; ttl != nil {
-		if ttl.Duration < 10*time.Second {
-			return fmt.Errorf("backend.conversationTTL must be >= 10s")
-		}
-		if timeout := spec.Backend.ResponseTimeout; timeout != nil && ttl.Duration <= timeout.Duration {
-			return fmt.Errorf("backend.conversationTTL must be greater than backend.responseTimeout")
-		}
+	ttl := 10 * time.Minute
+	if spec.Backend.ConversationTTL != nil {
+		ttl = spec.Backend.ConversationTTL.Duration
+	}
+	responseTimeout := 2 * time.Minute
+	if spec.Backend.ResponseTimeout != nil {
+		responseTimeout = spec.Backend.ResponseTimeout.Duration
+	}
+	if ttl <= 10*time.Second {
+		return fmt.Errorf("backend.conversationTTL must be greater than 10s")
+	}
+	if ttl <= responseTimeout {
+		return fmt.Errorf("backend.conversationTTL must be greater than backend.responseTimeout")
 	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {
 		if scaling.MinDllamas != nil {

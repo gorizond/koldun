@@ -1605,7 +1605,7 @@ func TestEnqueueScaleDownIfDue(t *testing.T) {
 		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
 		sessions.EXPECT().Cache().Return(cache).AnyTimes()
 		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
-			Status: v1.SessionStatus{ReadyWorkers: 1},
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
 		}, nil)
 		sessions.EXPECT().Enqueue("tenant", "session-hash")
 
@@ -1659,7 +1659,7 @@ func TestEnqueueScaleDownIfDue(t *testing.T) {
 		record := baseRecord()
 		record.Scaling.MinDllamas = &one
 		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
-			Status: v1.SessionStatus{ReadyWorkers: 1},
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
 		}, nil)
 		sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
 
@@ -1679,7 +1679,7 @@ func TestEnqueueScaleDownIfDueHandlesSessionLookup(t *testing.T) {
 		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
 		sessions.EXPECT().Cache().Return(cache).AnyTimes()
 		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
-			Status: v1.SessionStatus{ReadyWorkers: 1},
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
 		}, nil)
 		sessions.EXPECT().Enqueue("tenant", "session-hash")
 		minusOne := int32(-1)
@@ -1741,5 +1741,50 @@ func TestSyncSessionLastActivityGivesUpAfterConflicts(t *testing.T) {
 		Session:        "session-hash",
 		Namespace:      "tenant",
 		LastActivityAt: 1700000000,
+	})
+}
+
+func TestEnqueueScaleDownIfDueUsesAvailableWorkerSets(t *testing.T) {
+	one := int32(1)
+	now := time.Now()
+	record := &conversation.Record{
+		Hash:           "hash",
+		Session:        "session-hash",
+		Namespace:      "tenant",
+		LastActivityAt: now.Add(-2 * time.Minute).Unix(),
+		Scaling: &conversation.SessionScalingConfig{
+			MinDllamas:           &one,
+			ScaleDownIdleSeconds: 60,
+		},
+	}
+
+	t.Run("ready replicas above min but only one available set does not enqueue", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
+		}, nil)
+		sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+	})
+
+	t.Run("two available sets above min enqueue", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 2},
+		}, nil)
+		sessions.EXPECT().Enqueue("tenant", "session-hash")
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
 	})
 }

@@ -447,7 +447,7 @@ func (r *conversationReconciler) enqueueScaleDownIfDue(record *conversation.Reco
 	if err != nil || session == nil {
 		return
 	}
-	if session.Status.ReadyWorkers <= min {
+	if session.Status.AvailableWorkers <= min {
 		return
 	}
 	r.sessions.Enqueue(record.Namespace, record.SessionName())
