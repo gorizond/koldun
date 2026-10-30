@@ -371,8 +371,10 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 	if spec.Backend.ResponseTimeout != nil {
 		responseTimeout = spec.Backend.ResponseTimeout.Duration
 	}
-	if ttl <= 10*time.Second {
-		return fmt.Errorf("backend.conversationTTL must be greater than 10s")
+	if ttl < 20*time.Second {
+		// Two heartbeat intervals: the async heartbeat drops overlapping ticks,
+		// so the record must survive one skipped refresh.
+		return fmt.Errorf("backend.conversationTTL must be at least 20s (2x the streaming heartbeat interval)")
 	}
 	if ttl <= responseTimeout {
 		return fmt.Errorf("backend.conversationTTL must be greater than backend.responseTimeout")
