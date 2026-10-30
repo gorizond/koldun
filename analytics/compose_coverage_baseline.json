@@ -1,6 +1,6 @@
 {
-  "total": 86.5,
-  "updated_at": "2026-10-30T18:37:26Z",
-  "commit": "1365eaf7068cfe1b14139dcbb9ac689810fc1e4e",
-  "source": "1365eaf \u2014 fix: allow idle sessions to scale to zero"
+  "total": 86.8,
+  "updated_at": "2026-10-30T19:17:32Z",
+  "commit": "39259d8161d4d3ab39e05ec2e6670e617c6f40a5",
+  "source": "39259d8 \u2014 fix: schedule and guard session scale-to-zero"
 }
