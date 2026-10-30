@@ -671,8 +671,7 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Equal(t, "kubernetes.io/hostname", spread.TopologyKey)
 	require.Equal(t, corev1.ScheduleAnyway, spread.WhenUnsatisfiable)
 	require.NotNil(t, spread.LabelSelector)
-	require.Equal(t, sts.Spec.Template.Labels[labelDllamaName], spread.LabelSelector.MatchLabels[labelDllamaName])
-	require.Equal(t, "mistral", spread.LabelSelector.MatchLabels[labelDllamaName])
+	require.Equal(t, map[string]string{labelDllamaName: "mistral"}, spread.LabelSelector.MatchLabels)
 
 	require.Equal(t, fmt.Sprintf("root-%s-statefulset", root.Name), fakeApply.setID)
 }

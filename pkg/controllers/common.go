@@ -87,7 +87,16 @@ func labelValue(labels map[string]string, key string) string {
 // dllamaTopologySpread keeps the root and workers of one Dllama best-effort
 // spread across nodes. ScheduleAnyway never blocks scheduling when the node
 // count or resources cannot satisfy the skew.
+//
+// The selector value must match the pod labels on both templates: the root
+// stores the raw dllama name while workers apply sanitizeLabelValue. The two
+// derivations are equal for valid names; label identity is the spread contract.
 func dllamaTopologySpread(dllamaName string) []corev1.TopologySpreadConstraint {
+	if dllamaName == "" {
+		// Without the group label an empty matchLabels value is valid but
+		// matches nothing; skip the constraint instead.
+		return nil
+	}
 	return []corev1.TopologySpreadConstraint{{
 		MaxSkew:           1,
 		TopologyKey:       corev1.LabelHostname,
