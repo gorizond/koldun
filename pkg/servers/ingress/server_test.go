@@ -439,7 +439,7 @@ func TestConversationHashFromHeadersPlain(t *testing.T) {
 	req.Header.Set("X-Request-Id", "req-1")
 	req.Header.Set("User-Agent", "ingress-test")
 
-	actual, err := conversationHashFromHeaders(req, nil)
+	actual, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 
 	pairs := []string{
@@ -448,7 +448,7 @@ func TestConversationHashFromHeadersPlain(t *testing.T) {
 		"x-trace-id=abc-123",
 	}
 	sort.Strings(pairs)
-	expectedSum := sha256.Sum256([]byte(strings.Join(pairs, "&")))
+	expectedSum := sha256.Sum256([]byte("model=tenant/chat-1\n" + strings.Join(pairs, "&")))
 	assert.Equal(t, hex.EncodeToString(expectedSum[:]), actual)
 }
 
@@ -459,7 +459,7 @@ func TestConversationHashFromHeadersWithSecret(t *testing.T) {
 	req.Header.Set("User-Agent", "ingress-test")
 	req.Header.Set("X-Forwarded-Server", "ignored")
 
-	actual, err := conversationHashFromHeaders(req, secret)
+	actual, err := conversationHashFromHeaders(req, "tenant/chat-1", secret)
 	require.NoError(t, err)
 
 	pairs := []string{
@@ -467,10 +467,35 @@ func TestConversationHashFromHeadersWithSecret(t *testing.T) {
 		"x-trace-id=abc-123",
 	}
 	sort.Strings(pairs)
-	message := []byte(strings.Join(pairs, "&"))
+	message := []byte("model=tenant/chat-1\n" + strings.Join(pairs, "&"))
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(message)
 	assert.Equal(t, hex.EncodeToString(mac.Sum(nil)), actual)
+}
+
+func TestConversationHashFromHeadersScopesByModel(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("X-Chat-Id", "shared-chat")
+	req.Header.Set("User-Agent", "ingress-test")
+
+	small, err := conversationHashFromHeaders(req, "tenant/qwen3-0.6b", nil)
+	require.NoError(t, err)
+	large, err := conversationHashFromHeaders(req, "tenant/qwen3-8b-q40", nil)
+	require.NoError(t, err)
+	require.NotEqual(t, small, large, "same headers with different models must not share a conversation")
+
+	stable, err := conversationHashFromHeaders(req, "tenant/qwen3-0.6b", nil)
+	require.NoError(t, err)
+	require.Equal(t, small, stable, "same model and headers must produce a stable hash")
+
+	// An empty model keeps the legacy header-only hash.
+	legacy, err := conversationHashFromHeaders(req, "", nil)
+	require.NoError(t, err)
+	pairs := []string{"user-agent=ingress-test", "x-chat-id=shared-chat"}
+	sort.Strings(pairs)
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "&")))
+	require.Equal(t, hex.EncodeToString(sum[:]), legacy)
+	require.NotEqual(t, small, legacy)
 }
 
 // TestSessionBacklogSubject validates backlog subject generation.
@@ -1849,7 +1874,7 @@ func TestHandleChatCompletionsPublishesAndResponds(t *testing.T) {
 	req.Header.Set("User-Agent", "ingress-test")
 	req.Header.Set("X-Trace-Id", "abc-123")
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -1991,7 +2016,7 @@ func TestHandleChatCompletionsStreamsResponses(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -2140,7 +2165,7 @@ func TestHandleChatCompletionsStreamPublishFailure(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
 	defer srv.decrementSessionLoad(hash)
@@ -2219,7 +2244,7 @@ func TestHandleChatCompletionsNonStreamPublishFailure(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
 	defer srv.decrementSessionLoad(hash)
@@ -2320,7 +2345,7 @@ func TestHandleChatCompletionsQueueMisconfigured(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			req := newRequest()
-			hash, err := conversationHashFromHeaders(req, nil)
+			hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 			require.NoError(t, err)
 
 			require.Equal(t, int32(1), srv.incrementSessionLoad(hash))
@@ -2412,7 +2437,7 @@ func TestHandleChatCompletionsStreamContextCancel(t *testing.T) {
 	defer cancel()
 	req := baseReq.WithContext(ctx)
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -3128,6 +3153,25 @@ func TestHandleChatCompletionsRejectsInvalidConversationHash(t *testing.T) {
 			HashSecret:      []byte("test-secret"),
 		},
 		log: logrus.New().WithField("component", "test"),
+		// The model is resolved before the hash now, so the lookup must
+		// succeed for the request to reach hash derivation.
+		modelsKV: keyValueStub{
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 0, errors.New("not used")
+				},
+			},
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				model := &registry.Model{
+					Namespace:           "test",
+					Name:                "model",
+					OutputPVCName:       "pvc",
+					ConversionSizeHuman: "1Gi",
+				}
+				data, _ := json.Marshal(model)
+				return &kvEntryStub{value: data}, nil
+			},
+		},
 	}
 
 	body := strings.NewReader(`{"model":"test/model","messages":[{"role":"user","content":"test"}]}`)
@@ -4067,7 +4111,7 @@ func TestHandleChatCompletionsPublishesCanonicalRawOnly(t *testing.T) {
 		return req
 	}
 
-	hash, err := conversationHashFromHeaders(newRequest(pretty), nil)
+	hash, err := conversationHashFromHeaders(newRequest(pretty), "tenant/chat-1", nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 
@@ -4247,7 +4291,7 @@ func TestHandleNonStreamReturns400OnContextOverflow(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "ingress-test")
 
-	hash, err := conversationHashFromHeaders(req, nil)
+	hash, err := conversationHashFromHeaders(req, "tenant/chat-1", nil)
 	require.NoError(t, err)
 	backlogSubject := sessionBacklogSubject(hash)
 

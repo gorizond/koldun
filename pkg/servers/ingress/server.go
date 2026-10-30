@@ -684,7 +684,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hash, err := conversationHashFromHeaders(r, s.cfg.HashSecret)
+	model, err := s.resolveModel(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// The model is part of the conversation identity: the same client headers
+	// must not route a request to a session pinned to another model.
+	hash, err := conversationHashFromHeaders(r, model.Namespace+"/"+model.Name, s.cfg.HashSecret)
 	if err != nil {
 		s.log.WithError(err).Warn("conversation hash from headers")
 		writeError(w, http.StatusBadRequest, "failed to derive conversation id")
@@ -693,12 +701,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	chatID := hash
 	chatStart := fmt.Sprintf("%d", time.Now().Unix())
-
-	model, err := s.resolveModel(req.Model)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 
 	maxSeqLen := s.cfg.MaxSeqLen
 	if maxSeqLen <= 0 {
@@ -2267,7 +2269,7 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func conversationHashFromHeaders(r *http.Request, secret []byte) (string, error) {
+func conversationHashFromHeaders(r *http.Request, model string, secret []byte) (string, error) {
 	pairs := make([]string, 0, len(r.Header))
 	for name, values := range r.Header {
 		lower := strings.ToLower(name)
@@ -2290,7 +2292,13 @@ func conversationHashFromHeaders(r *http.Request, secret []byte) (string, error)
 		return "", fmt.Errorf("no identifying headers provided")
 	}
 	sort.Strings(pairs)
-	message := []byte(strings.Join(pairs, "&"))
+	payload := strings.Join(pairs, "&")
+	if trimmed := strings.TrimSpace(model); trimmed != "" {
+		// Domain separator keeps model-scoped hashes disjoint from the legacy
+		// header-only input. An empty model preserves the previous behaviour.
+		payload = "model=" + trimmed + "\n" + payload
+	}
+	message := []byte(payload)
 	if len(secret) == 0 {
 		sum := sha256.Sum256(message)
 		return hex.EncodeToString(sum[:]), nil
