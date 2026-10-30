@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 type staticResponseTransport struct {
@@ -2767,4 +2768,77 @@ func TestWorkersReadyForTraffic(t *testing.T) {
 
 	base.kube = nil
 	require.True(t, base.workersReadyForTraffic())
+}
+
+func newDllamaTestClient(ready int64) *dynamicfake.FakeDynamicClient {
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "koldun.gorizond.io/v1",
+		"kind":       "Dllama",
+		"metadata": map[string]interface{}{
+			"name":      "demo",
+			"namespace": "models",
+		},
+		"spec":   map[string]interface{}{"replicaPower": int64(2)},
+		"status": map[string]interface{}{"readyWorkers": ready},
+	}}
+	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+}
+
+func TestWaitForWorkersLoadedWaitsForStatus(t *testing.T) {
+	client := newDllamaTestClient(2)
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   client,
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		ctx := context.Background()
+		obj, err := client.Resource(dllamaGVR).Namespace("models").Get(ctx, "demo", metav1.GetOptions{})
+		if err != nil {
+			return
+		}
+		_ = unstructured.SetNestedField(obj.Object, int64(3), "status", "readyWorkers")
+		_, _ = client.Resource(dllamaGVR).Namespace("models").UpdateStatus(ctx, obj, metav1.UpdateOptions{})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, srv.waitForWorkersLoaded(ctx))
+}
+
+func TestWaitForWorkersLoadedForbiddenFailsOpen(t *testing.T) {
+	client := newDllamaTestClient(0)
+	client.PrependReactor("get", "dllamas", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "koldun.gorizond.io", Resource: "dllamas"}, "demo", errors.New("forbidden"))
+	})
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   client,
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	require.NoError(t, srv.waitForWorkersLoaded(ctx))
+	require.True(t, srv.workersReadyForTraffic())
+}
+
+func TestWaitForWorkersLoadedTimeout(t *testing.T) {
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   newDllamaTestClient(0),
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	require.Error(t, srv.waitForWorkersLoaded(ctx))
 }

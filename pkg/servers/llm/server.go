@@ -42,6 +42,9 @@ const (
 	// defaultSidecarStartupTimeout caps the readiness wait independently of the
 	// request timeout: loading weights is fast, inference is what is slow.
 	defaultSidecarStartupTimeout = 2 * time.Minute
+	// defaultWorkerLoadTimeout bounds how long a root may wait for workers to
+	// finish loading weights before the stuck group is evicted.
+	defaultWorkerLoadTimeout = 20 * time.Minute
 
 	sidecarModelsPath          = "/v1/models"
 	sidecarChatCompletionsPath = "/v1/chat/completions"
@@ -95,6 +98,7 @@ type Config struct {
 
 	SidecarURL              string
 	SidecarTimeout          time.Duration
+	WorkerLoadTimeout       time.Duration
 	SidecarMonitorInterval  time.Duration
 	SidecarFailureThreshold int
 	HeartbeatInterval       time.Duration
@@ -131,6 +135,8 @@ type Server struct {
 
 	sidecarMonitorInterval  time.Duration
 	sidecarFailureThreshold int
+	workerLoadPollInterval  time.Duration
+	forbiddenOnce           sync.Once
 
 	sessionOnce sync.Once
 	chats       *chatCache
@@ -183,6 +189,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.SidecarTimeout == 0 {
 		cfg.SidecarTimeout = 2 * time.Minute
+	}
+	if cfg.WorkerLoadTimeout <= 0 {
+		cfg.WorkerLoadTimeout = defaultWorkerLoadTimeout
 	}
 	if strings.TrimSpace(cfg.RequestSubject) == "" {
 		cfg.RequestSubject = cfg.InPrefix + cfg.Hash
@@ -302,8 +311,16 @@ func (s *Server) Run(ctx context.Context) error {
 	// forwarding a request to still-loading workers used to hang for minutes
 	// and then kill dllama-api. Requests published meanwhile stay in the
 	// durable request stream.
-	if err := s.waitForWorkersLoaded(runCtx); err != nil {
-		return fmt.Errorf("wait for dllama workers: %w", err)
+	loadCtx, loadCancel := context.WithTimeout(runCtx, s.cfg.WorkerLoadTimeout)
+	loadErr := s.waitForWorkersLoaded(loadCtx)
+	loadCancel()
+	if loadErr != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("wait for dllama workers: %w", loadErr)
+		}
+		reason := fmt.Sprintf("dllama workers did not load within %s: %v", s.cfg.WorkerLoadTimeout, loadErr)
+		s.triggerEviction(reason)
+		return fmt.Errorf("wait for dllama workers: %w", loadErr)
 	}
 
 	// Use a durable name derived from the dllama identity so JetStream preserves
@@ -410,12 +427,22 @@ func (s *Server) waitForWorkersLoaded(ctx context.Context) error {
 	})
 	log.Info("waiting for dllama workers to finish loading weights")
 
-	ticker := time.NewTicker(workerReadinessPollInterval)
+	interval := s.workerLoadPollInterval
+	if interval <= 0 {
+		interval = workerReadinessPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		loaded, err := s.workersLoaded(ctx)
 		if err != nil {
+			if apierrors.IsForbidden(err) {
+				s.logWorkerReadForbidden(err)
+				// Fail open: without RBAC the gate would block serving forever.
+				// This preserves the pre-gate behaviour instead of wedging.
+				return nil
+			}
 			s.log.WithError(err).Warn("check dllama worker readiness")
 		} else if loaded {
 			log.Info("dllama workers loaded; accepting requests")
@@ -995,10 +1022,20 @@ func (s *Server) workersReadyForTraffic() bool {
 	defer cancel()
 	loaded, err := s.workersLoaded(ctx)
 	if err != nil {
+		if apierrors.IsForbidden(err) {
+			s.logWorkerReadForbidden(err)
+			return true
+		}
 		s.log.WithError(err).Warn("check dllama worker readiness for heartbeat")
 		return true
 	}
 	return loaded
+}
+
+func (s *Server) logWorkerReadForbidden(err error) {
+	s.forbiddenOnce.Do(func() {
+		s.log.WithError(err).Error("llm sidecar cannot get dllamas; worker-load gate disabled (check the root pod serviceAccountName/RBAC)")
+	})
 }
 
 func (s *Server) ensureQueueSubscription(queueName string, ackWait time.Duration) (*nats.Subscription, error) {

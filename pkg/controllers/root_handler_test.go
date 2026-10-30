@@ -598,11 +598,12 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
 
 	h := &rootHandler{
-		apply:        fakeApply,
-		dllamas:      dllamas,
-		models:       models,
-		workers:      workers,
-		statefulsets: statefulsets,
+		apply:              fakeApply,
+		dllamas:            dllamas,
+		models:             models,
+		workers:            workers,
+		statefulsets:       statefulsets,
+		serviceAccountName: "koldun-controller",
 	}
 
 	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
@@ -661,6 +662,7 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Len(t, sts.Spec.Template.Spec.Containers, 2)
 	rootContainer := sts.Spec.Template.Spec.Containers[0]
 	require.Equal(t, "root", rootContainer.Name)
+	require.Equal(t, "koldun-controller", sts.Spec.Template.Spec.ServiceAccountName)
 	require.Equal(t, "1200", envVarValue(rootContainer.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
 	require.Contains(t, rootContainer.Args, "--workers")
 	require.Contains(t, rootContainer.Args, "mistral-workers-0.mistral-workers.models.svc.cluster.local:9999")
@@ -1784,4 +1786,115 @@ func TestRootWorkerPodsStartedEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, started)
 	})
+}
+
+func TestRootContainerHTTPReadTimeoutTracksSidecarTimeout(t *testing.T) {
+	handler := &rootHandler{}
+
+	root := &v1.Root{}
+	container := handler.rootContainer(root, "model", "tokenizer", "q4_0", 1, nil, corev1.ResourceRequirements{})
+	require.Equal(t, "1200", envVarValue(container.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
+
+	sidecarTimeout := metav1.Duration{Duration: 30 * time.Minute}
+	root.Spec.SidecarTimeout = &sidecarTimeout
+	container = handler.rootContainer(root, "model", "tokenizer", "q4_0", 1, nil, corev1.ResourceRequirements{})
+	require.Equal(t, "2100", envVarValue(container.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
+}
+
+func TestRootWorkerPodsStartedRequiresRunningPods(t *testing.T) {
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Namespace: "models"}, Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}}
+	workerName := workerResourceName("demo")
+
+	tests := []struct {
+		name   string
+		phases []corev1.PodPhase
+		want   bool
+	}{
+		{name: "all running", phases: []corev1.PodPhase{corev1.PodRunning, corev1.PodRunning, corev1.PodRunning}, want: true},
+		{name: "one pending", phases: []corev1.PodPhase{corev1.PodRunning, corev1.PodRunning, corev1.PodPending}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
+
+			workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+			workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+			statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+			statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+			pods := genericfake.NewMockControllerInterface[*corev1.Pod, *corev1.PodList](ctrl)
+			podsCache := genericfake.NewMockCacheInterface[*corev1.Pod](ctrl)
+
+			handler := &rootHandler{
+				workers:      workers,
+				statefulsets: statefulsets,
+				pods:         pods,
+				resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+					return &v1.Dllama{
+						ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+						Spec:       v1.DllamaSpec{ReplicaPower: 2},
+					}, nil
+				},
+			}
+
+			workers.EXPECT().Cache().Return(workersCache).AnyTimes()
+			workersCache.EXPECT().Get("models", workerName).Return(&v1.Worker{
+				ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"},
+			}, nil)
+			statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+			statefulsetsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{
+				Status: appsv1.StatefulSetStatus{Replicas: 3},
+			}, nil)
+			pods.EXPECT().Cache().Return(podsCache).AnyTimes()
+			podObjects := make([]*corev1.Pod, 0, len(tt.phases))
+			for i, phase := range tt.phases {
+				podObjects = append(podObjects, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-%d", workerName, i), Namespace: "models"},
+					Status:     corev1.PodStatus{Phase: phase},
+				})
+			}
+			podsCache.EXPECT().List("models", gomock.Any()).Return(podObjects, nil)
+
+			started, _, err := handler.workerPodsStarted(root)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, started)
+		})
+	}
+}
+
+func TestRootWorkerPodsStartedPodListError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	pods := genericfake.NewMockControllerInterface[*corev1.Pod, *corev1.PodList](ctrl)
+	podsCache := genericfake.NewMockCacheInterface[*corev1.Pod](ctrl)
+
+	handler := &rootHandler{
+		workers:      workers,
+		statefulsets: statefulsets,
+		pods:         pods,
+		resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return &v1.Dllama{
+				ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+				Spec:       v1.DllamaSpec{ReplicaPower: 2},
+			}, nil
+		},
+	}
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Namespace: "models"}, Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}}
+	workerName := workerResourceName("demo")
+
+	workers.EXPECT().Cache().Return(workersCache).AnyTimes()
+	workersCache.EXPECT().Get("models", workerName).Return(&v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"}}, nil)
+	statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+	statefulsetsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{Status: appsv1.StatefulSetStatus{Replicas: 3}}, nil)
+	pods.EXPECT().Cache().Return(podsCache).AnyTimes()
+	podsCache.EXPECT().List("models", gomock.Any()).Return(nil, errors.New("boom"))
+
+	_, _, err := handler.workerPodsStarted(root)
+	require.Error(t, err)
 }

@@ -74,6 +74,9 @@ spec:
             {{- range .Values.operator.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+          env:
+            - name: OPERATOR_SERVICE_ACCOUNT
+              value: {{ include "koldun.serviceAccountName" . | quote }}
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port | default .Values.service.port }}

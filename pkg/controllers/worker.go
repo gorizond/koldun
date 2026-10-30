@@ -109,6 +109,18 @@ func (h *workerHandler) onRelatedService(key string, obj *corev1.Service) (*core
 
 func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 	name := worker.Name
+
+	// podManagementPolicy is immutable. Existing sessions have OrderedReady,
+	// which would deadlock the readiness probe (worker-0 waits for the root,
+	// later ordinals wait for worker-0). Roll the whole group once: workers
+	// first (so the root controller sees the STS gone), then the root.
+	if h.statefulsets != nil {
+		if existing, err := h.statefulsets.Cache().Get(worker.Namespace, name); err == nil && existing != nil &&
+			existing.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement {
+			return h.rolloutWorkerGroup(worker)
+		}
+	}
+
 	labels := map[string]string{
 		labelComponent:  componentWorker,
 		labelWorkerName: sanitizeLabelValue(worker.Name),
@@ -265,6 +277,23 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		ApplyObjects(svc, sts)
 }
 
+// rolloutWorkerGroup deletes the worker and root StatefulSets so they can be
+// recreated with Parallel pod management. Root creation is gated on worker
+// pods, so the root comes back after the workers.
+func (h *workerHandler) rolloutWorkerGroup(worker *v1.Worker) error {
+	propagation := metav1.DeletePropagationBackground
+	if err := h.statefulsets.Delete(worker.Namespace, worker.Name, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete worker statefulset for pod management migration: %w", err)
+	}
+	if dllamaName := labelValue(worker.Labels, labelDllamaName); dllamaName != "" {
+		rootName := fmt.Sprintf("%s-root", dllamaName)
+		if err := h.statefulsets.Delete(worker.Namespace, rootName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete root statefulset for pod management migration: %w", err)
+		}
+	}
+	return nil
+}
+
 func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resources corev1.ResourceRequirements) corev1.Container {
 	args := []string{"worker", "--port", "9999", "--nthreads", fmt.Sprintf("%d", threads)}
 	if len(worker.Spec.Args) > 0 {
@@ -338,7 +367,7 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		// writes the marker only after weightReader.read() completes.
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{Command: []string{"test", "-f", workerReadyFile}},
+				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "test -f " + workerReadyFile}},
 			},
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       10,

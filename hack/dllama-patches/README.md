@@ -1,0 +1,22 @@
+# distributed-llama patches
+
+`Dockerfile` clones upstream `b4rtaz/distributed-llama` at `DL_VERSION`
+(currently v0.16.5) and applies `*.patch` from this directory.
+
+- `0001-worker-readiness-and-http-resilience.patch`:
+  - worker writes `$DLLAMA_READY_FILE` after `weightReader.read()` (and removes
+    it on reload), backing the Kubernetes readiness probe;
+  - `dllama-api` catches HTTP client exceptions, answers 503 and keeps serving;
+  - HTTP client sockets get a 20m (configurable) `SO_RCVTIMEO`.
+
+When bumping `DL_VERSION`, re-apply the patches to a clean upstream checkout,
+resolve conflicts, and regenerate:
+
+```sh
+git clone --depth 1 --branch <version> https://github.com/b4rtaz/distributed-llama.git /tmp/dl
+cd /tmp/dl && git apply /path/to/0001-worker-readiness-and-http-resilience.patch
+# edit, test with: make dllama dllama-api
+git diff > /path/to/0001-worker-readiness-and-http-resilience.patch
+```
+
+Then run `docker build --no-cache --target dllama-builder .`.

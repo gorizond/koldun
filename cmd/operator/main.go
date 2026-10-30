@@ -103,6 +103,7 @@ func main() {
 		llmDllamaName              string
 		llmSidecarURL              string
 		llmSidecarTimeout          time.Duration
+		llmWorkerLoadTimeout       time.Duration
 		llmHealthOnly              bool
 		llmNamespace               string
 		llmSidecarMonitorInterval  time.Duration
@@ -177,6 +178,7 @@ func main() {
 	fs.StringVar(&llmDllamaName, "llm-dllama-name", "", "Identifier of the dllama worker for dispatcher accounting")
 	fs.StringVar(&llmSidecarURL, "llm-sidecar-url", "http://127.0.0.1:8080", "Base URL for dllama-api sidecar")
 	fs.DurationVar(&llmSidecarTimeout, "llm-sidecar-timeout", 2*time.Minute, "Timeout for sidecar HTTP calls")
+	fs.DurationVar(&llmWorkerLoadTimeout, "llm-worker-load-timeout", 20*time.Minute, "Maximum time to wait for dllama workers to load weights before evicting")
 	fs.BoolVar(&llmHealthOnly, "llm-health-only", false, "Disable health server (useful for tests)")
 	fs.StringVar(&llmNamespace, "llm-namespace", os.Getenv("POD_NAMESPACE"), "Namespace containing the dllama resource (defaults to pod namespace when available)")
 	fs.DurationVar(&llmSidecarMonitorInterval, "llm-sidecar-monitor-interval", 60*time.Second, "Interval between dllama-api health probes")
@@ -284,6 +286,7 @@ func main() {
 			Namespace:               llmNamespace,
 			SidecarURL:              llmSidecarURL,
 			SidecarTimeout:          llmSidecarTimeout,
+			WorkerLoadTimeout:       llmWorkerLoadTimeout,
 			SidecarMonitorInterval:  llmSidecarMonitorInterval,
 			SidecarFailureThreshold: llmSidecarFailureThreshold,
 			MaxSeqLen:               llmMaxSeqLen,

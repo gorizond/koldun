@@ -1,5 +1,5 @@
 diff --git a/src/app.cpp b/src/app.cpp
-index 74016a6..e2fafba 100644
+index 74016a6..26adb28 100644
 --- a/src/app.cpp
 +++ b/src/app.cpp
 @@ -1,5 +1,7 @@
@@ -24,7 +24,7 @@ index 74016a6..e2fafba 100644
          std::unique_ptr<NnNetwork> networkPtr = NnNetwork::serve(args->host, args->port);
          NnNetwork *network = networkPtr.get();
  
-@@ -325,6 +333,16 @@ void runWorkerApp(AppCliArgs *args) {
+@@ -325,6 +333,19 @@ void runWorkerApp(AppCliArgs *args) {
          NnWorkerWeightReader weightReader(&executor, network);
          weightReader.read();
  
@@ -33,9 +33,12 @@ index 74016a6..e2fafba 100644
 +        // llm sidecar from accepting requests while workers still load.
 +        if (readyFilePath != nullptr) {
 +            FILE *readyFile = std::fopen(readyFilePath, "w");
-+            if (readyFile != nullptr)
++            if (readyFile != nullptr) {
 +                std::fclose(readyFile);
-+            printf("✅ Readiness marker written: %s\n", readyFilePath);
++                printf("✅ Readiness marker written: %s\n", readyFilePath);
++            } else {
++                printf("🚨 Failed to write readiness marker: %s\n", readyFilePath);
++            }
 +        }
 +
          WorkerLlmInference inference(&execution, network);

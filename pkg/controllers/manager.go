@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
 
 	koldv1 "github.com/gorizond/koldun/pkg/controllers/koldunv1"
 	lassocontroller "github.com/rancher/lasso/pkg/controller"
@@ -67,6 +68,11 @@ type Manager struct {
 
 	ensureObjectStorageBuckets bool
 
+	// ServiceAccountName is the chart-managed service account (with dllama
+	// read access) used by root pods and their llm sidecars. Empty keeps the
+	// namespace default.
+	ServiceAccountName string
+
 	Core  corev1.Interface
 	Apps  appsv1.Interface
 	Batch batchv1.Interface
@@ -128,6 +134,7 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		Batch:                      batch,
 		Kold:                       kold,
 		ensureObjectStorageBuckets: true,
+		ServiceAccountName:         os.Getenv("OPERATOR_SERVICE_ACCOUNT"),
 	}, nil
 }
 

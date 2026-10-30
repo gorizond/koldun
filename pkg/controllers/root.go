@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
@@ -45,6 +46,9 @@ type rootHandler struct {
 	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
 	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
 
+	serviceAccountName string
+	pods               generic.ControllerInterface[*corev1.Pod, *corev1.PodList]
+
 	workerStatusHook  func(*v1.Root) (bool, int32, []string, error)
 	resolveDllamaHook func(*v1.Root) (*v1.Dllama, error)
 	resolveModelHook  func(*v1.Dllama) (*v1.Model, error)
@@ -52,15 +56,17 @@ type rootHandler struct {
 
 func registerRootController(ctx context.Context, m *Manager) error {
 	handler := &rootHandler{
-		ctx:          ctx,
-		apply:        m.Apply(ctx),
-		dllamas:      m.Kold.Dllama(),
-		models:       m.Kold.Model(),
-		roots:        m.Kold.Root(),
-		deployments:  m.Apps.Deployment(),
-		services:     m.Core.Service(),
-		statefulsets: m.Apps.StatefulSet(),
-		workers:      m.Kold.Worker(),
+		ctx:                ctx,
+		apply:              m.Apply(ctx),
+		dllamas:            m.Kold.Dllama(),
+		models:             m.Kold.Model(),
+		roots:              m.Kold.Root(),
+		deployments:        m.Apps.Deployment(),
+		services:           m.Core.Service(),
+		statefulsets:       m.Apps.StatefulSet(),
+		workers:            m.Kold.Worker(),
+		serviceAccountName: m.ServiceAccountName,
+		pods:               m.Core.Pod(),
 	}
 
 	handler.roots.OnChange(ctx, "koldun-root-controller", handler.onChange)
@@ -311,6 +317,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
+					ServiceAccountName:            h.serviceAccountName,
 					TopologySpreadConstraints:     dllamaTopologySpread(labels[labelDllamaName]),
 					Volumes: []corev1.Volume{
 						{
@@ -451,7 +458,30 @@ func (h *rootHandler) workerPodsStarted(root *v1.Root) (started bool, endpoints 
 	if sts.Status.ReadyReplicas > created {
 		created = sts.Status.ReadyReplicas
 	}
-	return created >= replicas, endpoints, nil
+	if created < replicas {
+		return false, endpoints, nil
+	}
+	if h.pods == nil {
+		return true, endpoints, nil
+	}
+
+	// Pods that are still Pending/ContainerCreating have no address in the
+	// headless service yet and would make the root's single-shot connect fail.
+	// Wait for Running pods; the root still retries connects once they listen.
+	pods, err := h.pods.Cache().List(worker.Namespace, labels.SelectorFromSet(map[string]string{
+		labelDllamaName: dllama.Name,
+		labelComponent:  componentWorker,
+	}))
+	if err != nil {
+		return false, endpoints, err
+	}
+	running := int32(0)
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning {
+			running++
+		}
+	}
+	return running >= replicas, endpoints, nil
 }
 
 func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int32, endpoints []string, err error) {
@@ -523,12 +553,15 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		args = append(args, root.Spec.Args...)
 	}
 
+	httpReadTimeout := 20 * time.Minute
+	if root.Spec.SidecarTimeout != nil && root.Spec.SidecarTimeout.Duration+5*time.Minute > httpReadTimeout {
+		httpReadTimeout = root.Spec.SidecarTimeout.Duration + 5*time.Minute
+	}
 	env := []corev1.EnvVar{
 		{Name: "DLLAMA_ROLE", Value: "root"},
-		// Outlive the llm sidecar request timeout and worker weight loading.
-		// The patched dllama-api also defaults to this value; setting it here
-		// keeps the socket timeout visible/configurable in the pod spec.
-		{Name: "DLLAMA_HTTP_READ_TIMEOUT_SECONDS", Value: "1200"},
+		// Outlive the llm sidecar request timeout (ingress responseTimeout) and
+		// worker weight loading. The patched dllama-api also defaults to 20m.
+		{Name: "DLLAMA_HTTP_READ_TIMEOUT_SECONDS", Value: fmt.Sprint(int(httpReadTimeout.Seconds()))},
 	}
 
 	if root.Spec.CacheSpec != nil {
