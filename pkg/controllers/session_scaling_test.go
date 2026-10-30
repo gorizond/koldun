@@ -106,6 +106,34 @@ func TestScalingParamsFromSession(t *testing.T) {
 			},
 		},
 		{
+			name: "scaling without min falls back to legacy MinIdle",
+			session: &v1.Session{
+				Spec: v1.SessionSpec{
+					MinIdle: 3,
+					Scaling: &v1.SessionScalingSpec{
+						MaxDllamas: 10,
+					},
+				},
+			},
+			expected: sessionScalingParams{
+				min: 3,
+				max: 10,
+			},
+		},
+		{
+			name: "negative explicit min clamps to zero",
+			session: &v1.Session{
+				Spec: v1.SessionSpec{
+					Scaling: &v1.SessionScalingSpec{
+						MinDllamas: int32Ptr(-1),
+					},
+				},
+			},
+			expected: sessionScalingParams{
+				min: 0,
+			},
+		},
+		{
 			name: "negative min corrected to 1",
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
@@ -385,6 +413,21 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 				lastActivity: pastActivity,
 			},
 			expected: true,
+		},
+		{
+			name: "don't scale down with an in-flight request",
+			params: sessionScalingParams{
+				min:           0,
+				scaleDownIdle: 5 * time.Minute,
+			},
+			state: sessionPoolState{
+				dllamas:        makeDllamas(1),
+				ready:          makeDllamas(1),
+				idleReady:      makeDllamas(1),
+				activeRequests: 1,
+				lastActivity:   pastActivity,
+			},
+			expected: false,
 		},
 		{
 			name: "scale down below desired count",
@@ -733,4 +776,20 @@ func makeDllamas(count int) []*v1.Dllama {
 		}
 	}
 	return result
+}
+
+func TestScalingParamsFallsBackToLegacyMaxWorkers(t *testing.T) {
+	session := &v1.Session{
+		Spec: v1.SessionSpec{
+			MaxWorkers: 5,
+			Scaling:    &v1.SessionScalingSpec{MinDllamas: int32Ptr(0)},
+		},
+	}
+	params := scalingParamsFromSession(session)
+	if params.max != 5 {
+		t.Fatalf("max = %d, want legacy MaxWorkers=5", params.max)
+	}
+	if params.min != 0 {
+		t.Fatalf("min = %d, want 0", params.min)
+	}
 }

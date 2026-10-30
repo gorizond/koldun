@@ -1397,12 +1397,16 @@ func TestSyncSessionLastActivity(t *testing.T) {
 			return obj, nil
 		})
 
+		withLoad := *record
+		withLoad.Scaling = &conversation.SessionScalingConfig{ActiveRequests: 2}
+
 		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
-		reconciler.syncSessionLastActivity(record)
+		reconciler.syncSessionLastActivity(&withLoad)
 
 		require.NotNil(t, updated)
 		require.NotNil(t, updated.Status.LastActivity)
 		require.Equal(t, activity, updated.Status.LastActivity.Unix())
+		require.Equal(t, int32(2), updated.Status.ActiveRequests)
 	})
 
 	t.Run("does not overwrite newer status activity", func(t *testing.T) {
@@ -1504,4 +1508,46 @@ func TestEnsureSessionPassesExplicitZeroMin(t *testing.T) {
 	require.Equal(t, int32(0), *applied.Spec.Scaling.MinDllamas)
 	require.NotNil(t, applied.Spec.Scaling.DesiredDllamas)
 	require.Equal(t, int32(0), *applied.Spec.Scaling.DesiredDllamas)
+}
+
+func TestSyncSessionLastActivityMirrorsActiveRequestsOnly(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+	}, nil)
+
+	var updated *v1.Session
+	sessions.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(func(obj *v1.Session) (*v1.Session, error) {
+		updated = obj
+		return obj, nil
+	})
+
+	reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+	reconciler.syncSessionLastActivity(&conversation.Record{
+		Hash:      "hash",
+		Session:   "session-hash",
+		Namespace: "tenant",
+		Scaling:   &conversation.SessionScalingConfig{ActiveRequests: 2},
+	})
+
+	require.NotNil(t, updated)
+	require.Equal(t, int32(2), updated.Status.ActiveRequests)
+	require.Nil(t, updated.Status.LastActivity)
+
+	// A negative counter is clamped to zero and does not trigger a write.
+	ctrl2 := gomock.NewController(t)
+	t.Cleanup(ctrl2.Finish)
+	sessions2 := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl2)
+	reconciler2 := &conversationReconciler{sessions: sessions2, log: logrus.NewEntry(logrus.New())}
+	reconciler2.syncSessionLastActivity(&conversation.Record{
+		Hash:      "hash",
+		Session:   "session-hash",
+		Namespace: "tenant",
+		Scaling:   &conversation.SessionScalingConfig{ActiveRequests: -3},
+	})
 }

@@ -157,7 +157,7 @@ func (r *Record) Validate() error {
 		min := int32(1)
 		r.Scaling.MinDllamas = &min
 	} else if *r.Scaling.MinDllamas < 0 {
-		min := int32(1)
+		min := int32(0)
 		r.Scaling.MinDllamas = &min
 	}
 	minDllamas := *r.Scaling.MinDllamas

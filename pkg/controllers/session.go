@@ -177,6 +177,7 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 
 	params := scalingParamsFromSession(sess)
 	state := computeSessionPoolState(sess, dllamas)
+	defer h.scheduleScaleDownCheck(sess, params, state)
 
 	if int32(state.total()) < params.min {
 		if err := h.createDllamaForSession(sess); err != nil {
@@ -221,6 +222,25 @@ func (h *sessionHandler) ensureTopology(sess *v1.Session) error {
 	}
 
 	return h.ensureDispatcher(sess)
+}
+
+// scheduleScaleDownCheck arranges a wake-up at lastActivity+scaleDownIdle.
+// Reconciliation is event-driven, so without this an idle session with no
+// further spec/status changes would never be re-evaluated.
+func (h *sessionHandler) scheduleScaleDownCheck(sess *v1.Session, params sessionScalingParams, state sessionPoolState) {
+	if h.sessions == nil || params.scaleDownIdle <= 0 {
+		return
+	}
+	if int32(state.total()) <= params.min || state.lastActivity.IsZero() || state.activeRequests > 0 || state.backlog > 0 {
+		return
+	}
+	delay := time.Until(state.lastActivity.Add(params.scaleDownIdle))
+	if delay < time.Second {
+		// Already due (or nearly so); re-check shortly. Avoids a tight loop
+		// when a reconcile cannot delete a worker yet.
+		delay = time.Second
+	}
+	h.sessions.EnqueueAfter(sess.Namespace, sess.Name, delay)
 }
 
 func (h *sessionHandler) ensureStatus(sess *v1.Session) (*v1.Session, error) {
@@ -393,12 +413,17 @@ func scalingParamsFromSession(sess *v1.Session) sessionScalingParams {
 		sc := sess.Spec.Scaling
 		if sc.MinDllamas != nil {
 			params.min = *sc.MinDllamas
-			if params.min < 0 {
-				params.min = 0
-			}
+		} else if sess.Spec.MinIdle > 0 {
+			// Fall back to the deprecated field only when min is unset.
+			params.min = sess.Spec.MinIdle
+		}
+		if params.min < 0 {
+			params.min = 0
 		}
 		if sc.MaxDllamas > 0 {
 			params.max = sc.MaxDllamas
+		} else if sess.Spec.MaxWorkers > 0 {
+			params.max = sess.Spec.MaxWorkers
 		}
 		if sc.ScaleUpBacklog > 0 {
 			params.scaleUpThreshold = int64(sc.ScaleUpBacklog)
@@ -455,6 +480,9 @@ func (p sessionScalingParams) shouldScaleDown(state sessionPoolState) bool {
 	if int32(state.total()) <= p.min {
 		return false
 	}
+	if state.activeRequests > 0 {
+		return false
+	}
 	if state.idleCount() == 0 {
 		return false
 	}
@@ -472,12 +500,13 @@ func (p sessionScalingParams) shouldScaleDown(state sessionPoolState) bool {
 
 // sessionPoolState summarises the current dllama pool for scaling decisions.
 type sessionPoolState struct {
-	dllamas       []*v1.Dllama
-	ready         []*v1.Dllama
-	idleReady     []*v1.Dllama
-	workerMetrics map[string]v1.SessionWorker
-	backlog       int64
-	lastActivity  time.Time
+	dllamas        []*v1.Dllama
+	ready          []*v1.Dllama
+	idleReady      []*v1.Dllama
+	workerMetrics  map[string]v1.SessionWorker
+	backlog        int64
+	activeRequests int32
+	lastActivity   time.Time
 }
 
 func (s sessionPoolState) total() int { return len(s.dllamas) }
@@ -495,9 +524,10 @@ func computeSessionPoolState(sess *v1.Session, dllamas []*v1.Dllama) sessionPool
 	}
 
 	state := sessionPoolState{
-		dllamas:       dllamas,
-		workerMetrics: workerMetrics,
-		backlog:       sess.Status.Backlog,
+		dllamas:        dllamas,
+		workerMetrics:  workerMetrics,
+		backlog:        sess.Status.Backlog,
+		activeRequests: sess.Status.ActiveRequests,
 	}
 	if sess.Status.LastActivity != nil {
 		state.lastActivity = sess.Status.LastActivity.Time

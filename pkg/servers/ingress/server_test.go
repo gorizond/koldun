@@ -152,7 +152,7 @@ func TestNewNormalizesSessionScaling(t *testing.T) {
 		return srv
 	}
 
-	require.Equal(t, int32(1), newServer(-1, 0).cfg.SessionMinDllamas, "negative min falls back to 1")
+	require.Equal(t, int32(0), newServer(-1, 0).cfg.SessionMinDllamas, "negative min clamps to 0")
 	require.Equal(t, int32(2), newServer(2, 1).cfg.SessionMaxDllamas, "max is raised to min")
 	require.Equal(t, int32(0), newServer(0, 0).cfg.SessionMinDllamas, "explicit zero min survives")
 }
@@ -1132,7 +1132,7 @@ func TestServerSessionLoadLifecycle(t *testing.T) {
 
 func TestServerScheduleSessionCleanup(t *testing.T) {
 	srv := &Server{
-		cfg: Config{SessionScaleDownIdleSeconds: 1},
+		cfg: Config{ConversationTTL: time.Second},
 	}
 
 	now := time.Now()
@@ -1163,8 +1163,8 @@ func TestServerFinalizeSessionCleanup(t *testing.T) {
 
 		srv := &Server{
 			cfg: Config{
-				TTLPrefix:                   "nats_ttl_",
-				SessionScaleDownIdleSeconds: 1,
+				TTLPrefix:       "nats_ttl_",
+				ConversationTTL: time.Second,
 			},
 			convKV: kv,
 			log:    logrus.New().WithField("component", "ingress-test"),
@@ -1213,8 +1213,8 @@ func TestServerFinalizeSessionCleanup(t *testing.T) {
 
 		srv := &Server{
 			cfg: Config{
-				TTLPrefix:                   "nats_ttl_",
-				SessionScaleDownIdleSeconds: 1,
+				TTLPrefix:       "nats_ttl_",
+				ConversationTTL: time.Second,
 			},
 			convKV: kv,
 			log:    logrus.New().WithField("component", "ingress-test"),
@@ -4621,4 +4621,99 @@ func TestHandleChatCompletionsAcceptsBoundaryBody(t *testing.T) {
 
 func int32Ptr(value int32) *int32 {
 	return &value
+}
+
+func TestTouchConversationActivity(t *testing.T) {
+	t.Parallel()
+
+	record := &conversation.Record{
+		Hash:        "conv",
+		Namespace:   "ns",
+		Model:       "ns/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+		Scaling:     &conversation.SessionScalingConfig{ActiveRequests: 1},
+	}
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+
+	var stored []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 3}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			stored = append([]byte(nil), value...)
+			return 4, nil
+		},
+	}
+	srv := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	completed := time.Unix(1700000999, 0)
+	srv.touchConversationActivity("conv", completed)
+
+	require.NotNil(t, stored)
+	parsed, err := conversation.ParseRecord(stored)
+	require.NoError(t, err)
+	require.Equal(t, completed.Unix(), parsed.LastActivityAt)
+	require.Equal(t, int32(1), parsed.Scaling.ActiveRequests, "activity refresh must not clobber in-flight count")
+
+	(&Server{}).touchConversationActivity("conv", completed) // nil KV is a no-op
+}
+
+func TestEnsureConversationRetriesRevisionConflicts(t *testing.T) {
+	zero := int32(0)
+	old := &conversation.Record{
+		Hash:        "conflict",
+		Session:     "session-conflict",
+		Namespace:   "test-ns",
+		Model:       "ns/model",
+		RootImage:   "root:v1",
+		WorkerImage: "worker:v1",
+		Scaling:     &conversation.SessionScalingConfig{MinDllamas: &zero, DesiredDllamas: &zero},
+		Queue:       &conversation.QueueConfig{},
+	}
+	data, err := old.Marshal()
+	require.NoError(t, err)
+
+	updates := 0
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 1}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			updates++
+			if updates == 1 {
+				return 0, nats.ErrKeyExists
+			}
+			return revision + 1, nil
+		},
+	}
+	srv := &Server{
+		cfg: Config{
+			Namespace:         "test-ns",
+			RootImage:         "root:v1",
+			WorkerImage:       "worker:v1",
+			NATSURL:           "nats://test:4222",
+			TTLPrefix:         "conv:",
+			OutPrefix:         "out.",
+			SessionMinDllamas: 0,
+			SessionMaxDllamas: 5,
+		},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "conflict", &registry.Model{
+		Name:      "model",
+		Namespace: "ns",
+	}, 1)
+	require.NoError(t, err)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	require.Equal(t, int32(1), *record.Scaling.DesiredDllamas, "desired must not stay 0 after a conflict")
+	require.Equal(t, 2, updates, "revision conflict should be retried")
 }

@@ -362,29 +362,51 @@ func (r *conversationReconciler) ensureSession(record *conversation.Record) erro
 }
 
 // syncSessionLastActivity mirrors the conversation record's activity timestamp
-// into Session.Status.LastActivity so the session scaler can run its idle
-// timer. The Session status is a subresource, so this cannot go through apply.
+// and in-flight request count into the Session status. The session scaler uses
+// both: the timestamp drives the idle timer and ActiveRequests blocks
+// scale-down while a request is still running. The Session status is a
+// subresource, so this cannot go through apply.
 func (r *conversationReconciler) syncSessionLastActivity(record *conversation.Record) {
-	if record == nil || record.LastActivityAt <= 0 || r.sessions == nil {
+	if record == nil || r.sessions == nil {
+		return
+	}
+
+	activeRequests := int32(0)
+	if record.Scaling != nil {
+		activeRequests = record.Scaling.ActiveRequests
+		if activeRequests < 0 {
+			activeRequests = 0
+		}
+	}
+
+	if record.LastActivityAt <= 0 && activeRequests == 0 {
 		return
 	}
 
 	session, err := r.sessions.Cache().Get(record.Namespace, record.SessionName())
 	if err != nil || session == nil {
 		if err != nil && !apierrors.IsNotFound(err) {
-			r.log.WithError(err).WithField("session", record.SessionName()).Warn("get session for last activity")
+			r.log.WithError(err).WithField("session", record.SessionName()).Warn("get session for status sync")
 		}
 		return
 	}
 
-	if session.Status.LastActivity != nil && session.Status.LastActivity.Unix() >= record.LastActivityAt {
+	needsActivity := record.LastActivityAt > 0 &&
+		(session.Status.LastActivity == nil || session.Status.LastActivity.Unix() < record.LastActivityAt)
+	needsActive := session.Status.ActiveRequests != activeRequests
+	if !needsActivity && !needsActive {
 		return
 	}
 
 	updated := session.DeepCopy()
-	updated.Status.LastActivity = &metav1.Time{Time: time.Unix(record.LastActivityAt, 0).UTC()}
+	if needsActivity {
+		updated.Status.LastActivity = &metav1.Time{Time: time.Unix(record.LastActivityAt, 0).UTC()}
+	}
+	if needsActive {
+		updated.Status.ActiveRequests = activeRequests
+	}
 	if _, err := r.sessions.UpdateStatus(updated); err != nil {
-		r.log.WithError(err).WithField("session", record.SessionName()).Warn("update session last activity")
+		r.log.WithError(err).WithField("session", record.SessionName()).Warn("update session status")
 	}
 }
 

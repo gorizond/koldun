@@ -215,7 +215,7 @@ func TestStreamResponseRequiresFlusher(t *testing.T) {
 
 	srv := &Server{}
 	writer := &noFlushWriter{}
-	srv.streamResponse(context.Background(), writer, make(chan *nats.Msg))
+	srv.streamResponse(context.Background(), writer, make(chan *nats.Msg), nil)
 
 	require.Equal(t, http.StatusInternalServerError, writer.status)
 	require.Contains(t, writer.body.String(), `"streaming not supported"`)
@@ -235,7 +235,7 @@ func TestStreamResponseHappyPath(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs)
+		srv.streamResponse(ctx, rec, msgs, nil)
 	}()
 
 	msgs <- &nats.Msg{Data: []byte(`{"choices":[{"delta":{"role":"assistant","content":"hello"}}]}`)}
@@ -274,7 +274,7 @@ func TestStreamResponseContextCancelled(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs)
+		srv.streamResponse(ctx, rec, msgs, nil)
 	}()
 
 	time.AfterFunc(5*time.Millisecond, cancel)
@@ -306,7 +306,7 @@ func TestStreamResponseSubscriptionClosed(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs)
+		srv.streamResponse(ctx, rec, msgs, nil)
 	}()
 
 	close(msgs)
@@ -511,4 +511,38 @@ func TestNormaliseStreamingChunkScrubsExpandingRunes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, normalised, "response")
 	require.Contains(t, normalised, "answer")
+}
+
+func TestStreamResponseHeartbeat(t *testing.T) {
+	srv := &Server{
+		log:                     logrus.New().WithField("component", "test"),
+		streamHeartbeatInterval: 5 * time.Millisecond,
+	}
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	msgs := make(chan *nats.Msg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	heartbeats := make(chan struct{}, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		srv.streamResponse(ctx, rec, msgs, func() {
+			select {
+			case heartbeats <- struct{}{}:
+			default:
+			}
+		})
+	}()
+
+	select {
+	case <-heartbeats:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		wg.Wait()
+		t.Fatal("stream heartbeat was not invoked")
+	}
+	wg.Wait()
 }

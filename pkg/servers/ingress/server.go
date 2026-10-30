@@ -169,8 +169,9 @@ type Server struct {
 		workers map[string]map[string]cachedWorkerState
 	}
 
-	afterResponseSubscribe func() // test hook invoked after response subscription is created
-	ensureConversationHook func(context.Context, string, *registry.Model, int32) (*conversation.Record, error)
+	afterResponseSubscribe  func() // test hook invoked after response subscription is created
+	ensureConversationHook  func(context.Context, string, *registry.Model, int32) (*conversation.Record, error)
+	streamHeartbeatInterval time.Duration // test hook; defaults to 10s
 }
 
 type tokenEntry struct {
@@ -232,7 +233,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	cfg.SessionDispatcherMetricsListen = strings.TrimSpace(cfg.SessionDispatcherMetricsListen)
 	if cfg.SessionMinDllamas < 0 {
-		cfg.SessionMinDllamas = 1
+		cfg.SessionMinDllamas = 0
 	}
 	if cfg.SessionMaxDllamas > 0 && cfg.SessionMaxDllamas < cfg.SessionMinDllamas {
 		cfg.SessionMaxDllamas = cfg.SessionMinDllamas
@@ -346,16 +347,16 @@ func ensureBucket(js nats.JetStreamContext, cfg *nats.KeyValueConfig, log *logru
 			if err := updateBucketTTL(js, cfg.Bucket, desired); err != nil {
 				if log != nil {
 					log.WithError(err).WithFields(logrus.Fields{
-						"bucket":     cfg.Bucket,
-						"want_ttl":   desired,
-						"actual_ttl": current,
-					}).Warn("failed to update conversation bucket TTL; keeping existing bucket")
+						"bucket":       cfg.Bucket,
+						"want_ttl":     desired,
+						"previous_ttl": current,
+					}).Error("failed to update conversation bucket TTL; stale records may keep sessions alive (check JetStream stream-update permission)")
 				}
 			} else if log != nil {
 				log.WithFields(logrus.Fields{
-					"bucket":     cfg.Bucket,
-					"old_ttl":    current,
-					"actual_ttl": desired,
+					"bucket":       cfg.Bucket,
+					"previous_ttl": current,
+					"ttl":          desired,
 				}).Info("conversation bucket TTL updated")
 			}
 		}
@@ -879,9 +880,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.touchConversationRecord(hash, messageCount, prefixHash, time.Now())
+	// Stamp completion as well as start: a long generation must not look idle
+	// to the session scaler, and the record TTL must be refreshed on finish.
+	defer func() {
+		s.touchConversationActivity(hash, time.Now())
+	}()
 
 	if req.Stream {
-		s.streamResponse(respCtx, w, msgs)
+		s.streamResponse(respCtx, w, msgs, func() {
+			s.touchConversationActivity(hash, time.Now())
+		})
 		return
 	}
 
@@ -923,6 +931,118 @@ func errorResponseStatus(body []byte) int {
 	return 0
 }
 
+// applyConversationUpdates normalises an existing conversation record against
+// the current ingress configuration. It returns true when anything changed.
+// ensureConversation applies it through conversation.UpdateRecord, which
+// retries revision conflicts so a concurrent ingress replica cannot leave the
+// record with a stale desiredDllamas.
+func (s *Server) applyConversationUpdates(record *conversation.Record, hash string, model *registry.Model, active int32) bool {
+	recordChanged := false
+	requiredReplica := s.replicaPowerForModel(model)
+	if record.ReplicaPower != requiredReplica {
+		record.ReplicaPower = requiredReplica
+		recordChanged = true
+	}
+	if record.RootImage != s.cfg.RootImage {
+		record.RootImage = s.cfg.RootImage
+		recordChanged = true
+	}
+	if record.WorkerImage != s.cfg.WorkerImage {
+		record.WorkerImage = s.cfg.WorkerImage
+		recordChanged = true
+	}
+	if record.DispatcherImage != s.cfg.SessionDispatcherImage {
+		record.DispatcherImage = s.cfg.SessionDispatcherImage
+		recordChanged = true
+	}
+	if record.DispatcherMetricsListen != s.cfg.SessionDispatcherMetricsListen {
+		record.DispatcherMetricsListen = s.cfg.SessionDispatcherMetricsListen
+		recordChanged = true
+	}
+	if record.NATS.URL != s.cfg.NATSURL {
+		s.log.WithFields(logrus.Fields{
+			"hash":         hash,
+			"old_nats_url": record.NATS.URL,
+			"new_nats_url": s.cfg.NATSURL,
+		}).Info("updating conversation record NATS URL")
+		record.NATS.URL = s.cfg.NATSURL
+		recordChanged = true
+	}
+	if strings.TrimSpace(record.Session) == "" {
+		record.Session = fmt.Sprintf("session-%s", sanitizeSessionHash(hash))
+		recordChanged = true
+	}
+	if record.Queue == nil {
+		record.Queue = &conversation.QueueConfig{}
+		recordChanged = true
+	}
+	backlogSubject := sessionBacklogSubject(hash)
+	if record.Queue.BacklogSubject != backlogSubject {
+		record.Queue.BacklogSubject = backlogSubject
+		recordChanged = true
+	}
+	responsePrefix := responseSubjectPrefix(s.cfg.OutPrefix, hash)
+	if record.Queue.ResponseSubjectPrefix != responsePrefix {
+		record.Queue.ResponseSubjectPrefix = responsePrefix
+		recordChanged = true
+	}
+	dllamaPrefix := dllamaSubjectPrefix(hash)
+	if record.Queue.DllamaSubjectPrefix != dllamaPrefix {
+		record.Queue.DllamaSubjectPrefix = dllamaPrefix
+		recordChanged = true
+	}
+	assignmentsBucket := assignmentsBucketName(hash)
+	if record.Queue.AssignmentsBucket != assignmentsBucket {
+		record.Queue.AssignmentsBucket = assignmentsBucket
+		recordChanged = true
+	}
+	if record.Queue.ConversationBucket != s.cfg.ConversationBucket {
+		record.Queue.ConversationBucket = s.cfg.ConversationBucket
+		recordChanged = true
+	}
+	stateStream := stateStreamName(hash)
+	if record.Queue.StateStream != stateStream {
+		record.Queue.StateStream = stateStream
+		recordChanged = true
+	}
+	if record.Scaling == nil {
+		record.Scaling = &conversation.SessionScalingConfig{}
+		recordChanged = true
+	}
+	if !int32PointerMatches(record.Scaling.MinDllamas, s.cfg.SessionMinDllamas) {
+		record.Scaling.MinDllamas = int32Pointer(s.cfg.SessionMinDllamas)
+		recordChanged = true
+	}
+	if record.Scaling.MaxDllamas != s.cfg.SessionMaxDllamas {
+		record.Scaling.MaxDllamas = s.cfg.SessionMaxDllamas
+		recordChanged = true
+	}
+	if record.Scaling.ScaleUpBacklog != s.cfg.SessionScaleUpBacklog {
+		record.Scaling.ScaleUpBacklog = s.cfg.SessionScaleUpBacklog
+		recordChanged = true
+	}
+	if record.Scaling.ScaleDownIdleSeconds != s.cfg.SessionScaleDownIdleSeconds {
+		record.Scaling.ScaleDownIdleSeconds = s.cfg.SessionScaleDownIdleSeconds
+		recordChanged = true
+	}
+	desired := active
+	if desired < s.cfg.SessionMinDllamas {
+		desired = s.cfg.SessionMinDllamas
+	}
+	if s.cfg.SessionMaxDllamas > 0 && desired > s.cfg.SessionMaxDllamas {
+		desired = s.cfg.SessionMaxDllamas
+	}
+	if !int32PointerMatches(record.Scaling.DesiredDllamas, desired) {
+		record.Scaling.DesiredDllamas = int32Pointer(desired)
+		recordChanged = true
+	}
+	if record.Scaling.ActiveRequests != active {
+		record.Scaling.ActiveRequests = active
+		recordChanged = true
+	}
+	return recordChanged
+}
+
 func (s *Server) ensureConversation(ctx context.Context, hash string, model *registry.Model, active int32) (*conversation.Record, error) {
 	if hook := s.ensureConversationHook; hook != nil {
 		return hook(ctx, hash, model, active)
@@ -939,119 +1059,17 @@ func (s *Server) ensureConversation(ctx context.Context, hash string, model *reg
 	if err == nil {
 		record, parseErr := conversation.ParseRecord(rev.Value())
 		if parseErr == nil {
-			recordChanged := false
-			requiredReplica := s.replicaPowerForModel(model)
-			if record.ReplicaPower != requiredReplica {
-				record.ReplicaPower = requiredReplica
-				recordChanged = true
+			if !s.applyConversationUpdates(record, hash, model, active) {
+				return record, nil
 			}
-			if record.RootImage != s.cfg.RootImage {
-				record.RootImage = s.cfg.RootImage
-				recordChanged = true
+			updated, updateErr := conversation.UpdateRecord(s.convKV, key, func(fresh *conversation.Record) bool {
+				return s.applyConversationUpdates(fresh, hash, model, active)
+			})
+			if updateErr != nil {
+				s.log.WithError(updateErr).Warn("update conversation record")
+				return record, nil
 			}
-			if record.WorkerImage != s.cfg.WorkerImage {
-				record.WorkerImage = s.cfg.WorkerImage
-				recordChanged = true
-			}
-			if record.DispatcherImage != s.cfg.SessionDispatcherImage {
-				record.DispatcherImage = s.cfg.SessionDispatcherImage
-				recordChanged = true
-			}
-			if record.DispatcherMetricsListen != s.cfg.SessionDispatcherMetricsListen {
-				record.DispatcherMetricsListen = s.cfg.SessionDispatcherMetricsListen
-				recordChanged = true
-			}
-			if record.NATS.URL != s.cfg.NATSURL {
-				s.log.WithFields(logrus.Fields{
-					"hash":         hash,
-					"old_nats_url": record.NATS.URL,
-					"new_nats_url": s.cfg.NATSURL,
-				}).Info("updating conversation record NATS URL")
-				record.NATS.URL = s.cfg.NATSURL
-				recordChanged = true
-			}
-			if strings.TrimSpace(record.Session) == "" {
-				record.Session = fmt.Sprintf("session-%s", sanitizeSessionHash(hash))
-				recordChanged = true
-			}
-			if record.Queue == nil {
-				record.Queue = &conversation.QueueConfig{}
-				recordChanged = true
-			}
-			backlogSubject := sessionBacklogSubject(hash)
-			if record.Queue.BacklogSubject != backlogSubject {
-				record.Queue.BacklogSubject = backlogSubject
-				recordChanged = true
-			}
-			responsePrefix := responseSubjectPrefix(s.cfg.OutPrefix, hash)
-			if record.Queue.ResponseSubjectPrefix != responsePrefix {
-				record.Queue.ResponseSubjectPrefix = responsePrefix
-				recordChanged = true
-			}
-			dllamaPrefix := dllamaSubjectPrefix(hash)
-			if record.Queue.DllamaSubjectPrefix != dllamaPrefix {
-				record.Queue.DllamaSubjectPrefix = dllamaPrefix
-				recordChanged = true
-			}
-			assignmentsBucket := assignmentsBucketName(hash)
-			if record.Queue.AssignmentsBucket != assignmentsBucket {
-				record.Queue.AssignmentsBucket = assignmentsBucket
-				recordChanged = true
-			}
-			if record.Queue.ConversationBucket != s.cfg.ConversationBucket {
-				record.Queue.ConversationBucket = s.cfg.ConversationBucket
-				recordChanged = true
-			}
-			stateStream := stateStreamName(hash)
-			if record.Queue.StateStream != stateStream {
-				record.Queue.StateStream = stateStream
-				recordChanged = true
-			}
-			if record.Scaling == nil {
-				record.Scaling = &conversation.SessionScalingConfig{}
-				recordChanged = true
-			}
-			if !int32PointerMatches(record.Scaling.MinDllamas, s.cfg.SessionMinDllamas) {
-				record.Scaling.MinDllamas = int32Pointer(s.cfg.SessionMinDllamas)
-				recordChanged = true
-			}
-			if record.Scaling.MaxDllamas != s.cfg.SessionMaxDllamas {
-				record.Scaling.MaxDllamas = s.cfg.SessionMaxDllamas
-				recordChanged = true
-			}
-			if record.Scaling.ScaleUpBacklog != s.cfg.SessionScaleUpBacklog {
-				record.Scaling.ScaleUpBacklog = s.cfg.SessionScaleUpBacklog
-				recordChanged = true
-			}
-			if record.Scaling.ScaleDownIdleSeconds != s.cfg.SessionScaleDownIdleSeconds {
-				record.Scaling.ScaleDownIdleSeconds = s.cfg.SessionScaleDownIdleSeconds
-				recordChanged = true
-			}
-			desired := active
-			if desired < s.cfg.SessionMinDllamas {
-				desired = s.cfg.SessionMinDllamas
-			}
-			if s.cfg.SessionMaxDllamas > 0 && desired > s.cfg.SessionMaxDllamas {
-				desired = s.cfg.SessionMaxDllamas
-			}
-			if !int32PointerMatches(record.Scaling.DesiredDllamas, desired) {
-				record.Scaling.DesiredDllamas = int32Pointer(desired)
-				recordChanged = true
-			}
-			if record.Scaling.ActiveRequests != active {
-				record.Scaling.ActiveRequests = active
-				recordChanged = true
-			}
-			if recordChanged {
-				data, err := record.Marshal()
-				if err == nil {
-					_, err = s.convKV.Update(key, data, rev.Revision())
-					if err != nil {
-						s.log.WithError(err).Warn("update conversation record")
-					}
-				}
-			}
-			return record, nil
+			return updated, nil
 		}
 		// fallthrough to create new record if parsing failed
 	} else if err != nil && err != nats.ErrKeyNotFound {
@@ -1190,7 +1208,7 @@ func (s *Server) decrementSessionLoad(hash string) int32 {
 			s.sessionLoad.lastActivity = make(map[string]time.Time)
 		}
 		s.sessionLoad.lastActivity[hash] = now
-		if s.cfg.SessionScaleDownIdleSeconds > 0 {
+		if s.cfg.ConversationTTL > 0 {
 			s.scheduleSessionCleanupLocked(hash, now)
 		} else {
 			delete(s.sessionLoad.lastActivity, hash)
@@ -1216,7 +1234,10 @@ func (s *Server) sessionLoadValue(hash string) int32 {
 }
 
 func (s *Server) scheduleSessionCleanupLocked(hash string, last time.Time) {
-	idleAfter := time.Duration(s.cfg.SessionScaleDownIdleSeconds) * time.Second
+	// The record lifetime is the conversation TTL, not the dllama idle
+	// threshold: the scaler owns draining workers to zero, while the record
+	// (and its Session) should stay warm for the conversation TTL.
+	idleAfter := s.cfg.ConversationTTL
 	if idleAfter <= 0 {
 		return
 	}
@@ -1235,7 +1256,7 @@ func (s *Server) scheduleSessionCleanupLocked(hash string, last time.Time) {
 }
 
 func (s *Server) finalizeSessionCleanup(hash string, deadline time.Time) {
-	idleAfter := time.Duration(s.cfg.SessionScaleDownIdleSeconds) * time.Second
+	idleAfter := s.cfg.ConversationTTL
 	if idleAfter <= 0 {
 		return
 	}
@@ -1486,7 +1507,7 @@ func (s *Server) refreshConversationTTL(hash string) {
 	}
 }
 
-func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs <-chan *nats.Msg) {
+func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs <-chan *nats.Msg, heartbeat func()) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
@@ -1522,7 +1543,11 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 	}
 
 	state := streamingNormaliserState{disableThink: s.cfg.DisableThinkFilter}
-	keepalive := time.NewTicker(10 * time.Second)
+	interval := s.streamHeartbeatInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	keepalive := time.NewTicker(interval)
 	defer keepalive.Stop()
 
 	for {
@@ -1557,6 +1582,9 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 			writeChunk("[DONE]")
 			return
 		case <-keepalive.C:
+			if heartbeat != nil {
+				heartbeat()
+			}
 			_, _ = fmt.Fprint(w, ": \n\n")
 			flusher.Flush()
 		}
@@ -2140,6 +2168,27 @@ func (s *Server) touchConversationRecord(hash string, count int, prefixHash stri
 	})
 	if err != nil {
 		s.log.WithError(err).WithField("hash", hash).Warn("update conversation cursor")
+	}
+}
+
+// touchConversationActivity refreshes lastActivityAt (and therefore the KV TTL)
+// without touching the cursor. Used at request completion and by the streaming
+// heartbeat so records do not expire mid-request.
+func (s *Server) touchConversationActivity(hash string, now time.Time) {
+	if s.convKV == nil {
+		return
+	}
+	key := s.cfg.TTLPrefix + hash
+	activity := now.Unix()
+	_, err := conversation.UpdateRecord(s.convKV, key, func(record *conversation.Record) bool {
+		if record.LastActivityAt == activity {
+			return false
+		}
+		record.LastActivityAt = activity
+		return true
+	})
+	if err != nil {
+		s.log.WithError(err).WithField("hash", hash).Warn("refresh conversation activity")
 	}
 }
 

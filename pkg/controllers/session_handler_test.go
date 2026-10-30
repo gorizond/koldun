@@ -649,6 +649,51 @@ func TestSessionEnsureTopologyScalesDownAndDeletesIdleDllama(t *testing.T) {
 	require.Len(t, handler.apply.(*fakeApply).appliedObjects, 1, "dispatcher deployment should be applied after scaling down")
 }
 
+func TestSessionOnChangeSchedulesScaleDownWakeup(t *testing.T) {
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+
+	handler := &sessionHandler{
+		ctx:      context.Background(),
+		sessions: sessions,
+		dllamas:  dllamas,
+		apply:    newFakeApply(),
+		log:      logrus.NewEntry(logrus.New()),
+		ensureStatusFn: func(sess *v1.Session) (*v1.Session, error) {
+			return sess, nil
+		},
+	}
+
+	session, readyList := sessionScaleDownFixtures()
+	zero := int32(0)
+	session.Spec.Scaling.MinDllamas = &zero
+	session.Spec.Scaling.DesiredDllamas = &zero
+	session.Spec.Scaling.ScaleDownIdleSeconds = 60
+	session.Status.LastActivity = &metav1.Time{Time: time.Now().Add(-30 * time.Second)}
+
+	dllamas.EXPECT().Cache().Return(cache)
+	cache.EXPECT().List("models", gomock.Any()).Return(readyList[:1], nil)
+	dllamas.EXPECT().Update(gomock.AssignableToTypeOf(&v1.Dllama{})).Return(nil, nil).AnyTimes()
+
+	var delay time.Duration
+	sessions.EXPECT().EnqueueAfter("models", "chat", gomock.Any()).Do(
+		func(namespace, name string, d time.Duration) {
+			require.Equal(t, "models", namespace)
+			require.Equal(t, "chat", name)
+			delay = d
+		})
+
+	_, err := handler.onChange("models/chat", session)
+	require.NoError(t, err)
+	require.InDelta(t, (30 * time.Second).Seconds(), delay.Seconds(), 3.0,
+		"wake-up should be scheduled at lastActivity+scaleDownIdle")
+}
+
 func TestSessionEnsureTopologyScalesToZeroWithExplicitZeroMin(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
@@ -1871,4 +1916,73 @@ func TestSessionDeleteDllamaUsesHook(t *testing.T) {
 
 	require.NoError(t, handler.deleteDllama(sess, target))
 	require.Equal(t, 1, called, "hook should be invoked exactly once")
+}
+
+func TestScheduleScaleDownCheckBranches(t *testing.T) {
+	newSession := func() *v1.Session {
+		return &v1.Session{ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "models"}}
+	}
+
+	t.Run("nil sessions controller", func(t *testing.T) {
+		(&sessionHandler{}).scheduleScaleDownCheck(newSession(), sessionScalingParams{scaleDownIdle: time.Minute}, sessionPoolState{})
+	})
+
+	cases := []struct {
+		name   string
+		params sessionScalingParams
+		state  sessionPoolState
+	}{
+		{
+			name:   "cleanup disabled",
+			params: sessionScalingParams{min: 0, scaleDownIdle: 0},
+			state:  sessionPoolState{dllamas: makeDllamas(1), lastActivity: time.Now().Add(-time.Hour)},
+		},
+		{
+			name:   "already at min",
+			params: sessionScalingParams{min: 1, scaleDownIdle: time.Minute},
+			state:  sessionPoolState{dllamas: makeDllamas(1), lastActivity: time.Now().Add(-time.Hour)},
+		},
+		{
+			name:   "no activity timestamp",
+			params: sessionScalingParams{min: 0, scaleDownIdle: time.Minute},
+			state:  sessionPoolState{dllamas: makeDllamas(1)},
+		},
+		{
+			name:   "in-flight request",
+			params: sessionScalingParams{min: 0, scaleDownIdle: time.Minute},
+			state:  sessionPoolState{dllamas: makeDllamas(1), lastActivity: time.Now().Add(-time.Hour), activeRequests: 1},
+		},
+		{
+			name:   "pending backlog",
+			params: sessionScalingParams{min: 0, scaleDownIdle: time.Minute},
+			state:  sessionPoolState{dllamas: makeDllamas(1), lastActivity: time.Now().Add(-time.Hour), backlog: 3},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
+			sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+			sessions.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			handler := &sessionHandler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+			handler.scheduleScaleDownCheck(newSession(), tc.params, tc.state)
+		})
+	}
+
+	t.Run("already due wakes up after one second", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		var delay time.Duration
+		sessions.EXPECT().EnqueueAfter("models", "chat", gomock.Any()).Do(
+			func(namespace, name string, d time.Duration) { delay = d })
+		handler := &sessionHandler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		handler.scheduleScaleDownCheck(newSession(), sessionScalingParams{min: 0, scaleDownIdle: time.Minute}, sessionPoolState{
+			dllamas:      makeDllamas(1),
+			lastActivity: time.Now().Add(-time.Hour),
+		})
+		require.Equal(t, time.Second, delay)
+	})
 }
