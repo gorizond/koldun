@@ -18,6 +18,14 @@ import (
 	"k8s.io/utils/pointer"
 )
 
+const (
+	// workerReadyFile is written by the patched dllama worker after all weight
+	// shards are loaded; the readiness probe watches it.
+	workerReadyFile = "/tmp/dllama-weights-loaded"
+	// workerReadyEnv tells the worker where to write the readiness marker.
+	workerReadyEnv = "DLLAMA_READY_FILE"
+)
+
 type workerHandler struct {
 	ctx          context.Context
 	apply        apply.Apply
@@ -42,6 +50,7 @@ func registerWorkerController(ctx context.Context, m *Manager) error {
 	handler.workers.OnChange(ctx, "koldun-worker-controller", handler.onChange)
 	handler.workers.OnRemove(ctx, "koldun-worker-controller", handler.onRemove)
 	handler.statefulsets.OnChange(ctx, "koldun-worker-statefulset-watch", handler.onRelatedStatefulSet)
+	handler.statefulsets.OnRemove(ctx, "koldun-worker-statefulset-remove", handler.onRelatedStatefulSet)
 	handler.services.OnChange(ctx, "koldun-worker-service-watch", handler.onRelatedService)
 	handler.dllamas.OnChange(ctx, "koldun-worker-dllama-watch", handler.onRelatedDllama)
 	handler.dllamas.OnRemove(ctx, "koldun-worker-dllama-remove", handler.onRelatedDllama)
@@ -71,6 +80,16 @@ func (h *workerHandler) onRemove(key string, obj *v1.Worker) (*v1.Worker, error)
 
 func (h *workerHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
 	if obj == nil {
+		// The STS was deleted (e.g. OrderedReady -> Parallel migration). Guard
+		// the cluster-wide OnChange nil path by only enqueueing a real Worker;
+		// OnRemove also carries the object for the actual worker STS.
+		namespace, name := splitKey(key)
+		if namespace == "" || name == "" || h.workers == nil {
+			return nil, nil
+		}
+		if _, err := h.workers.Cache().Get(namespace, name); err == nil {
+			h.workers.Enqueue(namespace, name)
+		}
 		return nil, nil
 	}
 	if obj.Labels[labelComponent] != componentWorker {
@@ -101,6 +120,18 @@ func (h *workerHandler) onRelatedService(key string, obj *corev1.Service) (*core
 
 func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 	name := worker.Name
+
+	// podManagementPolicy is immutable. Existing sessions have OrderedReady,
+	// which would deadlock the readiness probe (worker-0 waits for the root,
+	// later ordinals wait for worker-0). Roll the whole group once: workers
+	// first (so the root controller sees the STS gone), then the root.
+	if h.statefulsets != nil {
+		if existing, err := h.statefulsets.Cache().Get(worker.Namespace, name); err == nil && existing != nil &&
+			existing.Spec.PodManagementPolicy == appsv1.OrderedReadyPodManagement {
+			return h.rolloutWorkerGroup(worker)
+		}
+	}
+
 	labels := map[string]string{
 		labelComponent:  componentWorker,
 		labelWorkerName: sanitizeLabelValue(worker.Name),
@@ -230,7 +261,12 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: name,
 			Replicas:    pointer.Int32(replicas),
-			Selector:    &metav1.LabelSelector{MatchLabels: labels},
+			// Workers must all be created before any of them becomes Ready:
+			// dllama workers block in NnNetwork::serve until the root connects,
+			// and the readiness probe only passes after weights are loaded.
+			// OrderedReady would deadlock on worker-0.
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+			Selector:            &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
@@ -250,6 +286,26 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		WithSetOwnerReference(true, false).
 		WithDefaultNamespace(worker.Namespace).
 		ApplyObjects(svc, sts)
+}
+
+// rolloutWorkerGroup deletes the worker and root StatefulSets so they can be
+// recreated with Parallel pod management. Root creation is gated on worker
+// pods, so the root comes back after the workers.
+func (h *workerHandler) rolloutWorkerGroup(worker *v1.Worker) error {
+	propagation := metav1.DeletePropagationBackground
+	if err := h.statefulsets.Delete(worker.Namespace, worker.Name, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete worker statefulset for pod management migration: %w", err)
+	}
+	if dllamaName := labelValue(worker.Labels, labelDllamaName); dllamaName != "" {
+		// The root controller names the StatefulSet via rootStatefulSetName,
+		// which truncates long Dllama names; using the raw "<name>-root" would
+		// miss the real object for production-length names.
+		rootName := rootStatefulSetName(fmt.Sprintf("%s-root", dllamaName))
+		if err := h.statefulsets.Delete(worker.Namespace, rootName, &metav1.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete root statefulset for pod management migration: %w", err)
+		}
+	}
+	return nil
 }
 
 func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resources corev1.ResourceRequirements) corev1.Container {
@@ -297,6 +353,8 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		}
 	}
 
+	env = append(env, corev1.EnvVar{Name: workerReadyEnv, Value: workerReadyFile})
+
 	// Add volume mount for model PVC if modelRef is set
 	var volumeMounts []corev1.VolumeMount
 	if worker.Spec.ModelRef != "" {
@@ -318,6 +376,18 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		Env:             env,
 		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
 		VolumeMounts:    volumeMounts,
+		// The worker accepts the root socket before the weights are loaded, so
+		// a plain TCP probe would pass too early. The patched dllama worker
+		// writes the marker only after weightReader.read() completes.
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"/bin/sh", "-c", "test -f " + workerReadyFile}},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+			TimeoutSeconds:      3,
+			FailureThreshold:    3,
+		},
 	}
 
 	if !isResourceRequirementsEmpty(resources) {

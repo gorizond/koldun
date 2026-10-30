@@ -52,6 +52,9 @@ jobs:
           helm dependency update charts/koldun
           helm lint charts/koldun
 
+      - name: Helm multi-namespace render
+        run: ./hack/test-helm-multinamespace.sh
+
       - name: Run integration test
         env:
           DEBUG: "true"

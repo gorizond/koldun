@@ -10,7 +10,9 @@ import (
 	"go.uber.org/mock/gomock"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
@@ -92,11 +94,35 @@ func TestWorkerHandlerOnRelatedStatefulSet(t *testing.T) {
 		t.Cleanup(ctrl.Finish)
 
 		workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+		workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
 		handler := &workerHandler{workers: workers}
 
-		workers.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+		// A deleted worker STS must re-enqueue the Worker, otherwise the
+		// Parallel migration would never recreate it.
+		workers.EXPECT().Cache().Return(workersCache)
+		workersCache.EXPECT().Get("models", "mistral-workers").Return(&v1.Worker{
+			ObjectMeta: metav1.ObjectMeta{Name: "mistral-workers", Namespace: "models"},
+		}, nil)
+		workers.EXPECT().Enqueue("models", "mistral-workers")
 
 		result, err := handler.onRelatedStatefulSet("models/mistral-workers", nil)
+		require.NoError(t, err)
+		require.Nil(t, result)
+	})
+
+	t.Run("ignores deleted non-worker statefulset", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+		workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+		handler := &workerHandler{workers: workers}
+
+		workers.EXPECT().Cache().Return(workersCache)
+		workersCache.EXPECT().Get("models", "other-sts").Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "workers"}, "other-sts"))
+		workers.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+
+		result, err := handler.onRelatedStatefulSet("models/other-sts", nil)
 		require.NoError(t, err)
 		require.Nil(t, result)
 	})

@@ -31,6 +31,12 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template
   name: ""
 
+# Minimal service account for dllama root pods (get/delete dllamas only).
+# It is created only in the release namespace; roots in other namespaces keep
+# the default service account and the llm sidecar fails open without RBAC.
+dllamaServiceAccount:
+  annotations: {}
+
 rbac:
   create: true
   extraRules: []

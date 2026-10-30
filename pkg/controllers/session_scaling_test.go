@@ -235,6 +235,21 @@ func TestSessionScalingParams_ShouldScaleUp(t *testing.T) {
 			expected: false,
 		},
 		{
+			name: "don't scale up while the initial group is loading",
+			params: sessionScalingParams{
+				min:              1,
+				max:              10,
+				scaleUpThreshold: 50,
+			},
+			state: sessionPoolState{
+				dllamas:   makeDllamas(1),
+				ready:     makeDllamas(0),
+				idleReady: makeDllamas(0),
+				backlog:   100,
+			},
+			expected: false,
+		},
+		{
 			name: "don't scale up without threshold configured",
 			params: sessionScalingParams{
 				min:              1,

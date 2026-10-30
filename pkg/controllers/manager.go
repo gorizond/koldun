@@ -3,6 +3,8 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	koldv1 "github.com/gorizond/koldun/pkg/controllers/koldunv1"
 	lassocontroller "github.com/rancher/lasso/pkg/controller"
@@ -57,6 +59,17 @@ func defaultFactoryFromConfig(cfg *rest.Config, opts *generic.FactoryOptions) (s
 	return factoryCreatorFn(cfg, opts)
 }
 
+// rootServiceAccountName returns the minimal dllama service account injected by
+// Helm. OPERATOR_SERVICE_ACCOUNT is only a legacy/manual-deployment fallback;
+// released charts set DLLAMA_SERVICE_ACCOUNT (or no account when the dedicated
+// SA is disabled).
+func rootServiceAccountName() string {
+	if name := strings.TrimSpace(os.Getenv("DLLAMA_SERVICE_ACCOUNT")); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("OPERATOR_SERVICE_ACCOUNT"))
+}
+
 // Manager wires together Wrangler factories, controllers, and reconcilers for the operator.
 type Manager struct {
 	factory           sharedFactory
@@ -66,6 +79,14 @@ type Manager struct {
 	health *Health
 
 	ensureObjectStorageBuckets bool
+
+	// ServiceAccountName is the dedicated dllama service account (dllama
+	// get/delete) used by root pods in the operator namespace. Empty keeps the
+	// namespace default.
+	ServiceAccountName string
+	// Namespace is the operator namespace. Root pods in other namespaces keep
+	// the default service account because the dedicated SA is namespaced.
+	Namespace string
 
 	Core  corev1.Interface
 	Apps  appsv1.Interface
@@ -128,6 +149,8 @@ func NewManager(cfg *rest.Config) (*Manager, error) {
 		Batch:                      batch,
 		Kold:                       kold,
 		ensureObjectStorageBuckets: true,
+		ServiceAccountName:         rootServiceAccountName(),
+		Namespace:                  strings.TrimSpace(os.Getenv("POD_NAMESPACE")),
 	}, nil
 }
 

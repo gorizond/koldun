@@ -168,3 +168,15 @@ func TestDefaultFactoryCreatorDefaultPath(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, factory)
 }
+
+func TestRootServiceAccountNamePrecedence(t *testing.T) {
+	t.Setenv("DLLAMA_SERVICE_ACCOUNT", "dllama-sa")
+	t.Setenv("OPERATOR_SERVICE_ACCOUNT", "operator-sa")
+	require.Equal(t, "dllama-sa", rootServiceAccountName())
+
+	t.Setenv("DLLAMA_SERVICE_ACCOUNT", "")
+	require.Equal(t, "operator-sa", rootServiceAccountName())
+
+	t.Setenv("OPERATOR_SERVICE_ACCOUNT", "")
+	require.Empty(t, rootServiceAccountName())
+}

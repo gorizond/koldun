@@ -23,10 +23,13 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 type staticResponseTransport struct {
@@ -2683,4 +2686,161 @@ func TestNormalizeStreamingChunkHandlesEmptyModel(t *testing.T) {
 	var resp map[string]any
 	require.NoError(t, json.Unmarshal(result, &resp))
 	require.Equal(t, "Distributed Model", resp["model"])
+}
+
+func TestDllamaWorkersLoaded(t *testing.T) {
+	tests := []struct {
+		name string
+		obj  *unstructured.Unstructured
+		want bool
+	}{
+		{name: "nil object", obj: nil, want: true},
+		{
+			name: "standalone",
+			obj: &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec": map[string]interface{}{"replicaPower": int64(0)},
+			}},
+			want: true,
+		},
+		{
+			name: "workers still loading",
+			obj: &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec":   map[string]interface{}{"replicaPower": int64(2)},
+				"status": map[string]interface{}{"readyWorkers": int64(2)},
+			}},
+			want: false,
+		},
+		{
+			name: "all workers loaded",
+			obj: &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec":   map[string]interface{}{"replicaPower": int64(2)},
+				"status": map[string]interface{}{"readyWorkers": int64(3)},
+			}},
+			want: true,
+		},
+		{
+			name: "missing status",
+			obj: &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec": map[string]interface{}{"replicaPower": int64(1)},
+			}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, dllamaWorkersLoaded(tt.obj))
+		})
+	}
+}
+
+func TestWaitForWorkersLoadedNoKubernetesClient(t *testing.T) {
+	srv := &Server{cfg: Config{DllamaName: "demo"}, log: logrus.New().WithField("component", "test")}
+	require.NoError(t, srv.waitForWorkersLoaded(context.Background()))
+}
+
+func TestWorkersReadyForTraffic(t *testing.T) {
+	newClient := func(ready int64) *dynamicfake.FakeDynamicClient {
+		obj := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "koldun.gorizond.io/v1",
+			"kind":       "Dllama",
+			"metadata": map[string]interface{}{
+				"name":      "demo",
+				"namespace": "models",
+			},
+			"spec":   map[string]interface{}{"replicaPower": int64(2)},
+			"status": map[string]interface{}{"readyWorkers": ready},
+		}}
+		return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+	}
+
+	base := &Server{
+		cfg:       Config{DllamaName: "demo"},
+		namespace: "models",
+		log:       logrus.New().WithField("component", "test"),
+	}
+
+	base.kube = newClient(2)
+	require.False(t, base.workersReadyForTraffic())
+
+	base.kube = newClient(3)
+	require.True(t, base.workersReadyForTraffic())
+
+	base.kube = nil
+	require.True(t, base.workersReadyForTraffic())
+}
+
+func newDllamaTestClient(ready int64) *dynamicfake.FakeDynamicClient {
+	obj := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "koldun.gorizond.io/v1",
+		"kind":       "Dllama",
+		"metadata": map[string]interface{}{
+			"name":      "demo",
+			"namespace": "models",
+		},
+		"spec":   map[string]interface{}{"replicaPower": int64(2)},
+		"status": map[string]interface{}{"readyWorkers": ready},
+	}}
+	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), obj)
+}
+
+func TestWaitForWorkersLoadedWaitsForStatus(t *testing.T) {
+	client := newDllamaTestClient(2)
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   client,
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		ctx := context.Background()
+		obj, err := client.Resource(dllamaGVR).Namespace("models").Get(ctx, "demo", metav1.GetOptions{})
+		if err != nil {
+			return
+		}
+		_ = unstructured.SetNestedField(obj.Object, int64(3), "status", "readyWorkers")
+		_, _ = client.Resource(dllamaGVR).Namespace("models").UpdateStatus(ctx, obj, metav1.UpdateOptions{})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, srv.waitForWorkersLoaded(ctx))
+}
+
+func TestWaitForWorkersLoadedForbiddenFailsOpen(t *testing.T) {
+	client := newDllamaTestClient(0)
+	client.PrependReactor("get", "dllamas", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "koldun.gorizond.io", Resource: "dllamas"}, "demo", errors.New("forbidden"))
+	})
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   client,
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	before := promtestutil.ToFloat64(metrics.LLMWorkerReadForbiddenTotal)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	require.NoError(t, srv.waitForWorkersLoaded(ctx))
+	require.True(t, srv.workersReadyForTraffic())
+	require.Equal(t, before+1, promtestutil.ToFloat64(metrics.LLMWorkerReadForbiddenTotal))
+}
+
+func TestWaitForWorkersLoadedTimeout(t *testing.T) {
+	srv := &Server{
+		cfg:                    Config{DllamaName: "demo"},
+		namespace:              "models",
+		kube:                   newDllamaTestClient(0),
+		log:                    logrus.New().WithField("component", "test"),
+		workerLoadPollInterval: 5 * time.Millisecond,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	require.Error(t, srv.waitForWorkersLoaded(ctx))
 }

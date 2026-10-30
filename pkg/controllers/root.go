@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
@@ -45,6 +46,10 @@ type rootHandler struct {
 	statefulsets generic.ControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]
 	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
 
+	serviceAccountName string
+	operatorNamespace  string
+	pods               generic.ControllerInterface[*corev1.Pod, *corev1.PodList]
+
 	workerStatusHook  func(*v1.Root) (bool, int32, []string, error)
 	resolveDllamaHook func(*v1.Root) (*v1.Dllama, error)
 	resolveModelHook  func(*v1.Dllama) (*v1.Model, error)
@@ -52,15 +57,18 @@ type rootHandler struct {
 
 func registerRootController(ctx context.Context, m *Manager) error {
 	handler := &rootHandler{
-		ctx:          ctx,
-		apply:        m.Apply(ctx),
-		dllamas:      m.Kold.Dllama(),
-		models:       m.Kold.Model(),
-		roots:        m.Kold.Root(),
-		deployments:  m.Apps.Deployment(),
-		services:     m.Core.Service(),
-		statefulsets: m.Apps.StatefulSet(),
-		workers:      m.Kold.Worker(),
+		ctx:                ctx,
+		apply:              m.Apply(ctx),
+		dllamas:            m.Kold.Dllama(),
+		models:             m.Kold.Model(),
+		roots:              m.Kold.Root(),
+		deployments:        m.Apps.Deployment(),
+		services:           m.Core.Service(),
+		statefulsets:       m.Apps.StatefulSet(),
+		workers:            m.Kold.Worker(),
+		serviceAccountName: m.ServiceAccountName,
+		operatorNamespace:  m.Namespace,
+		pods:               m.Core.Pod(),
 	}
 
 	handler.roots.OnChange(ctx, "koldun-root-controller", handler.onChange)
@@ -182,11 +190,16 @@ func (h *rootHandler) onRelatedWorker(key string, obj *v1.Worker) (*v1.Worker, e
 }
 
 func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
-	allWorkersReady, _, workerEndpoints, err := h.workerStatus(root)
+	// Start the root as soon as the worker pods exist, not when they report
+	// ready: dllama workers block in NnNetwork::serve until the root connects,
+	// so requiring fully loaded workers here would deadlock weight loading.
+	// Requests stay blocked until workers are actually loaded (see
+	// workerPodsStarted and the llm sidecar's worker-readiness wait).
+	workersStarted, workerEndpoints, err := h.workerPodsStarted(root)
 	if err != nil {
 		return err
 	}
-	if !allWorkersReady {
+	if !workersStarted {
 		return nil
 	}
 
@@ -288,6 +301,8 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		podAnnotations[annotationMemoryPlan] = fmt.Sprintf("model=%s nodes=%d root=%s worker=%s", sizeHuman, totalNodes, rootMemory.String(), workerMemory.String())
 	}
 
+	serviceAccountName := h.rootServiceAccountName(root.Namespace)
+
 	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: appsv1.SchemeGroupVersion.String(),
@@ -306,6 +321,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
+					ServiceAccountName:            serviceAccountName,
 					TopologySpreadConstraints:     dllamaTopologySpread(labels[labelDllamaName]),
 					Volumes: []corev1.Volume{
 						{
@@ -388,6 +404,100 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 		ApplyObjects(svc)
 }
 
+// rootServiceAccountName keeps the dedicated SA only where it exists: the
+// operator namespace. Ingresses may create roots in other namespaces; there we
+// use the namespace default SA and the llm sidecar fails open without RBAC.
+func (h *rootHandler) rootServiceAccountName(namespace string) string {
+	if h.operatorNamespace != "" && namespace != h.operatorNamespace {
+		return ""
+	}
+	return h.serviceAccountName
+}
+
+// workerPodsStarted reports whether the worker StatefulSet has created all
+// pods. Pod creation is enough for the root to connect and start the dllama
+// weight-loading protocol; actual readiness is tracked separately by
+// workerStatus/ReadyReplicas (gated by the worker's weights-loaded probe).
+func (h *rootHandler) workerPodsStarted(root *v1.Root) (started bool, endpoints []string, err error) {
+	if hook := h.workerStatusHook; hook != nil {
+		allReady, _, hookEndpoints, hookErr := hook(root)
+		return allReady, hookEndpoints, hookErr
+	}
+	if root == nil {
+		return false, nil, nil
+	}
+	if len(root.Spec.WorkerSelector) == 0 {
+		return true, nil, nil
+	}
+
+	dllama, err := h.resolveDllama(root)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	replicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
+	if replicas <= 0 {
+		return true, nil, nil
+	}
+
+	workerName := workerResourceName(dllama.Name)
+	worker, err := h.workers.Cache().Get(root.Namespace, workerName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+
+	endpoints = make([]string, 0, replicas)
+	for i := int32(0); i < replicas; i++ {
+		endpoints = append(endpoints, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:9999", worker.Name, i, worker.Name, worker.Namespace))
+	}
+
+	sts, err := h.statefulsets.Cache().Get(worker.Namespace, worker.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, endpoints, nil
+		}
+		return false, nil, err
+	}
+	created := sts.Status.Replicas
+	if sts.Status.CurrentReplicas > created {
+		created = sts.Status.CurrentReplicas
+	}
+	// Ready pods are necessarily created; accepting ReadyReplicas keeps older
+	// cached StatefulSets (and tests) without Status.Replicas working.
+	if sts.Status.ReadyReplicas > created {
+		created = sts.Status.ReadyReplicas
+	}
+	if created < replicas {
+		return false, endpoints, nil
+	}
+	if h.pods == nil {
+		return true, endpoints, nil
+	}
+
+	// Pods that are still Pending/ContainerCreating have no address in the
+	// headless service yet and would make the root's single-shot connect fail.
+	// Wait for Running pods; the root still retries connects once they listen.
+	pods, err := h.pods.Cache().List(worker.Namespace, labels.SelectorFromSet(map[string]string{
+		labelDllamaName: dllama.Name,
+		labelComponent:  componentWorker,
+	}))
+	if err != nil {
+		return false, endpoints, err
+	}
+	running := int32(0)
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning {
+			running++
+		}
+	}
+	return running >= replicas, endpoints, nil
+}
+
 func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int32, endpoints []string, err error) {
 	if hook := h.workerStatusHook; hook != nil {
 		return hook(root)
@@ -457,8 +567,15 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 		args = append(args, root.Spec.Args...)
 	}
 
+	httpReadTimeout := 20 * time.Minute
+	if root.Spec.SidecarTimeout != nil && root.Spec.SidecarTimeout.Duration+5*time.Minute > httpReadTimeout {
+		httpReadTimeout = root.Spec.SidecarTimeout.Duration + 5*time.Minute
+	}
 	env := []corev1.EnvVar{
 		{Name: "DLLAMA_ROLE", Value: "root"},
+		// Outlive the llm sidecar request timeout (ingress responseTimeout) and
+		// worker weight loading. The patched dllama-api also defaults to 20m.
+		{Name: "DLLAMA_HTTP_READ_TIMEOUT_SECONDS", Value: fmt.Sprint(int(httpReadTimeout.Seconds()))},
 	}
 
 	if root.Spec.CacheSpec != nil {

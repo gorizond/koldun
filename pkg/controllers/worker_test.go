@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
+	fakeapply "github.com/rancher/wrangler/v3/pkg/apply/fake"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -91,6 +92,7 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 		require.Equal(t, worker.Name, sts.Name)
 		require.Equal(t, worker.Namespace, sts.Namespace)
 		require.EqualValues(t, 1, *sts.Spec.Replicas)
+		require.Equal(t, appsv1.ParallelPodManagement, sts.Spec.PodManagementPolicy)
 		require.Equal(t, "mistral-workers", sts.Spec.ServiceName)
 		require.NotNil(t, sts.Spec.Selector)
 		require.Equal(t, sanitizeLabelValue(worker.Name), sts.Spec.Template.Labels[labelWorkerName])
@@ -115,6 +117,17 @@ func TestWorkerHandlerEnsureStatefulSetAppliesObjects(t *testing.T) {
 		roleEnv := envVarValue(container.Env, "DLLAMA_ROLE")
 		require.NotNil(t, roleEnv)
 		require.Equal(t, "worker", roleEnv.Value)
+
+		readyEnv := envVarValue(container.Env, workerReadyEnv)
+		require.NotNil(t, readyEnv)
+		require.Equal(t, workerReadyFile, readyEnv.Value)
+
+		require.NotNil(t, container.ReadinessProbe)
+		require.NotNil(t, container.ReadinessProbe.Exec)
+		require.Equal(t, []string{"/bin/sh", "-c", "test -f " + workerReadyFile}, container.ReadinessProbe.Exec.Command)
+		require.Equal(t, int32(5), container.ReadinessProbe.InitialDelaySeconds)
+		require.Equal(t, int32(10), container.ReadinessProbe.PeriodSeconds)
+		require.Equal(t, int32(3), container.ReadinessProbe.FailureThreshold)
 
 		cacheEndpoint := envVarValue(container.Env, "CACHE_ENDPOINT")
 		require.NotNil(t, cacheEndpoint)
@@ -694,8 +707,8 @@ func TestWorkerHandlerOnChangeSuccess(t *testing.T) {
 		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
 	).Return(nil)
 
-	// ensureStatus expectations
-	statefulsets.EXPECT().Cache().Return(stsCache)
+	// ensureStatefulSet policy check and ensureStatus both read the STS.
+	statefulsets.EXPECT().Cache().Return(stsCache).AnyTimes()
 	stsCache.EXPECT().Get("default", "test-worker").Return(&appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: int32Ptr(1),
@@ -703,7 +716,7 @@ func TestWorkerHandlerOnChangeSuccess(t *testing.T) {
 		Status: appsv1.StatefulSetStatus{
 			ReadyReplicas: 1,
 		},
-	}, nil)
+	}, nil).AnyTimes()
 	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
 		requireCondition(t, updated.Status.Conditions, metav1.Condition{
 			Type:    conditionReady,
@@ -761,6 +774,7 @@ func TestWorkerHandlerOnChangeEnsureStatefulSetError(t *testing.T) {
 	dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
 	dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
 	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	stsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
 
 	handler := &workerHandler{
 		apply:        mockApply,
@@ -783,6 +797,8 @@ func TestWorkerHandlerOnChangeEnsureStatefulSetError(t *testing.T) {
 	}
 
 	expectedErr := errors.New("apply failed")
+	statefulsets.EXPECT().Cache().Return(stsCache)
+	stsCache.EXPECT().Get("default", "test-worker").Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "statefulsets"}, "test-worker"))
 	dllamas.EXPECT().Cache().Return(dllamaCache)
 	dllamaCache.EXPECT().Get("default", "test-dllama").Return(nil, apierrors.NewNotFound(schema.GroupResource{}, "test-dllama"))
 	mockApply.EXPECT().ApplyObjects(
@@ -837,9 +853,9 @@ func TestWorkerHandlerOnChangeEnsureStatusError(t *testing.T) {
 		gomock.AssignableToTypeOf(&appsv1.StatefulSet{}),
 	).Return(nil)
 
-	// ensureStatus expectations
+	// ensureStatefulSet policy check and ensureStatus both read the STS.
 	expectedErr := errors.New("status update failed")
-	statefulsets.EXPECT().Cache().Return(stsCache)
+	statefulsets.EXPECT().Cache().Return(stsCache).AnyTimes()
 	stsCache.EXPECT().Get("default", "test-worker").Return(&appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: int32Ptr(1),
@@ -847,7 +863,7 @@ func TestWorkerHandlerOnChangeEnsureStatusError(t *testing.T) {
 		Status: appsv1.StatefulSetStatus{
 			ReadyReplicas: 0,
 		},
-	}, nil)
+	}, nil).AnyTimes()
 	workers.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Worker{})).DoAndReturn(func(updated *v1.Worker) (*v1.Worker, error) {
 		return nil, expectedErr
 	})
@@ -1274,7 +1290,7 @@ func TestWorkerContainer(t *testing.T) {
 				require.Equal(t, corev1.PullIfNotPresent, container.ImagePullPolicy)
 				require.Equal(t, []string{"dllama"}, container.Command)
 				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "4"}, container.Args)
-				require.Len(t, container.Env, 1)
+				require.Len(t, container.Env, 2)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "worker", container.Env[0].Value)
 				require.Len(t, container.Ports, 1)
@@ -1311,7 +1327,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   8,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 3)
+				require.Len(t, container.Env, 4)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "worker", container.Env[0].Value)
 				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
@@ -1337,7 +1353,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   1,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 4)
+				require.Len(t, container.Env, 5)
 				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
 				require.Equal(t, "https://s3.amazonaws.com", container.Env[1].Value)
 				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
@@ -1365,7 +1381,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   16,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 2)
+				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "NATS_URL", container.Env[1].Name)
 				require.Equal(t, "nats://nats.example.com:4222", container.Env[1].Value)
@@ -1387,7 +1403,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   3,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 3)
+				require.Len(t, container.Env, 4)
 				require.Equal(t, "NATS_URL", container.Env[1].Name)
 				require.Equal(t, "nats://secured.example.com:4222", container.Env[1].Value)
 				require.Equal(t, "NATS_CREDS", container.Env[2].Name)
@@ -1425,7 +1441,7 @@ func TestWorkerContainer(t *testing.T) {
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
 				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "6", "--debug"}, container.Args)
-				require.Len(t, container.Env, 6)
+				require.Len(t, container.Env, 7)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
 				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
@@ -1516,7 +1532,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 1)
+				require.Len(t, container.Env, 2)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 			},
 		},
@@ -1531,7 +1547,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 1)
+				require.Len(t, container.Env, 2)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 			},
 		},
@@ -1550,7 +1566,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 3)
+				require.Len(t, container.Env, 4)
 				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
 				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
 			},
@@ -1569,7 +1585,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 2)
+				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "NATS_URL", container.Env[1].Name)
 			},
@@ -1679,4 +1695,163 @@ func mustParseQuantity(s string) resource.Quantity {
 		panic(fmt.Sprintf("failed to parse quantity %q: %v", s, err))
 	}
 	return q
+}
+
+func TestWorkerHandlerEnsureStatefulSetMigratesOrderedReady(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+	statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+	applySpy := &fakeapply.FakeApply{}
+	handler := &workerHandler{apply: applySpy, statefulsets: statefulsets}
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-workers",
+			Namespace: "models",
+			Labels:    map[string]string{labelDllamaName: "mistral"},
+		},
+		Spec: v1.WorkerSpec{Image: "image", ModelRef: "model-pvc"},
+	}
+
+	statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+	statefulsetsCache.EXPECT().Get("models", "mistral-workers").Return(&appsv1.StatefulSet{
+		Spec: appsv1.StatefulSetSpec{PodManagementPolicy: appsv1.OrderedReadyPodManagement},
+	}, nil)
+	statefulsets.EXPECT().Delete("models", "mistral-workers", gomock.Any()).Return(nil)
+	statefulsets.EXPECT().Delete("models", "mistral-root", gomock.Any()).Return(nil)
+
+	require.NoError(t, handler.ensureStatefulSet(worker))
+	require.Zero(t, applySpy.Count)
+}
+
+func TestWorkerHandlerEnsureStatefulSetMigrationDeleteErrors(t *testing.T) {
+	newHandler := func(t *testing.T) (*workerHandler, *genericfake.MockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList]) {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		statefulsetsCache.EXPECT().Get("models", "mistral-workers").Return(&appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{PodManagementPolicy: appsv1.OrderedReadyPodManagement},
+		}, nil)
+		return &workerHandler{apply: &fakeapply.FakeApply{}, statefulsets: statefulsets}, statefulsets
+	}
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mistral-workers",
+			Namespace: "models",
+			Labels:    map[string]string{labelDllamaName: "mistral"},
+		},
+	}
+
+	t.Run("worker delete fails", func(t *testing.T) {
+		handler, statefulsets := newHandler(t)
+		statefulsets.EXPECT().Delete("models", "mistral-workers", gomock.Any()).Return(errors.New("boom"))
+		require.Error(t, handler.ensureStatefulSet(worker))
+	})
+
+	t.Run("root delete fails", func(t *testing.T) {
+		handler, statefulsets := newHandler(t)
+		statefulsets.EXPECT().Delete("models", "mistral-workers", gomock.Any()).Return(nil)
+		statefulsets.EXPECT().Delete("models", "mistral-root", gomock.Any()).Return(errors.New("boom"))
+		require.Error(t, handler.ensureStatefulSet(worker))
+	})
+}
+
+func TestWorkerHandlerEnsureStatefulSetMigratesLongNameAndRecreates(t *testing.T) {
+	dllamaName := strings.Repeat("s", 40) + "-abcdefghijklmno"
+	require.Greater(t, len(dllamaName), 47)
+	workerName := workerResourceName(dllamaName)
+	expectedRoot := rootStatefulSetName(dllamaName + "-root")
+	require.NotEqual(t, dllamaName+"-root", expectedRoot, "long names must be truncated like the root controller does")
+
+	worker := &v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      workerName,
+			Namespace: "models",
+			Labels:    map[string]string{labelDllamaName: dllamaName},
+		},
+		Spec: v1.WorkerSpec{Image: "image", ModelRef: "model-pvc"},
+	}
+
+	t.Run("deletes the truncated root statefulset", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+		handler := &workerHandler{apply: &fakeapply.FakeApply{}, statefulsets: statefulsets}
+
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		statefulsetsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{PodManagementPolicy: appsv1.OrderedReadyPodManagement},
+		}, nil)
+		statefulsets.EXPECT().Delete("models", workerName, gomock.Any()).Return(nil)
+		statefulsets.EXPECT().Delete("models", expectedRoot, gomock.Any()).Return(nil)
+
+		require.NoError(t, handler.ensureStatefulSet(worker))
+	})
+
+	t.Run("recreates the worker statefulset after deletion", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+		applySpy := &fakeapply.FakeApply{}
+		dllamas := genericfake.NewMockControllerInterface[*v1.Dllama, *v1.DllamaList](ctrl)
+		dllamaCache := genericfake.NewMockCacheInterface[*v1.Dllama](ctrl)
+		models := genericfake.NewMockControllerInterface[*v1.Model, *v1.ModelList](ctrl)
+		modelCache := genericfake.NewMockCacheInterface[*v1.Model](ctrl)
+		handler := &workerHandler{
+			apply:        applySpy,
+			statefulsets: statefulsets,
+			dllamas:      dllamas,
+			models:       models,
+		}
+
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		statefulsetsCache.EXPECT().Get("models", workerName).Return(nil, apierrors.NewNotFound(schema.GroupResource{Resource: "statefulsets"}, workerName))
+		dllamas.EXPECT().Cache().Return(dllamaCache).AnyTimes()
+		dllamaCache.EXPECT().Get("models", dllamaName).Return(&v1.Dllama{
+			ObjectMeta: metav1.ObjectMeta{Name: dllamaName, Namespace: "models"},
+			Spec:       v1.DllamaSpec{ReplicaPower: 1, ModelRef: v1.ModelReference{Kind: "Model", Name: "model"}},
+		}, nil)
+		models.EXPECT().Cache().Return(modelCache).AnyTimes()
+		modelCache.EXPECT().Get("models", "model").Return(&v1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "model", Namespace: "models"},
+			Spec:       v1.ModelSpec{Conversion: &v1.ModelConversionSpec{WeightsFloatType: "q40"}},
+		}, nil)
+
+		require.NoError(t, handler.ensureStatefulSet(worker))
+		require.NotEmpty(t, applySpy.Objects)
+		var created *appsv1.StatefulSet
+		for _, object := range applySpy.Objects[0].All() {
+			if sts, ok := object.(*appsv1.StatefulSet); ok {
+				created = sts
+			}
+		}
+		require.NotNil(t, created)
+		require.Equal(t, workerName, created.Name)
+		require.Equal(t, appsv1.ParallelPodManagement, created.Spec.PodManagementPolicy)
+		require.NotNil(t, created.Spec.Template.Spec.Containers[0].ReadinessProbe)
+	})
+}
+
+func TestWorkerOnRelatedStatefulSetRemoveEnqueuesWorker(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+	handler := &workerHandler{workers: workers}
+
+	workers.EXPECT().Cache().Return(workersCache)
+	workersCache.EXPECT().Get("models", "mistral-workers").Return(&v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral-workers", Namespace: "models"},
+	}, nil)
+	workers.EXPECT().Enqueue("models", "mistral-workers")
+	_, err := handler.onRelatedStatefulSet("models/mistral-workers", nil)
+	require.NoError(t, err)
 }

@@ -1,0 +1,33 @@
+{{- if and .Values.rbac.create .Values.serviceAccount.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "koldun.fullname" . }}-dllama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - koldun.gorizond.io
+    resources:
+      - dllamas
+    verbs:
+      - get
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "koldun.fullname" . }}-dllama
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "koldun.dllamaServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "koldun.fullname" . }}-dllama
+{{- end }}

@@ -7,7 +7,9 @@ ARG DL_REPOSITORY
 ARG DL_VERSION
 RUN apk add --no-cache git make build-base
 WORKDIR /src
-RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
+COPY hack/dllama-patches /tmp/dllama-patches
+RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" . && \
+    git apply /tmp/dllama-patches/*.patch
 RUN if [ "${TARGETARCH}" = "amd64" ]; then \
       sed -i 's/-march=native -mtune=native/-march=x86-64-v3 -mno-abm -mtune=generic/' Makefile; \
     fi && \

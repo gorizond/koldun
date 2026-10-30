@@ -1,0 +1,112 @@
+diff --git a/src/app.cpp b/src/app.cpp
+index 74016a6..26adb28 100644
+--- a/src/app.cpp
++++ b/src/app.cpp
+@@ -1,5 +1,7 @@
+ #include "app.hpp"
+ #include <cassert>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
+ #if defined(DLLAMA_VULKAN)
+@@ -304,7 +306,13 @@ void runInferenceApp(AppCliArgs *args, void (*handler)(AppInferenceContext *cont
+ }
+ 
+ void runWorkerApp(AppCliArgs *args) {
++    const char *readyFilePath = std::getenv("DLLAMA_READY_FILE");
+     while (true) {
++        // Clear the readiness marker before (re)loading so Kubernetes marks the
++        // worker not-ready during a reload instead of advertising stale weights.
++        if (readyFilePath != nullptr)
++            std::remove(readyFilePath);
++
+         std::unique_ptr<NnNetwork> networkPtr = NnNetwork::serve(args->host, args->port);
+         NnNetwork *network = networkPtr.get();
+ 
+@@ -325,6 +333,19 @@ void runWorkerApp(AppCliArgs *args) {
+         NnWorkerWeightReader weightReader(&executor, network);
+         weightReader.read();
+ 
++        // Signal readiness only after every weight shard has been loaded. The
++        // operator's worker readiness probe watches this file, which keeps the
++        // llm sidecar from accepting requests while workers still load.
++        if (readyFilePath != nullptr) {
++            FILE *readyFile = std::fopen(readyFilePath, "w");
++            if (readyFile != nullptr) {
++                std::fclose(readyFile);
++                printf("✅ Readiness marker written: %s\n", readyFilePath);
++            } else {
++                printf("🚨 Failed to write readiness marker: %s\n", readyFilePath);
++            }
++        }
++
+         WorkerLlmInference inference(&execution, network);
+         bool isFirstAttempt = true;
+         bool isTurboEnabled = false;
+diff --git a/src/dllama-api.cpp b/src/dllama-api.cpp
+index a170e91..2d0de24 100644
+--- a/src/dllama-api.cpp
++++ b/src/dllama-api.cpp
+@@ -17,6 +17,7 @@
+ #include <ws2tcpip.h>
+ #else
+ #include <sys/socket.h>
++#include <sys/time.h>
+ #include <netinet/in.h>
+ #include <unistd.h>
+ #endif
+@@ -598,6 +599,24 @@ void handleModelsRequest(HttpRequest& request, const char* modelPath) {
+     request.writeJson(response);
+ }
+ 
++static void configureHttpClientSocket(int socket) {
++#ifndef _WIN32
++    // A slow model can take tens of minutes; outlive worker weight loading and
++    // the llm sidecar request timeout instead of failing the request early.
++    long timeoutSeconds = 20 * 60;
++    if (const char *env = std::getenv("DLLAMA_HTTP_READ_TIMEOUT_SECONDS")) {
++        char *end = nullptr;
++        long parsed = std::strtol(env, &end, 10);
++        if (end != env && parsed > 0)
++            timeoutSeconds = parsed;
++    }
++    struct timeval timeout;
++    timeout.tv_sec = timeoutSeconds;
++    timeout.tv_usec = 0;
++    setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++#endif
++}
++
+ static void server(AppInferenceContext *context) {
+     NnSocket serverSocket(createServerSocket(context->args->host, context->args->port));
+ 
+@@ -624,8 +643,11 @@ static void server(AppInferenceContext *context) {
+     };
+ 
+     while (true) {
++        NnSocket clientSocket;
+         try {
+-            NnSocket clientSocket(acceptSocket(serverSocket.fd));
++            clientSocket.assign(acceptSocket(serverSocket.fd));
++            configureHttpClientSocket(clientSocket.fd);
++
+             HttpRequest request = HttpRequest::read(clientSocket.fd);
+             printf("🔷 %s %s\n", request.getMethod().c_str(), request.path.c_str());
+             Router::resolve(request, routes);
+@@ -633,6 +655,15 @@ static void server(AppInferenceContext *context) {
+             printf("Socket error: %d %s\n", e.code, e.what());
+         } catch (const NnExecutorException &e) {
+             throw;
++        } catch (const std::exception &e) {
++            // A client disconnect (llm sidecar timeout, pod shutdown) must not
++            // terminate dllama-api: answer 503 so callers can retry and keep
++            // serving subsequent requests.
++            printf("🚨 HTTP client error: %s\n", e.what());
++            if (clientSocket.fd >= 0) {
++                const char *response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
++                send(clientSocket.fd, response, std::strlen(response), 0);
++            }
+         }
+     }
+ }
