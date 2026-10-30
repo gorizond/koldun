@@ -158,6 +158,40 @@ func TestNewAppliesDefaults(t *testing.T) {
 	require.Contains(t, info.Config.Subjects, srv.cfg.InPrefix+">")
 }
 
+func TestNewHonorsConfiguredSidecarTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+
+	const timeout = 15 * time.Minute
+	cfg := Config{
+		Hash:           "tenant-timeout",
+		NATSURL:        ns.ClientURL(),
+		SidecarTimeout: timeout,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	t.Cleanup(func() {
+		if srv.sub != nil {
+			_ = srv.sub.Unsubscribe()
+		}
+		if srv.nc != nil {
+			_ = srv.nc.Drain()
+			srv.nc.Close()
+		}
+	})
+
+	require.Equal(t, timeout, srv.cfg.SidecarTimeout)
+	require.NotNil(t, srv.client)
+	require.Equal(t, timeout, srv.client.Timeout)
+}
+
 func TestNewHandlesInvalidNATSURL(t *testing.T) {
 	cfg := Config{
 		Hash:    "test-hash",

@@ -2107,6 +2107,14 @@ func TestRootSpec_DeepCopy(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "spec with sidecar timeout",
+			spec: &RootSpec{
+				ModelRef:       "test-model",
+				Image:          "test-image",
+				SidecarTimeout: &metav1.Duration{Duration: 15 * time.Minute},
+			},
+		},
 	}
 
 	for _, tt := range tests {

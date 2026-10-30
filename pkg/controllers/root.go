@@ -565,6 +565,9 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 		maxSeqLen = defaultMaxSeqLen
 	}
 	args = append(args, "--llm-max-seq-len", fmt.Sprint(maxSeqLen))
+	if root.Spec.SidecarTimeout != nil && root.Spec.SidecarTimeout.Duration > 0 {
+		args = append(args, fmt.Sprintf("--llm-sidecar-timeout=%s", root.Spec.SidecarTimeout.Duration))
+	}
 
 	env := []corev1.EnvVar{
 		{Name: "HASH_KOLDUN", Value: hash},

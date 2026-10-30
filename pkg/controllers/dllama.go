@@ -257,6 +257,7 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	} else {
 		root.Spec.NThreads = 1
 	}
+	root.Spec.SidecarTimeout = h.getIngressSidecarTimeout(dllama)
 	// The context window belongs to the model, not to whichever Ingress
 	// happened to be listed first.
 	if model.Spec.MaxSeqLen > 0 {
@@ -439,6 +440,35 @@ func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
 		}
 	}
 	return 0
+}
+
+// getIngressSidecarTimeout mirrors Ingress backend.responseTimeout so the llm
+// sidecar waits at least as long as the ingress frontend for slow generations.
+// Returns nil when no Ingress configures a positive timeout (sidecar default).
+func (h *dllamaHandler) getIngressSidecarTimeout(dllama *v1.Dllama) *metav1.Duration {
+	if h.ingresses == nil {
+		return nil
+	}
+	lookup := func(ings []*v1.Ingress) *metav1.Duration {
+		for _, ing := range ings {
+			if ing.Spec.Backend.ResponseTimeout != nil && ing.Spec.Backend.ResponseTimeout.Duration > 0 {
+				return ing.Spec.Backend.ResponseTimeout
+			}
+		}
+		return nil
+	}
+
+	if ingresses, err := h.ingresses.Cache().List(dllama.Namespace, labels.Everything()); err == nil {
+		if v := lookup(ingresses); v != nil {
+			return v
+		}
+	}
+	if allIngresses, err := h.ingresses.Cache().List("", labels.Everything()); err == nil {
+		if v := lookup(allIngresses); v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func (h *dllamaHandler) ensureStatus(dllama *v1.Dllama) (*v1.Dllama, error) {
