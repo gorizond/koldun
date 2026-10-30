@@ -182,11 +182,16 @@ func (h *rootHandler) onRelatedWorker(key string, obj *v1.Worker) (*v1.Worker, e
 }
 
 func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
-	allWorkersReady, _, workerEndpoints, err := h.workerStatus(root)
+	// Start the root as soon as the worker pods exist, not when they report
+	// ready: dllama workers block in NnNetwork::serve until the root connects,
+	// so requiring fully loaded workers here would deadlock weight loading.
+	// Requests stay blocked until workers are actually loaded (see
+	// workerPodsStarted and the llm sidecar's worker-readiness wait).
+	workersStarted, workerEndpoints, err := h.workerPodsStarted(root)
 	if err != nil {
 		return err
 	}
-	if !allWorkersReady {
+	if !workersStarted {
 		return nil
 	}
 
@@ -388,6 +393,67 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 		ApplyObjects(svc)
 }
 
+// workerPodsStarted reports whether the worker StatefulSet has created all
+// pods. Pod creation is enough for the root to connect and start the dllama
+// weight-loading protocol; actual readiness is tracked separately by
+// workerStatus/ReadyReplicas (gated by the worker's weights-loaded probe).
+func (h *rootHandler) workerPodsStarted(root *v1.Root) (started bool, endpoints []string, err error) {
+	if hook := h.workerStatusHook; hook != nil {
+		allReady, _, hookEndpoints, hookErr := hook(root)
+		return allReady, hookEndpoints, hookErr
+	}
+	if root == nil {
+		return false, nil, nil
+	}
+	if len(root.Spec.WorkerSelector) == 0 {
+		return true, nil, nil
+	}
+
+	dllama, err := h.resolveDllama(root)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+	replicas := workersForReplicaPower(dllama.Spec.ReplicaPower)
+	if replicas <= 0 {
+		return true, nil, nil
+	}
+
+	workerName := workerResourceName(dllama.Name)
+	worker, err := h.workers.Cache().Get(root.Namespace, workerName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil, nil
+		}
+		return false, nil, err
+	}
+
+	endpoints = make([]string, 0, replicas)
+	for i := int32(0); i < replicas; i++ {
+		endpoints = append(endpoints, fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local:9999", worker.Name, i, worker.Name, worker.Namespace))
+	}
+
+	sts, err := h.statefulsets.Cache().Get(worker.Namespace, worker.Name)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, endpoints, nil
+		}
+		return false, nil, err
+	}
+	created := sts.Status.Replicas
+	if sts.Status.CurrentReplicas > created {
+		created = sts.Status.CurrentReplicas
+	}
+	// Ready pods are necessarily created; accepting ReadyReplicas keeps older
+	// cached StatefulSets (and tests) without Status.Replicas working.
+	if sts.Status.ReadyReplicas > created {
+		created = sts.Status.ReadyReplicas
+	}
+	return created >= replicas, endpoints, nil
+}
+
 func (h *rootHandler) workerStatus(root *v1.Root) (allReady bool, readyCount int32, endpoints []string, err error) {
 	if hook := h.workerStatusHook; hook != nil {
 		return hook(root)
@@ -459,6 +525,10 @@ func (h *rootHandler) rootContainer(root *v1.Root, modelFile, tokenizerFile, wei
 
 	env := []corev1.EnvVar{
 		{Name: "DLLAMA_ROLE", Value: "root"},
+		// Outlive the llm sidecar request timeout and worker weight loading.
+		// The patched dllama-api also defaults to this value; setting it here
+		// keeps the socket timeout visible/configurable in the pod spec.
+		{Name: "DLLAMA_HTTP_READ_TIMEOUT_SECONDS", Value: "1200"},
 	}
 
 	if root.Spec.CacheSpec != nil {

@@ -25,6 +25,7 @@ import (
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
@@ -296,6 +297,15 @@ func (s *Server) Run(ctx context.Context) error {
 		return fmt.Errorf("wait for dllama sidecar: %w", err)
 	}
 
+	// Do not subscribe (or advertise an idle worker) until every dllama worker
+	// has loaded its weight shards. The root HTTP API starts much earlier and
+	// forwarding a request to still-loading workers used to hang for minutes
+	// and then kill dllama-api. Requests published meanwhile stay in the
+	// durable request stream.
+	if err := s.waitForWorkersLoaded(runCtx); err != nil {
+		return fmt.Errorf("wait for dllama workers: %w", err)
+	}
+
 	// Use a durable name derived from the dllama identity so JetStream preserves
 	// per-worker consumers while allowing us to restart safely.
 	queueName := durableName(s.cfg.DllamaName)
@@ -381,6 +391,75 @@ func (s *Server) Run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// workerReadinessPollInterval paces Dllama status checks while workers load.
+const workerReadinessPollInterval = 5 * time.Second
+
+// waitForWorkersLoaded blocks until the Dllama status reports that all worker
+// replicas have finished loading weights. It is a no-op when the sidecar has
+// no Kubernetes client (local runs/tests).
+func (s *Server) waitForWorkersLoaded(ctx context.Context) error {
+	if s.kube == nil || strings.TrimSpace(s.namespace) == "" || strings.TrimSpace(s.cfg.DllamaName) == "" {
+		return nil
+	}
+
+	log := s.log.WithFields(logrus.Fields{
+		"dllama":    s.cfg.DllamaName,
+		"namespace": s.namespace,
+	})
+	log.Info("waiting for dllama workers to finish loading weights")
+
+	ticker := time.NewTicker(workerReadinessPollInterval)
+	defer ticker.Stop()
+
+	for {
+		loaded, err := s.workersLoaded(ctx)
+		if err != nil {
+			s.log.WithError(err).Warn("check dllama worker readiness")
+		} else if loaded {
+			log.Info("dllama workers loaded; accepting requests")
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) workersLoaded(ctx context.Context) (bool, error) {
+	obj, err := s.kube.Resource(dllamaGVR).Namespace(s.namespace).Get(ctx, s.cfg.DllamaName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return dllamaWorkersLoaded(obj), nil
+}
+
+// dllamaWorkersLoaded reports whether status.readyWorkers reached the worker
+// count implied by spec.replicaPower ((1 << power) - 1).
+func dllamaWorkersLoaded(obj *unstructured.Unstructured) bool {
+	if obj == nil {
+		return true
+	}
+	power, _, err := unstructured.NestedInt64(obj.Object, "spec", "replicaPower")
+	if err != nil {
+		return false
+	}
+	if power <= 0 {
+		return true
+	}
+	if power > 30 {
+		power = 30
+	}
+	expected := (int64(1) << uint(power)) - 1
+	ready, _, err := unstructured.NestedInt64(obj.Object, "status", "readyWorkers")
+	if err != nil {
+		return false
+	}
+	return ready >= expected
 }
 
 func (s *Server) waitForSidecar(ctx context.Context) error {
@@ -891,13 +970,35 @@ func (s *Server) startHeartbeatLoop(ctx context.Context) {
 
 // publishHeartbeat reports busy while a request is in flight. An unconditional
 // idle heartbeat would make a busy worker look free within one interval and
-// defeat per-worker serialisation.
+// defeat per-worker serialisation. Workers that are reloading weights are
+// reported as "loading" so the dispatcher does not assign new requests.
 func (s *Server) publishHeartbeat() {
 	if s.inFlight.Load() {
 		s.publishState("busy", "", 1, "")
 		return
 	}
+	if !s.workersReadyForTraffic() {
+		s.publishState("loading", "", 0, "")
+		return
+	}
 	s.publishState("idle", "", 0, "")
+}
+
+// workersReadyForTraffic is a best-effort readiness check used by heartbeats.
+// On Kubernetes API errors it preserves the previous behaviour (assume ready)
+// rather than wedging the session forever.
+func (s *Server) workersReadyForTraffic() bool {
+	if s.kube == nil || strings.TrimSpace(s.namespace) == "" || strings.TrimSpace(s.cfg.DllamaName) == "" {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	loaded, err := s.workersLoaded(ctx)
+	if err != nil {
+		s.log.WithError(err).Warn("check dllama worker readiness for heartbeat")
+		return true
+	}
+	return loaded
 }
 
 func (s *Server) ensureQueueSubscription(queueName string, ackWait time.Duration) (*nats.Subscription, error) {

@@ -661,6 +661,7 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Len(t, sts.Spec.Template.Spec.Containers, 2)
 	rootContainer := sts.Spec.Template.Spec.Containers[0]
 	require.Equal(t, "root", rootContainer.Name)
+	require.Equal(t, "1200", envVarValue(rootContainer.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
 	require.Contains(t, rootContainer.Args, "--workers")
 	require.Contains(t, rootContainer.Args, "mistral-workers-0.mistral-workers.models.svc.cluster.local:9999")
 	require.Equal(t, "llm", sts.Spec.Template.Spec.Containers[1].Name)
@@ -1614,4 +1615,173 @@ func TestRootContainerDefaultMaxSeqLen(t *testing.T) {
 
 	sidecar := handler.llmSidecarContainer(root)
 	require.Contains(t, sidecar.Args, "4096")
+}
+
+func TestRootWorkerPodsStartedBeforeWorkersReady(t *testing.T) {
+	root := &v1.Root{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "models", Name: "demo-root"},
+		Spec:       v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}},
+	}
+	workerName := workerResourceName("demo")
+
+	tests := []struct {
+		name     string
+		replicas int32
+		want     bool
+	}{
+		{name: "pods created but still loading", replicas: 3, want: true},
+		{name: "pods not all created", replicas: 2, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
+
+			workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+			workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+			statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+			statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+			handler := &rootHandler{
+				workers:      workers,
+				statefulsets: statefulsets,
+				resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+					return &v1.Dllama{
+						ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+						Spec:       v1.DllamaSpec{ReplicaPower: 2},
+					}, nil
+				},
+			}
+
+			workers.EXPECT().Cache().Return(workersCache).AnyTimes()
+			workersCache.EXPECT().Get("models", workerName).Return(&v1.Worker{
+				ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"},
+			}, nil)
+			statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+			statefulsetsCache.EXPECT().Get("models", workerName).Return(&appsv1.StatefulSet{
+				Status: appsv1.StatefulSetStatus{Replicas: tt.replicas, ReadyReplicas: 0},
+			}, nil)
+
+			started, endpoints, err := handler.workerPodsStarted(root)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, started)
+			if tt.want {
+				require.Len(t, endpoints, 3)
+			}
+		})
+	}
+}
+
+func TestRootWorkerPodsStartedEdgeCases(t *testing.T) {
+	t.Run("nil root", func(t *testing.T) {
+		handler := &rootHandler{}
+		started, endpoints, err := handler.workerPodsStarted(nil)
+		require.NoError(t, err)
+		require.False(t, started)
+		require.Nil(t, endpoints)
+	})
+
+	t.Run("standalone root", func(t *testing.T) {
+		handler := &rootHandler{}
+		started, err := false, error(nil)
+		started, _, err = handler.workerPodsStarted(&v1.Root{})
+		require.NoError(t, err)
+		require.True(t, started)
+	})
+
+	t.Run("dllama not found", func(t *testing.T) {
+		handler := &rootHandler{resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Group: v1.GroupName, Resource: "dllamas"}, "demo")
+		}}
+		started, _, err := handler.workerPodsStarted(&v1.Root{Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}})
+		require.NoError(t, err)
+		require.False(t, started)
+	})
+
+	t.Run("dllama lookup error", func(t *testing.T) {
+		handler := &rootHandler{resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return nil, errors.New("boom")
+		}}
+		_, _, err := handler.workerPodsStarted(&v1.Root{Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}})
+		require.Error(t, err)
+	})
+
+	t.Run("zero replica power", func(t *testing.T) {
+		handler := &rootHandler{resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+			return &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}, nil
+		}}
+		started, _, err := handler.workerPodsStarted(&v1.Root{Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}})
+		require.NoError(t, err)
+		require.True(t, started)
+	})
+
+	newHandler := func(t *testing.T, workerErr, stsErr error, sts *appsv1.StatefulSet) *rootHandler {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+		workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
+		statefulsets := genericfake.NewMockControllerInterface[*appsv1.StatefulSet, *appsv1.StatefulSetList](ctrl)
+		statefulsetsCache := genericfake.NewMockCacheInterface[*appsv1.StatefulSet](ctrl)
+
+		workers.EXPECT().Cache().Return(workersCache).AnyTimes()
+		statefulsets.EXPECT().Cache().Return(statefulsetsCache).AnyTimes()
+		workerName := workerResourceName("demo")
+		worker := &v1.Worker{ObjectMeta: metav1.ObjectMeta{Name: workerName, Namespace: "models"}}
+		workersCache.EXPECT().Get("models", workerName).Return(worker, workerErr)
+		if workerErr == nil {
+			statefulsetsCache.EXPECT().Get("models", workerName).Return(sts, stsErr)
+		}
+
+		return &rootHandler{
+			workers:      workers,
+			statefulsets: statefulsets,
+			resolveDllamaHook: func(*v1.Root) (*v1.Dllama, error) {
+				return &v1.Dllama{
+					ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+					Spec:       v1.DllamaSpec{ReplicaPower: 2},
+				}, nil
+			},
+		}
+	}
+	root := &v1.Root{ObjectMeta: metav1.ObjectMeta{Namespace: "models"}, Spec: v1.RootSpec{WorkerSelector: map[string]string{"app": "dllama"}}}
+	notFound := apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "statefulsets"}, "demo-workers")
+
+	t.Run("worker not found", func(t *testing.T) {
+		handler := newHandler(t, notFound, nil, nil)
+		started, _, err := handler.workerPodsStarted(root)
+		require.NoError(t, err)
+		require.False(t, started)
+	})
+
+	t.Run("worker lookup error", func(t *testing.T) {
+		handler := newHandler(t, errors.New("boom"), nil, nil)
+		_, _, err := handler.workerPodsStarted(root)
+		require.Error(t, err)
+	})
+
+	t.Run("statefulset not found", func(t *testing.T) {
+		handler := newHandler(t, nil, notFound, nil)
+		started, endpoints, err := handler.workerPodsStarted(root)
+		require.NoError(t, err)
+		require.False(t, started)
+		require.Len(t, endpoints, 3)
+	})
+
+	t.Run("statefulset lookup error", func(t *testing.T) {
+		handler := newHandler(t, nil, errors.New("boom"), nil)
+		_, _, err := handler.workerPodsStarted(root)
+		require.Error(t, err)
+	})
+
+	t.Run("current replicas are counted", func(t *testing.T) {
+		handler := newHandler(t, nil, nil, &appsv1.StatefulSet{
+			Status: appsv1.StatefulSetStatus{Replicas: 1, CurrentReplicas: 3},
+		})
+		started, _, err := handler.workerPodsStarted(root)
+		require.NoError(t, err)
+		require.True(t, started)
+	})
 }

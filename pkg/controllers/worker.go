@@ -18,6 +18,14 @@ import (
 	"k8s.io/utils/pointer"
 )
 
+const (
+	// workerReadyFile is written by the patched dllama worker after all weight
+	// shards are loaded; the readiness probe watches it.
+	workerReadyFile = "/tmp/dllama-weights-loaded"
+	// workerReadyEnv tells the worker where to write the readiness marker.
+	workerReadyEnv = "DLLAMA_READY_FILE"
+)
+
 type workerHandler struct {
 	ctx          context.Context
 	apply        apply.Apply
@@ -230,7 +238,12 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: name,
 			Replicas:    pointer.Int32(replicas),
-			Selector:    &metav1.LabelSelector{MatchLabels: labels},
+			// Workers must all be created before any of them becomes Ready:
+			// dllama workers block in NnNetwork::serve until the root connects,
+			// and the readiness probe only passes after weights are loaded.
+			// OrderedReady would deadlock on worker-0.
+			PodManagementPolicy: appsv1.ParallelPodManagement,
+			Selector:            &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
@@ -297,6 +310,8 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		}
 	}
 
+	env = append(env, corev1.EnvVar{Name: workerReadyEnv, Value: workerReadyFile})
+
 	// Add volume mount for model PVC if modelRef is set
 	var volumeMounts []corev1.VolumeMount
 	if worker.Spec.ModelRef != "" {
@@ -318,6 +333,18 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 		Env:             env,
 		Ports:           []corev1.ContainerPort{{ContainerPort: 9999}},
 		VolumeMounts:    volumeMounts,
+		// The worker accepts the root socket before the weights are loaded, so
+		// a plain TCP probe would pass too early. The patched dllama worker
+		// writes the marker only after weightReader.read() completes.
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"test", "-f", workerReadyFile}},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
+			TimeoutSeconds:      3,
+			FailureThreshold:    3,
+		},
 	}
 
 	if !isResourceRequirementsEmpty(resources) {
