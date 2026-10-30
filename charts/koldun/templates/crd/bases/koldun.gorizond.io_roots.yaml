@@ -118,6 +118,12 @@ spec:
                 required:
                 - url
                 type: object
+              sidecarTimeout:
+                description: |-
+                  SidecarTimeout bounds llm sidecar HTTP calls to dllama-api
+                  (--llm-sidecar-timeout). Inherited from the Ingress responseTimeout.
+                  When unset the sidecar keeps its 2m default.
+                type: string
               workerSelector:
                 additionalProperties:
                   type: string

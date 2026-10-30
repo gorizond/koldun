@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	genericfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
@@ -157,6 +158,7 @@ func TestLLMSidecarContainer(t *testing.T) {
 				URL:               "nats://demo",
 				CredentialsSecret: &v1.SecretReference{Name: "nats-creds"},
 			},
+			SidecarTimeout: &metav1.Duration{Duration: 15 * time.Minute},
 		},
 	}
 
@@ -176,6 +178,7 @@ func TestLLMSidecarContainer(t *testing.T) {
 	require.Contains(t, container.Args, "sessions.demo.demo.state")
 	require.Contains(t, container.Args, "--llm-dllama-name")
 	require.Contains(t, container.Args, "demo")
+	require.Contains(t, container.Args, "--llm-sidecar-timeout=15m0s")
 
 	envMap := map[string]corev1.EnvVar{}
 	for _, env := range container.Env {
@@ -184,6 +187,20 @@ func TestLLMSidecarContainer(t *testing.T) {
 	require.Equal(t, "hash-123", envMap["HASH_KOLDUN"].Value)
 	require.Equal(t, "nats://demo", envMap["NATS_URL"].Value)
 	require.Equal(t, "nats-creds", envMap["NATS_CREDS"].ValueFrom.SecretKeyRef.Name)
+}
+
+func TestLLMSidecarContainerKeepsDefaultTimeoutWhenUnset(t *testing.T) {
+	h := &rootHandler{}
+	for _, timeout := range []*metav1.Duration{
+		nil,
+		{Duration: 0},
+	} {
+		root := &v1.Root{Spec: v1.RootSpec{Image: "root:latest", SidecarTimeout: timeout}}
+		container := h.llmSidecarContainer(root)
+		for _, arg := range container.Args {
+			require.NotContains(t, arg, "--llm-sidecar-timeout")
+		}
+	}
 }
 
 func TestRootHandlerWorkerStatus(t *testing.T) {

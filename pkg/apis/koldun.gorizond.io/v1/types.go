@@ -318,6 +318,10 @@ type RootSpec struct {
 	// MaxSeqLen configures the model context window (--max-seq-len).
 	// Defaults to 4096.
 	MaxSeqLen int32 `json:"maxSeqLen,omitempty"`
+	// SidecarTimeout bounds llm sidecar HTTP calls to dllama-api
+	// (--llm-sidecar-timeout). Inherited from the Ingress responseTimeout.
+	// When unset the sidecar keeps its 2m default.
+	SidecarTimeout *metav1.Duration `json:"sidecarTimeout,omitempty"`
 }
 
 // RootMemorySpec customizes root memory calculations.
@@ -777,6 +781,10 @@ func (in *RootSpec) DeepCopy() *RootSpec {
 	if in.Memory != nil {
 		memCopy := *in.Memory.DeepCopy()
 		out.Memory = &memCopy
+	}
+	if in.SidecarTimeout != nil {
+		timeoutCopy := *in.SidecarTimeout
+		out.SidecarTimeout = &timeoutCopy
 	}
 	return out
 }

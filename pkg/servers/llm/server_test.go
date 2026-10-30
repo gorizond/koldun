@@ -158,6 +158,59 @@ func TestNewAppliesDefaults(t *testing.T) {
 	require.Contains(t, info.Config.Subjects, srv.cfg.InPrefix+">")
 }
 
+func TestNewHonorsConfiguredSidecarTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startJetStreamServer(t)
+
+	const timeout = 15 * time.Minute
+	cfg := Config{
+		Hash:           "tenant-timeout",
+		NATSURL:        ns.ClientURL(),
+		SidecarTimeout: timeout,
+		Logger:         logrus.New().WithField("component", "test"),
+	}
+
+	srv, err := New(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	t.Cleanup(func() {
+		if srv.sub != nil {
+			_ = srv.sub.Unsubscribe()
+		}
+		if srv.nc != nil {
+			_ = srv.nc.Drain()
+			srv.nc.Close()
+		}
+	})
+
+	require.Equal(t, timeout, srv.cfg.SidecarTimeout)
+	require.NotNil(t, srv.client)
+	require.Equal(t, timeout, srv.client.Timeout)
+}
+
+func TestSidecarStartupTimeout(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured time.Duration
+		want       time.Duration
+	}{
+		{name: "zero falls back to default", configured: 0, want: defaultSidecarStartupTimeout},
+		{name: "shorter request timeout kept", configured: 30 * time.Second, want: 30 * time.Second},
+		{name: "default kept", configured: 2 * time.Minute, want: 2 * time.Minute},
+		{name: "long request timeout capped", configured: 15 * time.Minute, want: defaultSidecarStartupTimeout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, sidecarStartupTimeout(tt.configured))
+		})
+	}
+}
+
 func TestNewHandlesInvalidNATSURL(t *testing.T) {
 	cfg := Config{
 		Hash:    "test-hash",
@@ -1655,6 +1708,41 @@ func TestMonitorSidecarTriggersEviction(t *testing.T) {
 	cancel()
 	<-done
 	require.Error(t, srv.shutdownError())
+}
+
+func TestMonitorSidecarSkipsProbeWhileInFlight(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping monitor test in short mode")
+	}
+
+	transport := &testhelpers.SequenceTransport{Statuses: []int{http.StatusInternalServerError}}
+	srv := &Server{
+		cfg: Config{
+			DllamaName:     "dllama-busy",
+			SidecarURL:     "http://127.0.0.1:18080",
+			SidecarTimeout: 50 * time.Millisecond,
+		},
+		client:                  &http.Client{Transport: transport},
+		log:                     logrus.New().WithField("component", "test"),
+		sidecarMonitorInterval:  5 * time.Millisecond,
+		sidecarFailureThreshold: 1,
+	}
+	srv.inFlight.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		srv.monitorSidecar(ctx)
+		close(done)
+	}()
+
+	require.Never(t, func() bool {
+		return transport.CallCount() > 0
+	}, 100*time.Millisecond, 10*time.Millisecond)
+
+	cancel()
+	<-done
+	require.NoError(t, srv.shutdownError())
 }
 
 func TestMonitorSidecarResetsFailuresAfterSuccess(t *testing.T) {

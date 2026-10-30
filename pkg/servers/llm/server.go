@@ -38,6 +38,9 @@ const (
 	defaultOutPrefix               = "out."
 	defaultSidecarMonitorInterval  = 60 * time.Second // Increased from 15s for CPU inference tolerance
 	defaultSidecarFailureThreshold = 10               // Increased from 4 to give ~10min grace period
+	// defaultSidecarStartupTimeout caps the readiness wait independently of the
+	// request timeout: loading weights is fast, inference is what is slow.
+	defaultSidecarStartupTimeout = 2 * time.Minute
 
 	sidecarModelsPath          = "/v1/models"
 	sidecarChatCompletionsPath = "/v1/chat/completions"
@@ -287,7 +290,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	s.cancel = cancel
 
-	if err := s.waitForSidecar(runCtx); err != nil {
+	if err := s.waitForSidecarWithin(runCtx, sidecarStartupTimeout(s.cfg.SidecarTimeout)); err != nil {
 		reason := fmt.Sprintf("dllama sidecar failed to become ready: %v", err)
 		s.triggerEviction(reason)
 		return fmt.Errorf("wait for dllama sidecar: %w", err)
@@ -303,6 +306,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if ackWait <= 0 {
 		ackWait = 2 * time.Minute
 	} else {
+		// The +30s guard is intentional: ackWait must outlive the sidecar HTTP
+		// timeout, otherwise JetStream redelivers a request mid-generation
+		// (the request stream has no MaxAge). Accepted trade-off: after a
+		// worker crash an in-flight message can stay unacked for up to
+		// SidecarTimeout+30s before redelivery.
 		ackWait += 30 * time.Second
 	}
 
@@ -376,6 +384,22 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 func (s *Server) waitForSidecar(ctx context.Context) error {
+	return s.waitForSidecarWithin(ctx, s.cfg.SidecarTimeout)
+}
+
+// sidecarStartupTimeout bounds the readiness wait independently of the request
+// timeout. A misconfigured or crashed dllama-api should not take 15m to evict.
+func sidecarStartupTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 || configured > defaultSidecarStartupTimeout {
+		return defaultSidecarStartupTimeout
+	}
+	return configured
+}
+
+func (s *Server) waitForSidecarWithin(ctx context.Context, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultSidecarStartupTimeout
+	}
 	endpoint, err := s.sidecarEndpoint(sidecarModelsPath)
 	if err != nil {
 		return err
@@ -386,7 +410,7 @@ func (s *Server) waitForSidecar(ctx context.Context) error {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	deadline := time.Now().Add(s.cfg.SidecarTimeout)
+	deadline := time.Now().Add(timeout)
 	var lastErr error
 
 	for {
@@ -1025,6 +1049,12 @@ func (s *Server) monitorSidecar(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// /v1/models is unresponsive while dllama-api is running inference.
+			// Probing during a request would count as a failure and evict the
+			// pod mid-generation once SidecarTimeout grew to minutes.
+			if s.inFlight.Load() {
+				continue
+			}
 			if s.probeSidecar(ctx) {
 				failures = 0
 				continue
