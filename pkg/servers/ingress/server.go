@@ -1754,6 +1754,11 @@ type streamingNormaliserState struct {
 	disableThink bool
 }
 
+const (
+	thinkOpenTag  = "<think>"
+	thinkCloseTag = "</think>"
+)
+
 type thinkRedactor struct {
 	buffer  string
 	inThink bool
@@ -1802,31 +1807,29 @@ func (r *thinkRedactor) filter(content string) string {
 	var out strings.Builder
 
 	for {
-		lower := strings.ToLower(r.buffer)
-
 		if r.inThink {
-			closeIdx := strings.Index(lower, "</think>")
+			closeIdx := indexFold(r.buffer, thinkCloseTag)
 			if closeIdx == -1 {
-				if len(r.buffer) > len("</think>")-1 {
-					r.buffer = r.buffer[len(r.buffer)-(len("</think>")-1):]
+				if len(r.buffer) > len(thinkCloseTag)-1 {
+					r.buffer = r.buffer[len(r.buffer)-(len(thinkCloseTag)-1):]
 				}
 				return out.String()
 			}
-			r.buffer = r.buffer[closeIdx+len("</think>"):]
+			r.buffer = r.buffer[closeIdx+len(thinkCloseTag):]
 			r.inThink = false
 			continue
 		}
 
-		openIdx := strings.Index(lower, "<think>")
-		closeIdx := strings.Index(lower, "</think>")
+		openIdx := indexFold(r.buffer, thinkOpenTag)
+		closeIdx := indexFold(r.buffer, thinkCloseTag)
 		if closeIdx != -1 && (openIdx == -1 || closeIdx < openIdx) {
 			// Drop stray closing tag when we aren't tracking a think block.
-			r.buffer = r.buffer[closeIdx+len("</think>"):]
+			r.buffer = r.buffer[closeIdx+len(thinkCloseTag):]
 			continue
 		}
 
 		if openIdx == -1 {
-			emitLen := len(r.buffer) - longestThinkSuffix(lower)
+			emitLen := len(r.buffer) - longestThinkSuffix(r.buffer)
 			if emitLen <= 0 {
 				return out.String()
 			}
@@ -1838,15 +1841,35 @@ func (r *thinkRedactor) filter(content string) string {
 		if openIdx > 0 {
 			out.WriteString(r.buffer[:openIdx])
 		}
-		r.buffer = r.buffer[openIdx+len("<think>"):]
+		r.buffer = r.buffer[openIdx+len(thinkOpenTag):]
 		r.inThink = true
 	}
 }
 
-func longestThinkSuffix(lower string) int {
+// indexFold returns the byte offset of the first case-insensitive occurrence of
+// pattern in s. The offset is always valid for s: strings.ToLower can change the
+// byte length of a string (for example U+023A lowercases to the 3-byte U+2C65),
+// so offsets taken from a lowercased copy cannot be used to slice the original.
+func indexFold(s, pattern string) int {
+	if len(pattern) == 0 || len(s) < len(pattern) {
+		return -1
+	}
+	for i := 0; i+len(pattern) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(pattern)], pattern) {
+			return i
+		}
+	}
+	return -1
+}
+
+// longestThinkSuffix returns the length of the longest suffix of buffer that is
+// a prefix of a think tag, so a tag split across chunks is not emitted early.
+// Matching is case-insensitive and never indexes outside buffer, including for
+// buffers shorter than the tags.
+func longestThinkSuffix(buffer string) int {
 	patterns := []string{"<thinking>", "</thinking>"}
 	max := 0
-	length := len(lower)
+	length := len(buffer)
 	for _, pattern := range patterns {
 		limit := len(pattern) - 1
 		if limit <= 0 {
@@ -1855,9 +1878,10 @@ func longestThinkSuffix(lower string) int {
 		if limit > length {
 			limit = length
 		}
-		for i := 1; i <= limit; i++ {
-			if strings.HasSuffix(lower, pattern[:i]) && i > max {
+		for i := limit; i > max; i-- {
+			if strings.EqualFold(buffer[length-i:], pattern[:i]) {
 				max = i
+				break
 			}
 		}
 	}

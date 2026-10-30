@@ -1,6 +1,6 @@
 {
-  "total": 86.4,
-  "updated_at": "2026-10-29T22:54:04Z",
-  "commit": "1fc1f397885c2d5009dd3c978c63014de492a8fa",
-  "source": "1fc1f39 \u2014 fix(dispatcher): surface the worker-reported failure reason"
+  "total": 86.5,
+  "updated_at": "2026-10-30T10:26:02Z",
+  "commit": "39e01e9c4d8643657d47ed427a19855b340a9398",
+  "source": "39e01e9 \u2014 fix(ingress): never slice the think buffer with lowercased offsets"
 }
