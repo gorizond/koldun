@@ -75,12 +75,16 @@ spec:
             - {{ . | quote }}
             {{- end }}
           env:
+            {{- if .Values.serviceAccount.create }}
             - name: DLLAMA_SERVICE_ACCOUNT
-              {{- if .Values.serviceAccount.create }}
               value: {{ include "koldun.dllamaServiceAccountName" . | quote }}
-              {{- else }}
+            - name: OPERATOR_SERVICE_ACCOUNT
               value: {{ include "koldun.serviceAccountName" . | quote }}
-              {{- end }}
+            {{- end }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port | default .Values.service.port }}

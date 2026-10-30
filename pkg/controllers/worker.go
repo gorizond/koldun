@@ -80,10 +80,14 @@ func (h *workerHandler) onRemove(key string, obj *v1.Worker) (*v1.Worker, error)
 
 func (h *workerHandler) onRelatedStatefulSet(key string, obj *appsv1.StatefulSet) (*appsv1.StatefulSet, error) {
 	if obj == nil {
-		// The STS was deleted (e.g. OrderedReady -> Parallel migration). The
-		// Worker must be re-enqueued or the deleted STS is never recreated and
-		// the session strands until the worker-load timeout evicts it.
-		if namespace, name := splitKey(key); namespace != "" && name != "" {
+		// The STS was deleted (e.g. OrderedReady -> Parallel migration). Guard
+		// the cluster-wide OnChange nil path by only enqueueing a real Worker;
+		// OnRemove also carries the object for the actual worker STS.
+		namespace, name := splitKey(key)
+		if namespace == "" || name == "" || h.workers == nil {
+			return nil, nil
+		}
+		if _, err := h.workers.Cache().Get(namespace, name); err == nil {
 			h.workers.Enqueue(namespace, name)
 		}
 		return nil, nil

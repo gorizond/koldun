@@ -1844,8 +1844,13 @@ func TestWorkerOnRelatedStatefulSetRemoveEnqueuesWorker(t *testing.T) {
 	t.Cleanup(ctrl.Finish)
 
 	workers := genericfake.NewMockControllerInterface[*v1.Worker, *v1.WorkerList](ctrl)
+	workersCache := genericfake.NewMockCacheInterface[*v1.Worker](ctrl)
 	handler := &workerHandler{workers: workers}
 
+	workers.EXPECT().Cache().Return(workersCache)
+	workersCache.EXPECT().Get("models", "mistral-workers").Return(&v1.Worker{
+		ObjectMeta: metav1.ObjectMeta{Name: "mistral-workers", Namespace: "models"},
+	}, nil)
 	workers.EXPECT().Enqueue("models", "mistral-workers")
 	_, err := handler.onRelatedStatefulSet("models/mistral-workers", nil)
 	require.NoError(t, err)

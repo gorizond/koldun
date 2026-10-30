@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 - Rolling an existing Dllama group (image/config change) requires deleting the root and worker StatefulSets together, selected via `kubectl get sts -l koldun.gorizond.io/dllama=<dllama>` (both names may be truncated); expect 8-10 minutes without service and in-flight generations being terminated (grace period 0).
-- Root pods use a dedicated minimal service account (`<release>-dllama`, get/delete dllamas only) instead of the operator service account.
+- Root pods in the release namespace use a dedicated minimal service account (`<release>-dllama`, get/delete dllamas only) instead of the operator service account. Roots created by Ingresses in other namespaces keep the default SA and the llm sidecar fails open if RBAC is absent.
 
 ## [0.1.0] - 2025-11-18
 

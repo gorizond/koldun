@@ -1,0 +1,15 @@
+# Render check: an Ingress CR outside the release namespace. The root pod for
+# that Ingress runs in other-ns and therefore keeps the default service account
+# (the dedicated dllama SA exists only in the release namespace).
+ingresses:
+  - name: multi-namespace
+    namespace: other-ns
+    spec:
+      backend:
+        image: ghcr.io/gorizond/koldun:test
+        rootImage: ghcr.io/gorizond/koldun-root:test
+        workerImage: ghcr.io/gorizond/koldun-worker:test
+        nats:
+          url: nats://nats:4222
+      route:
+        host: multi-namespace.example.test

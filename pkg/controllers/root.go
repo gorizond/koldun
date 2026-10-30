@@ -47,6 +47,7 @@ type rootHandler struct {
 	workers      generic.ControllerInterface[*v1.Worker, *v1.WorkerList]
 
 	serviceAccountName string
+	operatorNamespace  string
 	pods               generic.ControllerInterface[*corev1.Pod, *corev1.PodList]
 
 	workerStatusHook  func(*v1.Root) (bool, int32, []string, error)
@@ -66,6 +67,7 @@ func registerRootController(ctx context.Context, m *Manager) error {
 		statefulsets:       m.Apps.StatefulSet(),
 		workers:            m.Kold.Worker(),
 		serviceAccountName: m.ServiceAccountName,
+		operatorNamespace:  m.Namespace,
 		pods:               m.Core.Pod(),
 	}
 
@@ -299,6 +301,8 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 		podAnnotations[annotationMemoryPlan] = fmt.Sprintf("model=%s nodes=%d root=%s worker=%s", sizeHuman, totalNodes, rootMemory.String(), workerMemory.String())
 	}
 
+	serviceAccountName := h.rootServiceAccountName(root.Namespace)
+
 	sts := &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: appsv1.SchemeGroupVersion.String(),
@@ -317,7 +321,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 				ObjectMeta: metav1.ObjectMeta{Labels: selector, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					TerminationGracePeriodSeconds: pointer.Int64(0),
-					ServiceAccountName:            h.serviceAccountName,
+					ServiceAccountName:            serviceAccountName,
 					TopologySpreadConstraints:     dllamaTopologySpread(labels[labelDllamaName]),
 					Volumes: []corev1.Volume{
 						{
@@ -398,6 +402,16 @@ func (h *rootHandler) ensureService(root *v1.Root) error {
 		WithDefaultNamespace(root.Namespace).
 		WithSetID(fmt.Sprintf("root-%s-service", root.Name)).
 		ApplyObjects(svc)
+}
+
+// rootServiceAccountName keeps the dedicated SA only where it exists: the
+// operator namespace. Ingresses may create roots in other namespaces; there we
+// use the namespace default SA and the llm sidecar fails open without RBAC.
+func (h *rootHandler) rootServiceAccountName(namespace string) string {
+	if h.operatorNamespace != "" && namespace != h.operatorNamespace {
+		return ""
+	}
+	return h.serviceAccountName
 }
 
 // workerPodsStarted reports whether the worker StatefulSet has created all

@@ -1898,3 +1898,12 @@ func TestRootWorkerPodsStartedPodListError(t *testing.T) {
 	_, _, err := handler.workerPodsStarted(root)
 	require.Error(t, err)
 }
+
+func TestRootServiceAccountNameOnlyInOperatorNamespace(t *testing.T) {
+	handler := &rootHandler{serviceAccountName: "dllama-sa", operatorNamespace: "koldun"}
+	require.Equal(t, "dllama-sa", handler.rootServiceAccountName("koldun"))
+	require.Empty(t, handler.rootServiceAccountName("other-namespace"))
+
+	handler.operatorNamespace = ""
+	require.Equal(t, "dllama-sa", handler.rootServiceAccountName("other-namespace"))
+}
