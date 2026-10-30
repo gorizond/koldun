@@ -1,7 +1,9 @@
 package v1
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1333,11 +1335,11 @@ func TestSessionDeepCopyVariants(t *testing.T) {
 				AckTimeout: &duration,
 			},
 			Scaling: &SessionScalingSpec{
-				MinDllamas:           1,
+				MinDllamas:           int32Ptr(1),
 				MaxDllamas:           5,
 				ScaleUpBacklog:       2,
 				ScaleDownIdleSeconds: 30,
-				DesiredDllamas:       3,
+				DesiredDllamas:       int32Ptr(3),
 			},
 			NATS: &SessionNATSConfig{
 				URL: "nats://session:4222",
@@ -1430,7 +1432,7 @@ func TestIngressDeepCopyVariants(t *testing.T) {
 				ConversationTTL: &convTTL,
 				ResponseTimeout: &respTimeout,
 				SessionScaling: &IngressSessionScalingSpec{
-					MinDllamas:           1,
+					MinDllamas:           int32Ptr(1),
 					MaxDllamas:           3,
 					ScaleUpBacklog:       5,
 					ScaleDownIdleSeconds: 30,
@@ -2240,5 +2242,58 @@ func TestRootStatus_DeepCopy(t *testing.T) {
 				t.Errorf("DeepCopy() = %+v, want %+v", got, tt.status)
 			}
 		})
+	}
+}
+
+func int32Ptr(value int32) *int32 {
+	return &value
+}
+
+func TestScalingMinDllamasJSONExplicitZero(t *testing.T) {
+	zero := int32(0)
+
+	sessionData, err := json.Marshal(SessionScalingSpec{MinDllamas: &zero})
+	if err != nil {
+		t.Fatalf("marshal session scaling: %v", err)
+	}
+	if !strings.Contains(string(sessionData), `"minDllamas":0`) {
+		t.Fatalf("explicit zero minDllamas missing from %s", sessionData)
+	}
+	var sessionParsed SessionScalingSpec
+	if err := json.Unmarshal(sessionData, &sessionParsed); err != nil {
+		t.Fatalf("unmarshal session scaling: %v", err)
+	}
+	if sessionParsed.MinDllamas == nil || *sessionParsed.MinDllamas != 0 {
+		t.Fatalf("session minDllamas = %v, want 0", sessionParsed.MinDllamas)
+	}
+
+	unsetData, err := json.Marshal(SessionScalingSpec{})
+	if err != nil {
+		t.Fatalf("marshal unset session scaling: %v", err)
+	}
+	if strings.Contains(string(unsetData), "minDllamas") {
+		t.Fatalf("unset minDllamas should be omitted: %s", unsetData)
+	}
+	var unsetParsed SessionScalingSpec
+	if err := json.Unmarshal(unsetData, &unsetParsed); err != nil {
+		t.Fatalf("unmarshal unset session scaling: %v", err)
+	}
+	if unsetParsed.MinDllamas != nil {
+		t.Fatalf("unset minDllamas = %v, want nil", unsetParsed.MinDllamas)
+	}
+
+	ingressData, err := json.Marshal(IngressSessionScalingSpec{MinDllamas: &zero})
+	if err != nil {
+		t.Fatalf("marshal ingress scaling: %v", err)
+	}
+	if !strings.Contains(string(ingressData), `"minDllamas":0`) {
+		t.Fatalf("explicit zero ingress minDllamas missing from %s", ingressData)
+	}
+	var ingressParsed IngressSessionScalingSpec
+	if err := json.Unmarshal(ingressData, &ingressParsed); err != nil {
+		t.Fatalf("unmarshal ingress scaling: %v", err)
+	}
+	if ingressParsed.MinDllamas == nil || *ingressParsed.MinDllamas != 0 {
+		t.Fatalf("ingress minDllamas = %v, want 0", ingressParsed.MinDllamas)
 	}
 }

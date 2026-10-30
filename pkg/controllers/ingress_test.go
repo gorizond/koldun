@@ -25,7 +25,7 @@ import (
 )
 
 func newIngressSpec() *v1.IngressSpec {
-	conversationTTL := metav1.Duration{Duration: 30 * time.Second}
+	conversationTTL := metav1.Duration{Duration: 60 * time.Second}
 	responseTimeout := metav1.Duration{Duration: 45 * time.Second}
 
 	return &v1.IngressSpec{
@@ -48,7 +48,7 @@ func newIngressSpec() *v1.IngressSpec {
 			ConversationTTL: &conversationTTL,
 			ResponseTimeout: &responseTimeout,
 			SessionScaling: &v1.IngressSessionScalingSpec{
-				MinDllamas:           1,
+				MinDllamas:           int32Ptr(1),
 				MaxDllamas:           3,
 				ScaleUpBacklog:       5,
 				ScaleDownIdleSeconds: 120,
@@ -387,7 +387,7 @@ func TestBackendArgs_DefaultsAndOptionalFlags(t *testing.T) {
 		"--backend-model-prefix=models",
 		"--backend-token-prefix=tokens",
 		"--backend-ttl-prefix=nats_ttl_",
-		"--backend-conversation-ttl=30s",
+		"--backend-conversation-ttl=1m0s",
 		"--backend-response-timeout=45s",
 		"--backend-session-min-dllamas=1",
 		"--backend-session-max-dllamas=3",
@@ -435,6 +435,16 @@ func TestBackendArgs_OverridesAndOmissions(t *testing.T) {
 	require.False(t, containsArg(args, "--backend-session-scale-down-idle-seconds"))
 	require.False(t, containsArg(args, "--backend-hash-secret"))
 	require.False(t, containsArg(args, "--backend-allow-anonymous"))
+}
+
+func TestBackendArgs_ExplicitZeroMinDllamas(t *testing.T) {
+	spec := newIngressSpec()
+	zero := int32(0)
+	spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{MinDllamas: &zero}
+
+	args := backendArgs(spec, 8082)
+
+	require.Contains(t, args, "--backend-session-min-dllamas=0")
 }
 
 func TestServicePort(t *testing.T) {
@@ -740,7 +750,7 @@ func TestValidateIngressSpec(t *testing.T) {
 			name: "negative min dllamas",
 			mutate: func(spec *v1.IngressSpec) {
 				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
-					MinDllamas: -1,
+					MinDllamas: int32Ptr(-1),
 				}
 			},
 			wantErr: "backend.sessionScaling.minDllamas must be >= 0",
@@ -755,10 +765,44 @@ func TestValidateIngressSpec(t *testing.T) {
 			wantErr: "backend.sessionScaling.maxDllamas must be >= 0",
 		},
 		{
+			name: "conversation TTL below two heartbeat intervals",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 19 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+			},
+			wantErr: "backend.conversationTTL must be at least 20s",
+		},
+		{
+			name: "conversation TTL below default response timeout",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 30 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+				spec.Backend.ResponseTimeout = nil
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
+		},
+		{
+			name: "response timeout above default conversation TTL",
+			mutate: func(spec *v1.IngressSpec) {
+				timeout := metav1.Duration{Duration: 15 * time.Minute}
+				spec.Backend.ConversationTTL = nil
+				spec.Backend.ResponseTimeout = &timeout
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
+		},
+		{
+			name: "conversation TTL not greater than response timeout",
+			mutate: func(spec *v1.IngressSpec) {
+				ttl := metav1.Duration{Duration: 45 * time.Second}
+				spec.Backend.ConversationTTL = &ttl
+			},
+			wantErr: "backend.conversationTTL must be greater than backend.responseTimeout",
+		},
+		{
 			name: "max dllamas less than min",
 			mutate: func(spec *v1.IngressSpec) {
 				spec.Backend.SessionScaling = &v1.IngressSessionScalingSpec{
-					MinDllamas: 2,
+					MinDllamas: int32Ptr(2),
 					MaxDllamas: 1,
 				}
 			},

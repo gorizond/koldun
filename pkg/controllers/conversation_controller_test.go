@@ -109,9 +109,9 @@ func TestEnsureSessionAppliesSessionFromRecord(t *testing.T) {
 		DispatcherImage:         "ghcr.io/dispatcher:stable",
 		DispatcherMetricsListen: ":9090",
 		Scaling: &conversation.SessionScalingConfig{
-			MinDllamas:           2,
+			MinDllamas:           int32Ptr(2),
 			MaxDllamas:           5,
-			DesiredDllamas:       4,
+			DesiredDllamas:       int32Ptr(4),
 			ScaleUpBacklog:       3,
 			ScaleDownIdleSeconds: 15,
 		},
@@ -1369,4 +1369,422 @@ func (s *stubKeyValueProvider) KeyValue(string) (nats.KeyValue, error) {
 func (s *stubKeyValueProvider) CreateKeyValue(*nats.KeyValueConfig) (nats.KeyValue, error) {
 	s.createCalled.Store(true)
 	return nil, errors.New("unexpected create call")
+}
+
+func TestSyncSessionLastActivity(t *testing.T) {
+	activity := int64(1700000000)
+	record := &conversation.Record{
+		Hash:           "hash",
+		Session:        "session-hash",
+		Namespace:      "tenant",
+		LastActivityAt: activity,
+	}
+
+	t.Run("copies record activity into session status", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+		}, nil)
+
+		var updated *v1.Session
+		sessions.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(func(obj *v1.Session) (*v1.Session, error) {
+			updated = obj
+			return obj, nil
+		})
+
+		withLoad := *record
+		withLoad.Scaling = &conversation.SessionScalingConfig{ActiveRequests: 2}
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.syncSessionLastActivity(&withLoad)
+
+		require.NotNil(t, updated)
+		require.NotNil(t, updated.Status.LastActivity)
+		require.Equal(t, activity, updated.Status.LastActivity.Unix())
+		require.Equal(t, int32(2), updated.Status.ActiveRequests)
+	})
+
+	t.Run("does not overwrite newer status activity", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+			Status: v1.SessionStatus{
+				LastActivity: &metav1.Time{Time: time.Unix(activity+60, 0)},
+			},
+		}, nil)
+		sessions.EXPECT().UpdateStatus(gomock.Any()).Times(0)
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.syncSessionLastActivity(record)
+	})
+
+	t.Run("logs status update failures", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+		}, nil)
+		sessions.EXPECT().UpdateStatus(gomock.Any()).Return(nil, errors.New("update failed"))
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.syncSessionLastActivity(record)
+	})
+
+	t.Run("skips cache errors and missing sessions", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(nil, errors.New("cache unavailable")).Times(1)
+		cache.EXPECT().Get("tenant", "session-hash").Return(nil, nil).Times(1)
+		sessions.EXPECT().UpdateStatus(gomock.Any()).Times(0)
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.syncSessionLastActivity(record)
+		reconciler.syncSessionLastActivity(record)
+	})
+
+	t.Run("skips empty records and missing sessions controller", func(t *testing.T) {
+		reconciler := &conversationReconciler{}
+		reconciler.syncSessionLastActivity(nil)
+		reconciler.syncSessionLastActivity(&conversation.Record{LastActivityAt: 0})
+	})
+}
+
+func TestEnsureSessionPassesExplicitZeroMin(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	applyMock := newGomockApply(ctrl)
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get(gomock.Any(), gomock.Any()).Return(nil, apierrors.NewNotFound(schema.GroupResource{}, "")).AnyTimes()
+	reconciler := &conversationReconciler{apply: applyMock, sessions: sessions}
+
+	zero := int32(0)
+	record := &conversation.Record{
+		Hash:        "hash",
+		Session:     "sess",
+		Namespace:   "tenant",
+		Model:       "tenant/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+		Scaling: &conversation.SessionScalingConfig{
+			MinDllamas:     &zero,
+			DesiredDllamas: &zero,
+		},
+	}
+
+	var applied *v1.Session
+	applyMock.EXPECT().ApplyObjects(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(func(objs ...runtime.Object) error {
+		var ok bool
+		applied, ok = objs[0].(*v1.Session)
+		require.True(t, ok)
+		return nil
+	})
+
+	require.NoError(t, reconciler.ensureSession(record))
+	require.NotNil(t, applied)
+	require.Equal(t, int32(0), applied.Spec.MinIdle, "explicit zero MinIdle must pass through")
+	require.NotNil(t, applied.Spec.Scaling)
+	require.NotNil(t, applied.Spec.Scaling.MinDllamas)
+	require.Equal(t, int32(0), *applied.Spec.Scaling.MinDllamas)
+	require.NotNil(t, applied.Spec.Scaling.DesiredDllamas)
+	require.Equal(t, int32(0), *applied.Spec.Scaling.DesiredDllamas)
+}
+
+func TestSyncSessionLastActivityMirrorsActiveRequestsOnly(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+	}, nil)
+
+	var updated *v1.Session
+	sessions.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(func(obj *v1.Session) (*v1.Session, error) {
+		updated = obj
+		return obj, nil
+	})
+
+	reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+	reconciler.syncSessionLastActivity(&conversation.Record{
+		Hash:      "hash",
+		Session:   "session-hash",
+		Namespace: "tenant",
+		Scaling:   &conversation.SessionScalingConfig{ActiveRequests: 2},
+	})
+
+	require.NotNil(t, updated)
+	require.Equal(t, int32(2), updated.Status.ActiveRequests)
+	require.Nil(t, updated.Status.LastActivity)
+
+	// A negative counter is clamped to zero and does not trigger a write.
+	ctrl2 := gomock.NewController(t)
+	t.Cleanup(ctrl2.Finish)
+	sessions2 := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl2)
+	reconciler2 := &conversationReconciler{sessions: sessions2, log: logrus.NewEntry(logrus.New())}
+	reconciler2.syncSessionLastActivity(&conversation.Record{
+		Hash:      "hash",
+		Session:   "session-hash",
+		Namespace: "tenant",
+		Scaling:   &conversation.SessionScalingConfig{ActiveRequests: -3},
+	})
+}
+
+func TestSyncSessionLastActivityRetriesConflicts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	stale := &v1.Session{ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"}}
+	cache.EXPECT().Get("tenant", "session-hash").Return(stale, nil).Times(2)
+
+	gomock.InOrder(
+		sessions.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Session{})).
+			Return(nil, apierrors.NewConflict(schema.GroupResource{Resource: "sessions"}, "session-hash", errors.New("conflict"))),
+		sessions.EXPECT().UpdateStatus(gomock.AssignableToTypeOf(&v1.Session{})).DoAndReturn(
+			func(obj *v1.Session) (*v1.Session, error) {
+				require.Equal(t, int64(1700000000), obj.Status.LastActivity.Unix())
+				return obj, nil
+			}),
+	)
+
+	reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+	reconciler.syncSessionLastActivity(&conversation.Record{
+		Hash:           "hash",
+		Session:        "session-hash",
+		Namespace:      "tenant",
+		LastActivityAt: 1700000000,
+	})
+}
+
+func TestEnqueueScaleDownIfDue(t *testing.T) {
+	zero := int32(0)
+	now := time.Now()
+
+	baseRecord := func() *conversation.Record {
+		return &conversation.Record{
+			Hash:           "hash",
+			Session:        "session-hash",
+			Namespace:      "tenant",
+			LastActivityAt: now.Add(-2 * time.Minute).Unix(),
+			Scaling: &conversation.SessionScalingConfig{
+				MinDllamas:           &zero,
+				ScaleDownIdleSeconds: 60,
+			},
+		}
+	}
+
+	t.Run("enqueues due idle conversation", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
+		}, nil)
+		sessions.EXPECT().Enqueue("tenant", "session-hash")
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(baseRecord())
+	})
+
+	skipCases := []struct {
+		name   string
+		mutate func(*conversation.Record)
+	}{
+		{
+			name:   "no scaling block",
+			mutate: func(r *conversation.Record) { r.Scaling = nil },
+		},
+		{
+			name:   "idle threshold disabled",
+			mutate: func(r *conversation.Record) { r.Scaling.ScaleDownIdleSeconds = 0 },
+		},
+		{
+			name:   "in-flight request",
+			mutate: func(r *conversation.Record) { r.Scaling.ActiveRequests = 1 },
+		},
+		{
+			name:   "not due yet",
+			mutate: func(r *conversation.Record) { r.LastActivityAt = now.Unix() },
+		},
+	}
+
+	for _, tc := range skipCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
+			sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+			sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+			record := baseRecord()
+			tc.mutate(record)
+			reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+			reconciler.enqueueScaleDownIfDue(record)
+		})
+	}
+
+	t.Run("does not enqueue while ready workers are at min", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		one := int32(1)
+		record := baseRecord()
+		record.Scaling.MinDllamas = &one
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
+		}, nil)
+		sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+	})
+}
+
+func TestEnqueueScaleDownIfDueHandlesSessionLookup(t *testing.T) {
+	zero := int32(0)
+	now := time.Now()
+
+	t.Run("negative min clamps to zero", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
+		}, nil)
+		sessions.EXPECT().Enqueue("tenant", "session-hash")
+		minusOne := int32(-1)
+		record := &conversation.Record{
+			Hash:           "hash",
+			Session:        "session-hash",
+			Namespace:      "tenant",
+			LastActivityAt: now.Add(-2 * time.Minute).Unix(),
+			Scaling: &conversation.SessionScalingConfig{
+				MinDllamas:           &minusOne,
+				ScaleDownIdleSeconds: 60,
+			},
+		}
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+	})
+
+	t.Run("cache error and missing session are ignored", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(nil, errors.New("cache unavailable")).Times(1)
+		cache.EXPECT().Get("tenant", "session-hash").Return(nil, nil).Times(1)
+		sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+		record := &conversation.Record{
+			Hash:           "hash",
+			Session:        "session-hash",
+			Namespace:      "tenant",
+			LastActivityAt: now.Add(-2 * time.Minute).Unix(),
+			Scaling: &conversation.SessionScalingConfig{
+				MinDllamas:           &zero,
+				ScaleDownIdleSeconds: 60,
+			},
+		}
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+		reconciler.enqueueScaleDownIfDue(record)
+	})
+}
+
+func TestSyncSessionLastActivityGivesUpAfterConflicts(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+	cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+	sessions.EXPECT().Cache().Return(cache).AnyTimes()
+	cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+		ObjectMeta: metav1.ObjectMeta{Name: "session-hash", Namespace: "tenant"},
+	}, nil).Times(3)
+	conflict := apierrors.NewConflict(schema.GroupResource{Resource: "sessions"}, "session-hash", errors.New("conflict"))
+	sessions.EXPECT().UpdateStatus(gomock.Any()).Return(nil, conflict).Times(3)
+
+	reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+	reconciler.syncSessionLastActivity(&conversation.Record{
+		Hash:           "hash",
+		Session:        "session-hash",
+		Namespace:      "tenant",
+		LastActivityAt: 1700000000,
+	})
+}
+
+func TestEnqueueScaleDownIfDueUsesAvailableWorkerSets(t *testing.T) {
+	one := int32(1)
+	now := time.Now()
+	record := &conversation.Record{
+		Hash:           "hash",
+		Session:        "session-hash",
+		Namespace:      "tenant",
+		LastActivityAt: now.Add(-2 * time.Minute).Unix(),
+		Scaling: &conversation.SessionScalingConfig{
+			MinDllamas:           &one,
+			ScaleDownIdleSeconds: 60,
+		},
+	}
+
+	t.Run("ready replicas above min but only one available set does not enqueue", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 1},
+		}, nil)
+		sessions.EXPECT().Enqueue(gomock.Any(), gomock.Any()).Times(0)
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+	})
+
+	t.Run("two available sets above min enqueue", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		t.Cleanup(ctrl.Finish)
+		sessions := genericfake.NewMockControllerInterface[*v1.Session, *v1.SessionList](ctrl)
+		cache := genericfake.NewMockCacheInterface[*v1.Session](ctrl)
+		sessions.EXPECT().Cache().Return(cache).AnyTimes()
+		cache.EXPECT().Get("tenant", "session-hash").Return(&v1.Session{
+			Status: v1.SessionStatus{ReadyWorkers: 3, AvailableWorkers: 2},
+		}, nil)
+		sessions.EXPECT().Enqueue("tenant", "session-hash")
+
+		reconciler := &conversationReconciler{sessions: sessions, log: logrus.NewEntry(logrus.New())}
+		reconciler.enqueueScaleDownIfDue(record)
+	})
 }

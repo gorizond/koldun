@@ -516,12 +516,52 @@ func TestRecord_ScalingDefaults(t *testing.T) {
 		t.Fatalf("Validate() error = %v", err)
 	}
 
-	if record.Scaling.MinDllamas <= 0 {
-		t.Error("MinDllamas should default to > 0")
+	if record.Scaling.MinDllamas == nil || *record.Scaling.MinDllamas != 1 {
+		t.Error("MinDllamas should default to 1")
 	}
 
-	if record.Scaling.DesiredDllamas < record.Scaling.MinDllamas {
+	if record.Scaling.DesiredDllamas == nil || *record.Scaling.DesiredDllamas < *record.Scaling.MinDllamas {
 		t.Error("DesiredDllamas should be >= MinDllamas")
+	}
+}
+
+func TestRecord_ScalingExplicitZeroMin(t *testing.T) {
+	zero := int32(0)
+	record := Record{
+		Hash:        "test-hash",
+		Namespace:   "default",
+		Model:       "test-model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+		Scaling: &SessionScalingConfig{
+			MinDllamas:     &zero,
+			DesiredDllamas: &zero,
+		},
+	}
+
+	if err := record.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if record.Scaling.MinDllamas == nil || *record.Scaling.MinDllamas != 0 {
+		t.Errorf("MinDllamas = %v, want explicit 0", record.Scaling.MinDllamas)
+	}
+	if record.Scaling.DesiredDllamas == nil || *record.Scaling.DesiredDllamas != 0 {
+		t.Errorf("DesiredDllamas = %v, want explicit 0", record.Scaling.DesiredDllamas)
+	}
+
+	data, err := record.Marshal()
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	parsed, err := ParseRecord(data)
+	if err != nil {
+		t.Fatalf("ParseRecord() error = %v", err)
+	}
+	if parsed.Scaling.MinDllamas == nil || *parsed.Scaling.MinDllamas != 0 {
+		t.Errorf("round-tripped MinDllamas = %v, want explicit 0", parsed.Scaling.MinDllamas)
+	}
+	if parsed.Scaling.DesiredDllamas == nil || *parsed.Scaling.DesiredDllamas != 0 {
+		t.Errorf("round-tripped DesiredDllamas = %v, want explicit 0", parsed.Scaling.DesiredDllamas)
 	}
 }
 
@@ -781,4 +821,8 @@ func TestCanonicalMessagesEmpty(t *testing.T) {
 	if got := CanonicalMessages([]byte("  \n")); got != nil {
 		t.Fatalf("CanonicalMessages(blank) = %v, want nil", got)
 	}
+}
+
+func int32Ptr(value int32) *int32 {
+	return &value
 }

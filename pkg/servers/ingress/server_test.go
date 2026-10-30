@@ -127,6 +127,36 @@ func TestNew(t *testing.T) {
 	}
 }
 
+func TestNewNormalizesSessionScaling(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+
+	newServer := func(min, max int32) *Server {
+		srv, err := New(Config{
+			RootImage:         "test/root:latest",
+			WorkerImage:       "test/worker:latest",
+			NATSURL:           ns.ClientURL(),
+			SessionMinDllamas: min,
+			SessionMaxDllamas: max,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			if srv.raw != nil {
+				_ = srv.raw.Drain()
+				srv.raw.Close()
+			}
+		})
+		return srv
+	}
+
+	require.Equal(t, int32(0), newServer(-1, 0).cfg.SessionMinDllamas, "negative min clamps to 0")
+	require.Equal(t, int32(2), newServer(2, 1).cfg.SessionMaxDllamas, "max is raised to min")
+	require.Equal(t, int32(0), newServer(0, 0).cfg.SessionMinDllamas, "explicit zero min survives")
+}
+
 func TestNewEstablishesResources(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping JetStream integration test in short mode")
@@ -358,7 +388,7 @@ func TestResponseSubjectPrefix(t *testing.T) {
 	}
 }
 
-func TestEnsureBucketKeepsExistingBucketOnTTLChange(t *testing.T) {
+func TestEnsureBucketUpdatesExistingBucketTTL(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping JetStream integration test in short mode")
 	}
@@ -384,7 +414,8 @@ func TestEnsureBucketKeepsExistingBucketOnTTLChange(t *testing.T) {
 	_, err = kv.Put("conv", []byte("pinned"))
 	require.NoError(t, err)
 
-	// A TTL mismatch must not delete the bucket: pins and cursors live there.
+	// A TTL mismatch must update the existing bucket in place: pins and
+	// cursors live there, so it must not be recreated.
 	cfg.TTL = 2 * time.Minute
 	kv, err = ensureBucket(js, cfg, logrus.NewEntry(logrus.New()))
 	require.NoError(t, err)
@@ -392,11 +423,78 @@ func TestEnsureBucketKeepsExistingBucketOnTTLChange(t *testing.T) {
 
 	status, err = kv.Status()
 	require.NoError(t, err)
-	require.InDelta(t, time.Minute.Seconds(), status.TTL().Seconds(), 1.0)
+	require.InDelta(t, cfg.TTL.Seconds(), status.TTL().Seconds(), 1.0)
 
 	entry, err := kv.Get("conv")
 	require.NoError(t, err)
 	require.Equal(t, []byte("pinned"), entry.Value())
+}
+
+func TestEnsureBucketAddsTTLToExistingBucket(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream integration test in short mode")
+	}
+
+	ns := startIngressJetStream(t)
+	js, _ := connectIngressJetStream(t, ns)
+
+	// The conversation controller may create the bucket without a TTL first.
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "no-ttl"})
+	require.NoError(t, err)
+	status, err := kv.Status()
+	require.NoError(t, err)
+	require.Zero(t, status.TTL())
+
+	kv, err = ensureBucket(js, &nats.KeyValueConfig{Bucket: "no-ttl", TTL: 10 * time.Minute}, logrus.NewEntry(logrus.New()))
+	require.NoError(t, err)
+
+	status, err = kv.Status()
+	require.NoError(t, err)
+	require.InDelta(t, (10 * time.Minute).Seconds(), status.TTL().Seconds(), 1.0)
+}
+
+func TestUpdateBucketTTLErrors(t *testing.T) {
+	infoErr := errors.New("stream info failed")
+	updateErr := errors.New("stream update failed")
+
+	t.Run("stream info failure", func(t *testing.T) {
+		stub := &bucketTTLStub{infoErr: infoErr}
+		require.ErrorIs(t, updateBucketTTL(stub, "bucket", time.Minute), infoErr)
+	})
+
+	t.Run("stream update failure", func(t *testing.T) {
+		stub := &bucketTTLStub{info: &nats.StreamInfo{Config: nats.StreamConfig{Name: "bucket"}}, updateErr: updateErr}
+		require.ErrorIs(t, updateBucketTTL(stub, "bucket", time.Minute), updateErr)
+	})
+
+	t.Run("updates max age", func(t *testing.T) {
+		stub := &bucketTTLStub{info: &nats.StreamInfo{Config: nats.StreamConfig{Name: "bucket"}}}
+		require.NoError(t, updateBucketTTL(stub, "bucket", 2*time.Minute))
+		require.NotNil(t, stub.updated)
+		require.Equal(t, 2*time.Minute, stub.updated.MaxAge)
+	})
+}
+
+type bucketTTLStub struct {
+	info      *nats.StreamInfo
+	infoErr   error
+	updateErr error
+	updated   *nats.StreamConfig
+}
+
+func (s *bucketTTLStub) StreamInfo(string, ...nats.JSOpt) (*nats.StreamInfo, error) {
+	if s.infoErr != nil {
+		return nil, s.infoErr
+	}
+	return s.info, nil
+}
+
+func (s *bucketTTLStub) UpdateStream(cfg *nats.StreamConfig, _ ...nats.JSOpt) (*nats.StreamInfo, error) {
+	s.updated = cfg
+	if s.updateErr != nil {
+		return nil, s.updateErr
+	}
+	return s.info, nil
 }
 
 func TestEnsureRequestStreamCreatesAndUpdates(t *testing.T) {
@@ -1034,7 +1132,7 @@ func TestServerSessionLoadLifecycle(t *testing.T) {
 
 func TestServerScheduleSessionCleanup(t *testing.T) {
 	srv := &Server{
-		cfg: Config{SessionScaleDownIdleSeconds: 1},
+		cfg: Config{ConversationTTL: time.Second},
 	}
 
 	now := time.Now()
@@ -1065,8 +1163,8 @@ func TestServerFinalizeSessionCleanup(t *testing.T) {
 
 		srv := &Server{
 			cfg: Config{
-				TTLPrefix:                   "nats_ttl_",
-				SessionScaleDownIdleSeconds: 1,
+				TTLPrefix:       "nats_ttl_",
+				ConversationTTL: time.Second,
 			},
 			convKV: kv,
 			log:    logrus.New().WithField("component", "ingress-test"),
@@ -1115,8 +1213,8 @@ func TestServerFinalizeSessionCleanup(t *testing.T) {
 
 		srv := &Server{
 			cfg: Config{
-				TTLPrefix:                   "nats_ttl_",
-				SessionScaleDownIdleSeconds: 1,
+				TTLPrefix:       "nats_ttl_",
+				ConversationTTL: time.Second,
 			},
 			convKV: kv,
 			log:    logrus.New().WithField("component", "ingress-test"),
@@ -2732,9 +2830,46 @@ func TestEnsureConversationCreatesNewRecord(t *testing.T) {
 	assert.Equal(t, "model-ns/test-model", record.Model)
 	assert.Equal(t, ":9090", record.DispatcherMetricsListen)
 	assert.Equal(t, int32(2), record.Scaling.ActiveRequests)
-	assert.Equal(t, int32(2), record.Scaling.DesiredDllamas)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	assert.Equal(t, int32(2), *record.Scaling.DesiredDllamas)
 	assert.Equal(t, "conv:abc123", putKey)
 	assert.NotNil(t, putValue)
+}
+
+func TestEnsureConversationIdleWithZeroMinDesiresZero(t *testing.T) {
+	srv := &Server{
+		cfg: Config{
+			Namespace:         "test-ns",
+			RootImage:         "root:v1",
+			WorkerImage:       "worker:v1",
+			NATSURL:           "nats://test:4222",
+			TTLPrefix:         "conv:",
+			OutPrefix:         "out.",
+			SessionMinDllamas: 0,
+			SessionMaxDllamas: 5,
+		},
+		log: logrus.New().WithField("component", "test"),
+		convKV: keyValueStub{
+			getFn: func(key string) (nats.KeyValueEntry, error) {
+				return nil, nats.ErrKeyNotFound
+			},
+			KeyValue: &mockKV{
+				putFn: func(key string, value []byte) (uint64, error) {
+					return 1, nil
+				},
+			},
+		},
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "idle", &registry.Model{
+		Name:      "model",
+		Namespace: "model-ns",
+	}, 0)
+	require.NoError(t, err)
+	require.NotNil(t, record.Scaling.MinDllamas)
+	require.Equal(t, int32(0), *record.Scaling.MinDllamas)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	require.Equal(t, int32(0), *record.Scaling.DesiredDllamas)
 }
 
 func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
@@ -2758,11 +2893,11 @@ func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
 			StateStream:           "old-state",
 		},
 		Scaling: &conversation.SessionScalingConfig{
-			MinDllamas:           0,
+			MinDllamas:           int32Ptr(0),
 			MaxDllamas:           3,
 			ScaleUpBacklog:       5,
 			ScaleDownIdleSeconds: 100,
-			DesiredDllamas:       1,
+			DesiredDllamas:       int32Ptr(1),
 			ActiveRequests:       1,
 		},
 	}
@@ -2821,12 +2956,14 @@ func TestEnsureConversationUpdatesExistingRecordWhenFieldsChange(t *testing.T) {
 	assert.Equal(t, "dispatcher:new", record.DispatcherImage)
 	assert.Equal(t, ":9191", record.DispatcherMetricsListen)
 	assert.Equal(t, "nats://new:4222", record.NATS.URL)
-	assert.Equal(t, int32(2), record.Scaling.MinDllamas)
+	require.NotNil(t, record.Scaling.MinDllamas)
+	assert.Equal(t, int32(2), *record.Scaling.MinDllamas)
 	assert.Equal(t, int32(10), record.Scaling.MaxDllamas)
 	assert.Equal(t, int32(20), record.Scaling.ScaleUpBacklog)
 	assert.Equal(t, int32(600), record.Scaling.ScaleDownIdleSeconds)
 	assert.Equal(t, int32(3), record.Scaling.ActiveRequests)
-	assert.Equal(t, int32(3), record.Scaling.DesiredDllamas)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	assert.Equal(t, int32(3), *record.Scaling.DesiredDllamas)
 
 	// Verify Update was called
 	assert.Equal(t, "conv:hash123", updatedKey)
@@ -4480,4 +4617,173 @@ func TestHandleChatCompletionsAcceptsBoundaryBody(t *testing.T) {
 
 	require.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code, "a body at the limit must pass admission")
 	require.Equal(t, http.StatusBadRequest, w.Code, "the request should fail later on model resolution")
+}
+
+func int32Ptr(value int32) *int32 {
+	return &value
+}
+
+func TestTouchConversationActivity(t *testing.T) {
+	t.Parallel()
+
+	record := &conversation.Record{
+		Hash:        "conv",
+		Namespace:   "ns",
+		Model:       "ns/model",
+		RootImage:   "root:latest",
+		WorkerImage: "worker:latest",
+		Scaling:     &conversation.SessionScalingConfig{ActiveRequests: 1},
+	}
+	data, err := json.Marshal(record)
+	require.NoError(t, err)
+
+	var stored []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 3}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			stored = append([]byte(nil), value...)
+			return 4, nil
+		},
+	}
+	srv := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	completed := time.Unix(1700000999, 0)
+	srv.touchConversationActivity("conv", completed)
+
+	require.NotNil(t, stored)
+	parsed, err := conversation.ParseRecord(stored)
+	require.NoError(t, err)
+	require.Equal(t, completed.Unix(), parsed.LastActivityAt)
+	require.Equal(t, int32(1), parsed.Scaling.ActiveRequests, "activity refresh must not clobber in-flight count")
+
+	(&Server{}).touchConversationActivity("conv", completed) // nil KV is a no-op
+
+	expired := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: keyValueStub{getFn: func(string) (nats.KeyValueEntry, error) { return nil, nats.ErrKeyNotFound }},
+		log:    logrus.New().WithField("component", "test"),
+	}
+	expired.touchConversationActivity("conv", completed) // expired record is only debug-logged
+
+	failing := &Server{
+		cfg:    Config{TTLPrefix: "nats_ttl_"},
+		convKV: keyValueStub{getFn: func(string) (nats.KeyValueEntry, error) { return nil, errors.New("kv down") }},
+		log:    logrus.New().WithField("component", "test"),
+	}
+	failing.touchConversationActivity("conv", completed) // transient errors are warned
+}
+
+func TestEnsureConversationRetriesRevisionConflicts(t *testing.T) {
+	zero := int32(0)
+	old := &conversation.Record{
+		Hash:        "conflict",
+		Session:     "session-conflict",
+		Namespace:   "test-ns",
+		Model:       "ns/model",
+		RootImage:   "root:v1",
+		WorkerImage: "worker:v1",
+		Scaling:     &conversation.SessionScalingConfig{MinDllamas: &zero, DesiredDllamas: &zero},
+		Queue:       &conversation.QueueConfig{},
+	}
+	data, err := old.Marshal()
+	require.NoError(t, err)
+
+	updates := 0
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			return &kvEntryStub{value: data, revision: 1}, nil
+		},
+		updateFn: func(key string, value []byte, revision uint64) (uint64, error) {
+			updates++
+			if updates == 1 {
+				return 0, nats.ErrKeyExists
+			}
+			return revision + 1, nil
+		},
+	}
+	srv := &Server{
+		cfg: Config{
+			Namespace:         "test-ns",
+			RootImage:         "root:v1",
+			WorkerImage:       "worker:v1",
+			NATSURL:           "nats://test:4222",
+			TTLPrefix:         "conv:",
+			OutPrefix:         "out.",
+			SessionMinDllamas: 0,
+			SessionMaxDllamas: 5,
+		},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "conflict", &registry.Model{
+		Name:      "model",
+		Namespace: "ns",
+	}, 1)
+	require.NoError(t, err)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	require.Equal(t, int32(1), *record.Scaling.DesiredDllamas, "desired must not stay 0 after a conflict")
+	require.Equal(t, 2, updates, "revision conflict should be retried")
+}
+
+func TestEnsureConversationRecreatesRecordAfterTTLExpiry(t *testing.T) {
+	old := &conversation.Record{
+		Hash:        "expired",
+		Session:     "session-expired",
+		Namespace:   "test-ns",
+		Model:       "ns/model",
+		RootImage:   "root:v1",
+		WorkerImage: "worker:v1",
+	}
+	data, err := old.Marshal()
+	require.NoError(t, err)
+
+	gets := 0
+	var putValue []byte
+	kv := keyValueStub{
+		getFn: func(key string) (nats.KeyValueEntry, error) {
+			gets++
+			if gets == 1 {
+				return &kvEntryStub{value: data, revision: 1}, nil
+			}
+			return nil, nats.ErrKeyNotFound
+		},
+		KeyValue: &mockKV{
+			putFn: func(key string, value []byte) (uint64, error) {
+				putValue = append([]byte(nil), value...)
+				return 2, nil
+			},
+		},
+	}
+	srv := &Server{
+		cfg: Config{
+			Namespace:         "test-ns",
+			RootImage:         "root:v1",
+			WorkerImage:       "worker:v1",
+			NATSURL:           "nats://test:4222",
+			TTLPrefix:         "conv:",
+			OutPrefix:         "out.",
+			SessionMinDllamas: 0,
+			SessionMaxDllamas: 5,
+		},
+		convKV: kv,
+		log:    logrus.New().WithField("component", "test"),
+	}
+
+	record, err := srv.ensureConversation(context.Background(), "expired", &registry.Model{
+		Name:      "model",
+		Namespace: "ns",
+	}, 1)
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	require.NotNil(t, putValue, "expired record should be recreated")
+	require.GreaterOrEqual(t, gets, 2)
+	require.NotNil(t, record.Scaling.DesiredDllamas)
+	require.Equal(t, int32(1), *record.Scaling.DesiredDllamas)
 }

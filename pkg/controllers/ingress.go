@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	v1 "github.com/gorizond/koldun/pkg/apis/koldun.gorizond.io/v1"
 	"github.com/rancher/wrangler/v3/pkg/apply"
@@ -362,15 +363,33 @@ func validateIngressSpec(spec *v1.IngressSpec) error {
 			return fmt.Errorf("backend.rootMemory.overheadMaxRatio must be > 0")
 		}
 	}
+	ttl := 10 * time.Minute
+	if spec.Backend.ConversationTTL != nil {
+		ttl = spec.Backend.ConversationTTL.Duration
+	}
+	responseTimeout := 2 * time.Minute
+	if spec.Backend.ResponseTimeout != nil {
+		responseTimeout = spec.Backend.ResponseTimeout.Duration
+	}
+	if ttl < 20*time.Second {
+		// Two heartbeat intervals: the async heartbeat drops overlapping ticks,
+		// so the record must survive one skipped refresh.
+		return fmt.Errorf("backend.conversationTTL must be at least 20s (2x the streaming heartbeat interval)")
+	}
+	if ttl <= responseTimeout {
+		return fmt.Errorf("backend.conversationTTL must be greater than backend.responseTimeout")
+	}
 	if scaling := spec.Backend.SessionScaling; scaling != nil {
-		if scaling.MinDllamas < 0 {
-			return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
+		if scaling.MinDllamas != nil {
+			if *scaling.MinDllamas < 0 {
+				return fmt.Errorf("backend.sessionScaling.minDllamas must be >= 0")
+			}
+			if *scaling.MinDllamas > 0 && scaling.MaxDllamas > 0 && scaling.MaxDllamas < *scaling.MinDllamas {
+				return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= minDllamas")
+			}
 		}
 		if scaling.MaxDllamas < 0 {
 			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= 0")
-		}
-		if scaling.MinDllamas > 0 && scaling.MaxDllamas > 0 && scaling.MaxDllamas < scaling.MinDllamas {
-			return fmt.Errorf("backend.sessionScaling.maxDllamas must be >= minDllamas")
 		}
 	}
 	return nil
@@ -432,8 +451,8 @@ func backendArgs(spec *v1.IngressSpec, port int32) []string {
 	}
 	if spec.Backend.SessionScaling != nil {
 		scaling := spec.Backend.SessionScaling
-		if scaling.MinDllamas > 0 {
-			args = append(args, fmt.Sprintf("--backend-session-min-dllamas=%d", scaling.MinDllamas))
+		if scaling.MinDllamas != nil {
+			args = append(args, fmt.Sprintf("--backend-session-min-dllamas=%d", *scaling.MinDllamas))
 		}
 		if scaling.MaxDllamas > 0 {
 			args = append(args, fmt.Sprintf("--backend-session-max-dllamas=%d", scaling.MaxDllamas))

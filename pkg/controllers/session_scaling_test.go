@@ -44,7 +44,7 @@ func TestScalingParamsFromSession(t *testing.T) {
 					MinIdle:    2,
 					MaxWorkers: 5,
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 4,
+						MinDllamas: int32Ptr(4),
 						MaxDllamas: 20,
 					},
 				},
@@ -59,9 +59,9 @@ func TestScalingParamsFromSession(t *testing.T) {
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas:           2,
+						MinDllamas:           int32Ptr(2),
 						MaxDllamas:           15,
-						DesiredDllamas:       5,
+						DesiredDllamas:       int32Ptr(5),
 						ScaleUpBacklog:       100,
 						ScaleDownIdleSeconds: 300,
 					},
@@ -80,7 +80,7 @@ func TestScalingParamsFromSession(t *testing.T) {
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 10,
+						MinDllamas: int32Ptr(10),
 						MaxDllamas: 5,
 					},
 				},
@@ -91,18 +91,46 @@ func TestScalingParamsFromSession(t *testing.T) {
 			},
 		},
 		{
-			name: "zero min corrected to 1",
+			name: "explicit zero min keeps zero",
 			session: &v1.Session{
 				Spec: v1.SessionSpec{
 					Scaling: &v1.SessionScalingSpec{
-						MinDllamas: 0,
+						MinDllamas: int32Ptr(0),
 						MaxDllamas: 10,
 					},
 				},
 			},
 			expected: sessionScalingParams{
-				min: 1, // corrected from 0
+				min: 0,
 				max: 10,
+			},
+		},
+		{
+			name: "scaling without min falls back to legacy MinIdle",
+			session: &v1.Session{
+				Spec: v1.SessionSpec{
+					MinIdle: 3,
+					Scaling: &v1.SessionScalingSpec{
+						MaxDllamas: 10,
+					},
+				},
+			},
+			expected: sessionScalingParams{
+				min: 3,
+				max: 10,
+			},
+		},
+		{
+			name: "negative explicit min clamps to zero",
+			session: &v1.Session{
+				Spec: v1.SessionSpec{
+					Scaling: &v1.SessionScalingSpec{
+						MinDllamas: int32Ptr(-1),
+					},
+				},
+			},
+			expected: sessionScalingParams{
+				min: 0,
 			},
 		},
 		{
@@ -387,34 +415,49 @@ func TestSessionScalingParams_ShouldScaleDown(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "don't scale down when at desired count",
+			name: "scale down to zero with explicit zero min and desired",
 			params: sessionScalingParams{
-				min:           1,
-				desired:       3,
+				min:           0,
+				desired:       0,
 				scaleDownIdle: 5 * time.Minute,
 			},
 			state: sessionPoolState{
-				dllamas:      makeDllamas(3),
-				ready:        makeDllamas(3),
-				idleReady:    makeDllamas(2),
+				dllamas:      makeDllamas(1),
+				ready:        makeDllamas(1),
+				idleReady:    makeDllamas(1),
+				lastActivity: pastActivity,
+			},
+			expected: true,
+		},
+		{
+			name: "don't scale down while desired is above min",
+			params: sessionScalingParams{
+				min:           0,
+				desired:       1,
+				scaleDownIdle: 5 * time.Minute,
+			},
+			state: sessionPoolState{
+				dllamas:      makeDllamas(1),
+				ready:        makeDllamas(1),
+				idleReady:    makeDllamas(1),
 				lastActivity: pastActivity,
 			},
 			expected: false,
 		},
 		{
-			name: "scale down when above desired count",
+			name: "don't scale down with an in-flight request",
 			params: sessionScalingParams{
-				min:           1,
-				desired:       2,
+				min:           0,
 				scaleDownIdle: 5 * time.Minute,
 			},
 			state: sessionPoolState{
-				dllamas:      makeDllamas(3),
-				ready:        makeDllamas(3),
-				idleReady:    makeDllamas(2),
-				lastActivity: pastActivity,
+				dllamas:        makeDllamas(1),
+				ready:          makeDllamas(1),
+				idleReady:      makeDllamas(1),
+				activeRequests: 1,
+				lastActivity:   pastActivity,
 			},
-			expected: true,
+			expected: false,
 		},
 	}
 
@@ -733,4 +776,20 @@ func makeDllamas(count int) []*v1.Dllama {
 		}
 	}
 	return result
+}
+
+func TestScalingParamsFallsBackToLegacyMaxWorkers(t *testing.T) {
+	session := &v1.Session{
+		Spec: v1.SessionSpec{
+			MaxWorkers: 5,
+			Scaling:    &v1.SessionScalingSpec{MinDllamas: int32Ptr(0)},
+		},
+	}
+	params := scalingParamsFromSession(session)
+	if params.max != 5 {
+		t.Fatalf("max = %d, want legacy MaxWorkers=5", params.max)
+	}
+	if params.min != 0 {
+		t.Fatalf("min = %d, want 0", params.min)
+	}
 }

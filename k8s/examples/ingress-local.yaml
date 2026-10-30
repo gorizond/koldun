@@ -30,7 +30,7 @@ spec:
     allowAnonymous: true
 
     # Session lifecycle
-    conversationTTL: 10m
+    conversationTTL: 30m
     responseTimeout: 10m
 
     # Session scaling configuration for Session 4 testing

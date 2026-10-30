@@ -930,12 +930,14 @@ type SessionSpec struct {
 }
 
 // SessionScalingSpec defines desired pool sizing behaviour for a session.
+// MinDllamas and DesiredDllamas are optional so an explicit 0 (scale to zero)
+// is distinguishable from an unset field.
 type SessionScalingSpec struct {
-	MinDllamas           int32 `json:"minDllamas,omitempty"`
-	MaxDllamas           int32 `json:"maxDllamas,omitempty"`
-	ScaleUpBacklog       int32 `json:"scaleUpBacklog,omitempty"`
-	ScaleDownIdleSeconds int32 `json:"scaleDownIdleSeconds,omitempty"`
-	DesiredDllamas       int32 `json:"desiredDllamas,omitempty"`
+	MinDllamas           *int32 `json:"minDllamas,omitempty"`
+	MaxDllamas           int32  `json:"maxDllamas,omitempty"`
+	ScaleUpBacklog       int32  `json:"scaleUpBacklog,omitempty"`
+	ScaleDownIdleSeconds int32  `json:"scaleDownIdleSeconds,omitempty"`
+	DesiredDllamas       *int32 `json:"desiredDllamas,omitempty"`
 }
 
 // SessionQueueSpec configures NATS subjects used for session backlogs.
@@ -1051,6 +1053,14 @@ func (in *SessionScalingSpec) DeepCopy() *SessionScalingSpec {
 	}
 	out := new(SessionScalingSpec)
 	*out = *in
+	if in.MinDllamas != nil {
+		v := *in.MinDllamas
+		out.MinDllamas = &v
+	}
+	if in.DesiredDllamas != nil {
+		v := *in.DesiredDllamas
+		out.DesiredDllamas = &v
+	}
 	return out
 }
 
@@ -1236,11 +1246,13 @@ func (in *IngressRootMemorySpec) DeepCopy() *IngressRootMemorySpec {
 }
 
 // IngressSessionScalingSpec controls auto-scaling behaviour for Session-managed Dllamas.
+// MinDllamas is optional so an explicit 0 (scale to zero) is distinguishable
+// from an unset field.
 type IngressSessionScalingSpec struct {
-	MinDllamas           int32 `json:"minDllamas,omitempty"`
-	MaxDllamas           int32 `json:"maxDllamas,omitempty"`
-	ScaleUpBacklog       int32 `json:"scaleUpBacklog,omitempty"`
-	ScaleDownIdleSeconds int32 `json:"scaleDownIdleSeconds,omitempty"`
+	MinDllamas           *int32 `json:"minDllamas,omitempty"`
+	MaxDllamas           int32  `json:"maxDllamas,omitempty"`
+	ScaleUpBacklog       int32  `json:"scaleUpBacklog,omitempty"`
+	ScaleDownIdleSeconds int32  `json:"scaleDownIdleSeconds,omitempty"`
 }
 
 // IngressNATSConfig configures connectivity with the conversation control plane.
@@ -1368,6 +1380,10 @@ func (in *IngressSessionScalingSpec) DeepCopy() *IngressSessionScalingSpec {
 	}
 	out := new(IngressSessionScalingSpec)
 	*out = *in
+	if in.MinDllamas != nil {
+		v := *in.MinDllamas
+		out.MinDllamas = &v
+	}
 	return out
 }
 
