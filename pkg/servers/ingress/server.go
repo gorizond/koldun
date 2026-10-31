@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -93,6 +94,10 @@ const (
 	errConversationQueueMisconfigured = "conversation queue misconfigured"
 )
 
+// errResponseSubscriptionClosed mirrors the old non-stream behaviour: a closed
+// response subscription is reported as a gateway timeout.
+var errResponseSubscriptionClosed = errors.New("subscription closed")
+
 // Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
 type Config struct {
 	ListenAddress string
@@ -130,6 +135,13 @@ type Config struct {
 	// NATSMaxPayload is the NATS max_payload budget in bytes. Backlog messages
 	// are capped at half of it, leaving headroom for assignment envelopes.
 	NATSMaxPayload int
+
+	// Ingress request coalescing. Zero values select the defaults documented in
+	// dedupe.go (10m TTL, 256 cached entries, 32 MiB, 16 waiters per entry).
+	DedupeTTL        time.Duration
+	DedupeMaxEntries int
+	DedupeMaxBytes   int64
+	DedupeMaxWaiters int
 
 	DisableThinkFilter bool
 
@@ -171,7 +183,15 @@ type Server struct {
 
 	afterResponseSubscribe  func() // test hook invoked after response subscription is created
 	ensureConversationHook  func(context.Context, string, *registry.Model, int32) (*conversation.Record, error)
-	streamHeartbeatInterval time.Duration // test hook; defaults to 10s
+	dedupeKeyHook           func(string, []byte) (string, error) // test hook for digest failures
+	streamHeartbeatInterval time.Duration                        // test hook; defaults to 10s
+
+	// dedupeState lazily builds the in-memory coalescing coordinator so a
+	// zero-value Server behaves like a configured one.
+	dedupeState struct {
+		once  sync.Once
+		coord *dedupeCoordinator
+	}
 }
 
 type tokenEntry struct {
@@ -737,22 +757,71 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Coalesce identical retries before touching session load: cache hits and
+	// attaches must not create a second backlog request or bump the scaler.
+	keyForRequest := requestDedupeKey
+	if hook := s.dedupeKeyHook; hook != nil {
+		keyForRequest = hook
+	}
+	dedupeKey, err := keyForRequest(hash, canonical)
+	if err != nil {
+		s.log.WithError(err).Warn("derive request dedupe key")
+		writeError(w, http.StatusBadRequest, "invalid chat completion payload")
+		return
+	}
+	handle := s.dedupeBegin(dedupeKey, req.Stream)
+	s.observeDedupe(handle, req.Stream)
+
+	switch handle.Kind() {
+	case dedupeRejected:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "request coalescing capacity exhausted; retry shortly")
+		return
+	case dedupeCacheHit, dedupeAttach:
+		// Neither path publishes to the backlog, so the llm sidecar never runs
+		// classify/rememberChat for it: no cold_start, no instance_change and no
+		// history replay. The owner's pump keeps conversation activity fresh.
+		s.serveDedupe(reqCtx, w, handle)
+		return
+	}
+
+	// The owner is the only caller allowed to enqueue. If it returns before the
+	// detached pump takes over, fail the entry so attached waiters (and the
+	// terminal callback) are not stranded.
+	ownerHandedOff := false
+	defer func() {
+		if !ownerHandedOff {
+			handle.Fail(errDedupeOwnerAborted)
+		}
+	}()
+
 	load := s.incrementSessionLoad(hash)
 
 	record, err := s.ensureConversation(authCtx, hash, model, load)
 	if err != nil {
 		s.decrementSessionLoad(hash)
+		handle.Fail(err)
 		s.log.WithError(err).Error("ensure conversation record")
 		writeError(w, http.StatusInternalServerError, "failed to prepare conversation")
 		return
 	}
 
-	defer func() {
+	// Session load and the post-completion record update belong to the request,
+	// not to this HTTP handler: the pump may outlive a disconnected client.
+	handle.SetOnTerminal(func() {
+		s.touchConversationActivity(hash, time.Now())
 		remaining := s.decrementSessionLoad(hash)
-		if _, err := s.ensureConversation(context.Background(), hash, model, remaining); err != nil {
+
+		timeout := s.cfg.ResponseTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Minute
+		}
+		updateCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if _, err := s.ensureConversation(updateCtx, hash, model, remaining); err != nil {
 			s.log.WithError(err).Warn("update conversation record after completion")
 		}
-	}()
+	})
 
 	s.refreshConversationTTL(hash)
 
@@ -776,15 +845,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	responseSubject := responsePrefix + newRequestID()
 
-	respCtx := reqCtx
-	var respCancel context.CancelFunc
-	if req.Stream {
-		respCtx, respCancel = context.WithCancel(reqCtx)
-	} else {
-		respCtx, respCancel = context.WithTimeout(reqCtx, s.cfg.ResponseTimeout)
-	}
-	defer respCancel()
-
 	dllamaPrefix := strings.TrimSpace(queue.DllamaSubjectPrefix)
 	if dllamaPrefix == "" {
 		dllamaPrefix = dllamaSubjectPrefix(hash)
@@ -805,9 +865,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to subscribe to conversation stream")
 		return
 	}
+	// The pump takes ownership of the subscription and channel once it starts.
+	subHandedOff := false
 	defer func() {
-		_ = sub.Unsubscribe()
-		close(msgs)
+		if !subHandedOff {
+			_ = sub.Unsubscribe()
+			close(msgs)
+		}
 	}()
 
 	if hook := s.afterResponseSubscribe; hook != nil {
@@ -880,35 +944,67 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.touchConversationRecord(hash, messageCount, prefixHash, time.Now())
-	// Stamp completion as well as start: a long generation must not look idle
-	// to the session scaler, and the record TTL must be refreshed on finish.
-	defer func() {
-		s.touchConversationActivity(hash, time.Now())
-	}()
 
-	if req.Stream {
-		s.streamResponse(respCtx, w, msgs, func() {
-			s.touchConversationActivity(hash, time.Now())
-		})
-		return
+	// The pump deadline starts here, when the ingress admits the request, but
+	// the sidecar only starts its own dispatch clock after the backlog message
+	// is consumed. There is deliberately no extra grace: ResponseTimeout is the
+	// end-to-end budget and the sidecar timeout mirrors it.
+	pumpTimeout := s.cfg.ResponseTimeout
+	if pumpTimeout <= 0 {
+		pumpTimeout = 2 * time.Minute
+	}
+	pumpCtx, pumpCancel := context.WithTimeout(context.Background(), pumpTimeout)
+
+	// Detach inference from this HTTP handler: streaming and non-streaming
+	// requests both keep running when every client disconnects, bounded by the
+	// pump deadline and the buffer budget.
+	go s.pumpResponse(pumpCtx, pumpCancel, handle, hash, msgs, sub)
+
+	subHandedOff = true
+	ownerHandedOff = true
+
+	s.serveDedupe(reqCtx, w, handle)
+}
+
+// observeDedupe records the coalescing outcome and logs the entry shape. It
+// never logs request bodies.
+func (s *Server) observeDedupe(handle *dedupeHandle, stream bool) {
+	result := handle.Kind().String()
+	metrics.IngressDedupTotal.WithLabelValues(result).Inc()
+	// The histogram describes fan-out pressure: only attaches add a waiter to
+	// an existing entry.
+	if handle.Kind() == dedupeAttach {
+		metrics.IngressDedupWaiters.Observe(float64(handle.Waiters()))
 	}
 
-	msg, err := waitForMessage(respCtx, msgs)
-	if err != nil {
-		writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
+	if s.log == nil {
 		return
 	}
+	s.log.WithFields(logrus.Fields{
+		"result":       result,
+		"key_prefix":   handle.KeyPrefix(),
+		"stream":       stream,
+		"age":          handle.EntryAge().String(),
+		"buffer_bytes": handle.BufferBytes(),
+		"waiters":      handle.Waiters(),
+	}).Debug("ingress dedupe")
+}
 
-	if status := errorResponseStatus(msg.Data); status != 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		_, _ = w.Write(msg.Data)
+// serveDedupe serves a cache hit, attach, or the owner's own entry. The
+// non-stream path keeps the historical response timeout; streaming is bounded
+// by the client connection and the detached pump deadline.
+func (s *Server) serveDedupe(ctx context.Context, w http.ResponseWriter, handle *dedupeHandle) {
+	if handle.dedupeStream() {
+		s.serveStream(ctx, w, handle)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(msg.Data)
+	timeout := s.cfg.ResponseTimeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+	jsonCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	s.serveJSON(jsonCtx, w, handle)
 }
 
 // errorResponseStatus maps structured error payloads to HTTP statuses so
@@ -1512,7 +1608,12 @@ func (s *Server) refreshConversationTTL(hash string) {
 	}
 }
 
-func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs <-chan *nats.Msg, heartbeat func()) {
+// serveStream writes the replay snapshot and then follows live chunks until
+// the entry terminates. Termination is read from the entry's done channel, so
+// it is delivered even when this waiter's 64-slot chunk buffer is full.
+func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle *dedupeHandle) {
+	defer handle.Close()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
@@ -1547,37 +1648,219 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 		writeChunk(string(payload))
 	}
 
-	state := streamingNormaliserState{disableThink: s.cfg.DisableThinkFilter}
-	interval := s.streamHeartbeatInterval
-	if interval <= 0 {
-		interval = 10 * time.Second
+	// Replay the prefix captured when this waiter joined. The live pump only
+	// starts writing after the snapshot, so the order is gap-free.
+	for _, payload := range handle.Snapshot() {
+		writeChunk(payload)
 	}
-	keepalive := time.NewTicker(interval)
+	if handle.Kind() == dedupeCacheHit {
+		writeChunk("[DONE]")
+		return
+	}
+
+	events := handle.Events()
+	done := handle.Done()
+	dropped := handle.Dropped()
+	keepalive := time.NewTicker(s.streamHeartbeat())
 	defer keepalive.Stop()
 
-	// Run the TTL heartbeat off the SSE write path: KV calls (with retries)
-	// must not delay chunks. Ticks are dropped while a heartbeat is in flight.
-	var heartbeatCh chan struct{}
-	if heartbeat != nil {
-		heartbeatCh = make(chan struct{}, 1)
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-heartbeatCh:
-					heartbeat()
-				}
+	for {
+		select {
+		case <-ctx.Done():
+			errorChunk(ctx.Err().Error())
+			writeChunk("[DONE]")
+			return
+		case <-done:
+			drainStreamChunks(events, writeChunk)
+			if err := handle.TerminalError(); err != nil {
+				errorChunk(err.Error())
 			}
-		}()
+			writeChunk("[DONE]")
+			return
+		case <-dropped:
+			// Never end a 200 SSE response silently: tell the client why.
+			errorChunk("client too slow to consume the stream")
+			writeChunk("[DONE]")
+			return
+		case payload := <-events:
+			writeChunk(payload)
+		case <-keepalive.C:
+			_, _ = fmt.Fprint(w, ": \n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// drainStreamChunks flushes chunks that were queued before the entry became
+// terminal. After done closes no further publishes can occur.
+func drainStreamChunks(events <-chan string, write func(string)) {
+	for {
+		select {
+		case payload, ok := <-events:
+			if !ok {
+				return
+			}
+			write(payload)
+		default:
+			return
+		}
+	}
+}
+
+// serveJSON waits for the single non-stream body and writes it with the same
+// status mapping the ingress used before coalescing.
+func (s *Server) serveJSON(ctx context.Context, w http.ResponseWriter, handle *dedupeHandle) {
+	defer handle.Close()
+
+	if handle.Kind() == dedupeCacheHit {
+		snapshot := handle.Snapshot()
+		if len(snapshot) == 0 {
+			writeError(w, http.StatusBadGateway, "failed to receive response")
+			return
+		}
+		writeJSONPayload(w, []byte(snapshot[len(snapshot)-1]))
+		return
+	}
+
+	events := handle.Events()
+	done := handle.Done()
+	dropped := handle.Dropped()
+
+	var body string
+	if snapshot := handle.Snapshot(); len(snapshot) > 0 {
+		body = snapshot[len(snapshot)-1]
 	}
 
 	for {
 		select {
-		case msg := <-msgs:
-			if msg == nil {
-				errorChunk("subscription closed")
-				writeChunk("[DONE]")
+		case <-ctx.Done():
+			writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
+			return
+		case <-done:
+			drainJSONBody(events, &body)
+			if err := handle.TerminalError(); err != nil {
+				// Preserve the historical non-stream status for a closed
+				// subscription or a pump deadline.
+				if errors.Is(err, context.DeadlineExceeded) ||
+					errors.Is(err, context.Canceled) ||
+					errors.Is(err, errResponseSubscriptionClosed) {
+					writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
+					return
+				}
+				writeError(w, http.StatusBadGateway, "failed to receive response")
+				return
+			}
+			if body == "" {
+				writeError(w, http.StatusBadGateway, "failed to receive response")
+				return
+			}
+			writeJSONPayload(w, []byte(body))
+			return
+		case <-dropped:
+			writeError(w, http.StatusBadGateway, "failed to receive response")
+			return
+		case payload := <-events:
+			body = payload
+		}
+	}
+}
+
+func drainJSONBody(events <-chan string, body *string) {
+	for {
+		select {
+		case payload, ok := <-events:
+			if !ok {
+				return
+			}
+			*body = payload
+		default:
+			return
+		}
+	}
+}
+
+func writeJSONPayload(w http.ResponseWriter, body []byte) {
+	if status := errorResponseStatus(body); status != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// pumpResponse owns the NATS response subscription for one ingress entry. It
+// is detached from the HTTP handler so a client disconnect never cancels the
+// upstream generation: the pump keeps feeding waiters and the short cache.
+func (s *Server) pumpResponse(ctx context.Context, cancel context.CancelFunc, handle *dedupeHandle, hash string, msgs chan *nats.Msg, sub *nats.Subscription) {
+	defer s.finishPump(handle, sub, msgs, cancel)
+
+	if handle.dedupeStream() {
+		s.pumpStream(ctx, handle, hash, msgs)
+		return
+	}
+	s.pumpJSON(ctx, handle, hash, msgs)
+}
+
+// finishPump releases the subscription and channel even when the pump panics.
+// A panic fails the entry so attached waiters receive an explicit terminal
+// frame instead of hanging.
+func (s *Server) finishPump(handle *dedupeHandle, sub *nats.Subscription, msgs chan *nats.Msg, cancel context.CancelFunc) {
+	if recovered := recover(); recovered != nil {
+		if s.log != nil {
+			s.log.WithField("panic", recovered).Error("response pump panic")
+		}
+		handle.Fail(fmt.Errorf("response pump panic: %v", recovered))
+	}
+	if sub != nil {
+		_ = sub.Unsubscribe()
+	}
+	close(msgs)
+	cancel()
+}
+
+// startActivityHeartbeat refreshes conversation activity off the chunk path.
+// Ticks are dropped while a KV update is already in flight.
+func (s *Server) startActivityHeartbeat(ctx context.Context, hash string) chan<- struct{} {
+	ticks := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticks:
+				s.touchConversationActivity(hash, time.Now())
+			}
+		}
+	}()
+	return ticks
+}
+
+// pumpStream normalises each upstream chunk exactly once and republishes the
+// result to every waiter. Terminal detection: [DONE], a structured error
+// payload, a closed subscription, or the pump deadline. Error payloads are
+// never cached, so a retry re-enqueues instead of replaying a sticky failure.
+func (s *Server) pumpStream(ctx context.Context, handle *dedupeHandle, hash string, msgs <-chan *nats.Msg) {
+	state := streamingNormaliserState{disableThink: s.cfg.DisableThinkFilter}
+	heartbeatTicks := s.startActivityHeartbeat(ctx, hash)
+	ticker := time.NewTicker(s.streamHeartbeat())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			handle.Fail(ctx.Err())
+			return
+		case <-ticker.C:
+			select {
+			case heartbeatTicks <- struct{}{}:
+			default:
+			}
+		case msg, ok := <-msgs:
+			if !ok || msg == nil {
+				handle.Fail(errResponseSubscriptionClosed)
 				return
 			}
 			line := strings.TrimSpace(string(msg.Data))
@@ -1585,47 +1868,73 @@ func (s *Server) streamResponse(ctx context.Context, w http.ResponseWriter, msgs
 				continue
 			}
 			if strings.EqualFold(line, "[DONE]") {
-				writeChunk("[DONE]")
+				handle.Complete()
 				return
 			}
 
 			normalised, err := normaliseStreamingChunk(line, &state)
 			if err != nil {
-				s.log.WithError(err).Debug("normalise chunk")
-				writeChunk(line)
-				continue
+				// Preserve raw tokens rather than dropping them on a
+				// normalisation hiccup.
+				if s.log != nil {
+					s.log.WithError(err).Debug("normalise chunk")
+				}
+				normalised = line
 			}
 			if isEmptyDeltaChunk(normalised) {
 				continue
 			}
-			writeChunk(normalised)
-		case <-ctx.Done():
-			errorChunk(ctx.Err().Error())
-			writeChunk("[DONE]")
-			return
-		case <-keepalive.C:
-			if heartbeatCh != nil {
-				select {
-				case heartbeatCh <- struct{}{}:
-				default:
-				}
+			handle.Publish(normalised)
+			if hasErrorField([]byte(normalised)) {
+				handle.CompleteUncached()
+				return
 			}
-			_, _ = fmt.Fprint(w, ": \n\n")
-			flusher.Flush()
 		}
 	}
 }
 
-func waitForMessage(ctx context.Context, msgs <-chan *nats.Msg) (*nats.Msg, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case msg := <-msgs:
-		if msg == nil {
-			return nil, errors.New("subscription closed")
+// pumpJSON waits for the single non-stream body. The heartbeat keeps the
+// conversation record alive for slow generations.
+func (s *Server) pumpJSON(ctx context.Context, handle *dedupeHandle, hash string, msgs <-chan *nats.Msg) {
+	heartbeatTicks := s.startActivityHeartbeat(ctx, hash)
+	ticker := time.NewTicker(s.streamHeartbeat())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			handle.Fail(ctx.Err())
+			return
+		case <-ticker.C:
+			select {
+			case heartbeatTicks <- struct{}{}:
+			default:
+			}
+		case msg, ok := <-msgs:
+			if !ok || msg == nil {
+				handle.Fail(errResponseSubscriptionClosed)
+				return
+			}
+			line := strings.TrimSpace(string(msg.Data))
+			if line == "" {
+				continue
+			}
+			handle.Publish(line)
+			if hasErrorField([]byte(line)) {
+				handle.CompleteUncached()
+				return
+			}
+			handle.Complete()
+			return
 		}
-		return msg, nil
 	}
+}
+
+func (s *Server) streamHeartbeat() time.Duration {
+	if s.streamHeartbeatInterval > 0 {
+		return s.streamHeartbeatInterval
+	}
+	return 10 * time.Second
 }
 
 func (s *Server) waitForIdleWorker(ctx context.Context, prefix string) error {
@@ -2115,6 +2424,11 @@ func isEmptyDeltaChunk(payload string) bool {
 
 // hasErrorField reports whether the JSON object carries a non-empty error.
 func hasErrorField(raw []byte) bool {
+	// Most chunks have no error field at all; skip the JSON decode entirely
+	// instead of paying it in normalise, empty-delta and terminal checks.
+	if !bytes.Contains(raw, []byte(`"error"`)) {
+		return false
+	}
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
 	}

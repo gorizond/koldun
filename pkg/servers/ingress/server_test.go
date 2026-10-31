@@ -3874,6 +3874,19 @@ func TestLoadTokenCacheLoadsFromKV(t *testing.T) {
 	assert.False(t, cache["abc123"].disabled)
 }
 
+// waitForMessage is a test-only helper retained from the pre-dedupe handler.
+func waitForMessage(ctx context.Context, msgs <-chan *nats.Msg) (*nats.Msg, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case msg := <-msgs:
+		if msg == nil {
+			return nil, errors.New("subscription closed")
+		}
+		return msg, nil
+	}
+}
+
 func TestWaitForMessageContextCancellation(t *testing.T) {
 	t.Parallel()
 

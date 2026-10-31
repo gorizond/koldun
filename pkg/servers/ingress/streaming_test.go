@@ -210,117 +210,6 @@ func TestEventTimestamp(t *testing.T) {
 	require.Equal(t, time.Unix(past, 0), eventTimestamp(past))
 }
 
-func TestStreamResponseRequiresFlusher(t *testing.T) {
-	t.Parallel()
-
-	srv := &Server{}
-	writer := &noFlushWriter{}
-	srv.streamResponse(context.Background(), writer, make(chan *nats.Msg), nil)
-
-	require.Equal(t, http.StatusInternalServerError, writer.status)
-	require.Contains(t, writer.body.String(), `"streaming not supported"`)
-}
-
-func TestStreamResponseHappyPath(t *testing.T) {
-	t.Parallel()
-
-	srv := &Server{log: logrus.New().WithField("component", "test")}
-	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg, 2)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
-	}()
-
-	msgs <- &nats.Msg{Data: []byte(`{"choices":[{"delta":{"role":"assistant","content":"hello"}}]}`)}
-	msgs <- &nats.Msg{Data: []byte("[DONE]")}
-
-	wg.Wait()
-
-	body := rec.Body.String()
-	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
-	require.Len(t, chunks, 2)
-
-	first := strings.TrimPrefix(chunks[0], "data: ")
-	var chunk streamingChunk
-	require.NoError(t, json.Unmarshal([]byte(first), &chunk))
-	require.Equal(t, "chat.completion.chunk", chunk.Object)
-	require.Len(t, chunk.Choices, 1)
-	require.Nil(t, chunk.Choices[0].FinishReason)
-	require.Equal(t, "assistant", chunk.Choices[0].Delta.Role)
-	require.Equal(t, "hello", chunk.Choices[0].Delta.Content)
-
-	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
-	require.Greater(t, rec.flushes, 0)
-	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
-	require.Equal(t, http.StatusOK, rec.Code)
-}
-
-func TestStreamResponseContextCancelled(t *testing.T) {
-	t.Parallel()
-
-	srv := &Server{log: logrus.New().WithField("component", "test")}
-	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
-	}()
-
-	time.AfterFunc(5*time.Millisecond, cancel)
-	wg.Wait()
-
-	body := rec.Body.String()
-	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
-	require.Len(t, chunks, 2)
-
-	errorChunk := strings.TrimPrefix(chunks[0], "data: ")
-	require.Contains(t, errorChunk, `"error":{"message":"context canceled"}`)
-	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
-}
-
-// TestStreamResponseSubscriptionClosed ensures SSE emits an error chunk when the
-// response subscription closes before any payloads are streamed (e.g. backlog
-// publish failure or dispatcher drop).
-func TestStreamResponseSubscriptionClosed(t *testing.T) {
-	t.Parallel()
-
-	srv := &Server{log: logrus.New().WithField("component", "test")}
-	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
-	}()
-
-	close(msgs)
-	wg.Wait()
-
-	body := rec.Body.String()
-	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
-	require.Len(t, chunks, 2)
-
-	errorChunk := strings.TrimPrefix(chunks[0], "data: ")
-	require.Contains(t, errorChunk, `"subscription closed"`)
-	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
-}
-
 func TestConsumeStateEvent(t *testing.T) {
 	t.Parallel()
 
@@ -513,36 +402,124 @@ func TestNormaliseStreamingChunkScrubsExpandingRunes(t *testing.T) {
 	require.Contains(t, normalised, "answer")
 }
 
-func TestStreamResponseHeartbeat(t *testing.T) {
-	srv := &Server{
-		log:                     logrus.New().WithField("component", "test"),
-		streamHeartbeatInterval: 5 * time.Millisecond,
-	}
+func TestServeStreamRequiresFlusher(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("requires-flusher", true)
+	writer := &noFlushWriter{}
+	srv.serveStream(context.Background(), writer, handle)
+
+	require.Equal(t, http.StatusInternalServerError, writer.status)
+	require.Contains(t, writer.body.String(), `"streaming not supported"`)
+}
+
+func TestServeStreamHappyPath(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("happy-path", true)
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	heartbeats := make(chan struct{}, 1)
+	defer cancel()
 
+	payload := `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		handle.Publish(payload)
+		handle.Complete()
+	}()
+
+	srv.serveStream(ctx, rec, handle)
+
+	body := rec.Body.String()
+	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
+	require.Len(t, chunks, 2)
+
+	first := strings.TrimPrefix(chunks[0], "data: ")
+	require.JSONEq(t, payload, first)
+
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
+	require.Greater(t, rec.flushes, 0)
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestServeStreamContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("context-cancelled", true)
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, func() {
-			select {
-			case heartbeats <- struct{}{}:
-			default:
-			}
-		})
+		srv.serveStream(ctx, rec, handle)
 	}()
 
-	select {
-	case <-heartbeats:
-		cancel()
-	case <-time.After(time.Second):
-		cancel()
-		wg.Wait()
-		t.Fatal("stream heartbeat was not invoked")
-	}
+	time.AfterFunc(5*time.Millisecond, cancel)
 	wg.Wait()
+
+	body := rec.Body.String()
+	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
+	require.Len(t, chunks, 2)
+
+	errorChunk := strings.TrimPrefix(chunks[0], "data: ")
+	require.Contains(t, errorChunk, `"error":{"message":"context canceled"}`)
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
+}
+
+// TestPumpSubscriptionClosed ensures the SSE client sees an error chunk when
+// the upstream subscription closes before any payloads are streamed.
+func TestPumpSubscriptionClosed(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("subscription-closed", true)
+	msgs := make(chan *nats.Msg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pumpCtx, pumpCancel := context.WithCancel(ctx)
+	go srv.pumpResponse(pumpCtx, pumpCancel, handle, "hash", msgs, nil)
+	msgs <- nil
+
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	srv.serveStream(ctx, rec, handle)
+
+	body := rec.Body.String()
+	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
+	require.Len(t, chunks, 2)
+
+	errorChunk := strings.TrimPrefix(chunks[0], "data: ")
+	require.Contains(t, errorChunk, `"subscription closed"`)
+	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
+}
+
+func TestServeStreamHeartbeat(t *testing.T) {
+	srv := &Server{
+		log:                     logrus.New().WithField("component", "test"),
+		streamHeartbeatInterval: 5 * time.Millisecond,
+	}
+	handle := srv.dedupeBegin("heartbeat", true)
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.serveStream(ctx, rec, handle)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	require.Contains(t, rec.Body.String(), ": \n\n")
+	require.Greater(t, rec.flushes, 0)
 }

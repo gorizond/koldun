@@ -444,8 +444,11 @@ func (h *dllamaHandler) getIngressNThreads(dllama *v1.Dllama) int32 {
 }
 
 // minimumSidecarTimeout preserves the historical sidecar default. Ingresses
-// with a shorter responseTimeout (or streams, which have no backend timeout)
-// must not cause generations to be cut off sooner than before.
+// with a shorter responseTimeout must not cause generations to be cut off
+// sooner than before. Streaming responses are bounded by the ingress deadline
+// as well, but that deadline starts when the ingress admits the request, while
+// the sidecar starts its own clock only after dispatch; keeping the historical
+// default here avoids cutting the model off earlier than the frontend.
 const minimumSidecarTimeout = 2 * time.Minute
 
 // getIngressSidecarTimeout mirrors Ingress backend.responseTimeout so the llm

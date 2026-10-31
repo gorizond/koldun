@@ -1,6 +1,6 @@
 {
-  "total": 87.0,
-  "updated_at": "2026-10-30T19:39:58Z",
-  "commit": "6d5bf9489871a05bddb39f528b45eedc26ff9b73",
-  "source": "6d5bf94 \u2014 fix: drive idle scale-down from the conversation record"
+  "total": 89.1,
+  "updated_at": "2026-10-31T02:13:12Z",
+  "commit": "30431f9faa1e364143d0557a33a48227edf17ff9",
+  "source": "30431f9 \u2014 test(ingress): cover dedupe response paths and apply review nits"
 }
