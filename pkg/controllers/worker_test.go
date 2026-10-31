@@ -1290,9 +1290,10 @@ func TestWorkerContainer(t *testing.T) {
 				require.Equal(t, corev1.PullIfNotPresent, container.ImagePullPolicy)
 				require.Equal(t, []string{"dllama"}, container.Command)
 				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "4"}, container.Args)
-				require.Len(t, container.Env, 2)
+				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "worker", container.Env[0].Value)
+				require.Equal(t, "64", envVarValue(container.Env, "DLLAMA_N_BATCHES").Value)
 				require.Len(t, container.Ports, 1)
 				require.Equal(t, int32(9999), container.Ports[0].ContainerPort)
 				require.Empty(t, container.Resources.Requests)
@@ -1327,13 +1328,13 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   8,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 4)
+				require.Len(t, container.Env, 5)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "worker", container.Env[0].Value)
-				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
-				require.Equal(t, "https://minio:9000", container.Env[1].Value)
-				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
-				require.Equal(t, "models", container.Env[2].Value)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[2].Name)
+				require.Equal(t, "https://minio:9000", container.Env[2].Value)
+				require.Equal(t, "CACHE_BUCKET", container.Env[3].Name)
+				require.Equal(t, "models", container.Env[3].Value)
 			},
 		},
 		{
@@ -1353,19 +1354,19 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   1,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 5)
-				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
-				require.Equal(t, "https://s3.amazonaws.com", container.Env[1].Value)
-				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
-				require.Equal(t, "my-bucket", container.Env[2].Value)
-				require.Equal(t, "CACHE_SECRET", container.Env[3].Name)
-				require.Empty(t, container.Env[3].Value)
-				require.NotNil(t, container.Env[3].ValueFrom)
-				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef)
-				require.Equal(t, "s3-credentials", container.Env[3].ValueFrom.SecretKeyRef.Name)
-				require.Equal(t, "credentials", container.Env[3].ValueFrom.SecretKeyRef.Key)
-				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef.Optional)
-				require.True(t, *container.Env[3].ValueFrom.SecretKeyRef.Optional)
+				require.Len(t, container.Env, 6)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[2].Name)
+				require.Equal(t, "https://s3.amazonaws.com", container.Env[2].Value)
+				require.Equal(t, "CACHE_BUCKET", container.Env[3].Name)
+				require.Equal(t, "my-bucket", container.Env[3].Value)
+				require.Equal(t, "CACHE_SECRET", container.Env[4].Name)
+				require.Empty(t, container.Env[4].Value)
+				require.NotNil(t, container.Env[4].ValueFrom)
+				require.NotNil(t, container.Env[4].ValueFrom.SecretKeyRef)
+				require.Equal(t, "s3-credentials", container.Env[4].ValueFrom.SecretKeyRef.Name)
+				require.Equal(t, "credentials", container.Env[4].ValueFrom.SecretKeyRef.Key)
+				require.NotNil(t, container.Env[4].ValueFrom.SecretKeyRef.Optional)
+				require.True(t, *container.Env[4].ValueFrom.SecretKeyRef.Optional)
 			},
 		},
 		{
@@ -1381,10 +1382,10 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   16,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 3)
+				require.Len(t, container.Env, 4)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
-				require.Equal(t, "NATS_URL", container.Env[1].Name)
-				require.Equal(t, "nats://nats.example.com:4222", container.Env[1].Value)
+				require.Equal(t, "NATS_URL", container.Env[2].Name)
+				require.Equal(t, "nats://nats.example.com:4222", container.Env[2].Value)
 			},
 		},
 		{
@@ -1403,17 +1404,17 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   3,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 4)
-				require.Equal(t, "NATS_URL", container.Env[1].Name)
-				require.Equal(t, "nats://secured.example.com:4222", container.Env[1].Value)
-				require.Equal(t, "NATS_CREDS", container.Env[2].Name)
-				require.Empty(t, container.Env[2].Value)
-				require.NotNil(t, container.Env[2].ValueFrom)
-				require.NotNil(t, container.Env[2].ValueFrom.SecretKeyRef)
-				require.Equal(t, "nats-creds-secret", container.Env[2].ValueFrom.SecretKeyRef.Name)
-				require.Equal(t, "nats.creds", container.Env[2].ValueFrom.SecretKeyRef.Key)
-				require.NotNil(t, container.Env[2].ValueFrom.SecretKeyRef.Optional)
-				require.True(t, *container.Env[2].ValueFrom.SecretKeyRef.Optional)
+				require.Len(t, container.Env, 5)
+				require.Equal(t, "NATS_URL", container.Env[2].Name)
+				require.Equal(t, "nats://secured.example.com:4222", container.Env[2].Value)
+				require.Equal(t, "NATS_CREDS", container.Env[3].Name)
+				require.Empty(t, container.Env[3].Value)
+				require.NotNil(t, container.Env[3].ValueFrom)
+				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef)
+				require.Equal(t, "nats-creds-secret", container.Env[3].ValueFrom.SecretKeyRef.Name)
+				require.Equal(t, "nats.creds", container.Env[3].ValueFrom.SecretKeyRef.Key)
+				require.NotNil(t, container.Env[3].ValueFrom.SecretKeyRef.Optional)
+				require.True(t, *container.Env[3].ValueFrom.SecretKeyRef.Optional)
 			},
 		},
 		{
@@ -1441,13 +1442,13 @@ func TestWorkerContainer(t *testing.T) {
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
 				require.Equal(t, []string{"worker", "--port", "9999", "--nthreads", "6", "--debug"}, container.Args)
-				require.Len(t, container.Env, 7)
+				require.Len(t, container.Env, 8)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
-				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
-				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
-				require.Equal(t, "CACHE_SECRET", container.Env[3].Name)
-				require.Equal(t, "NATS_URL", container.Env[4].Name)
-				require.Equal(t, "NATS_CREDS", container.Env[5].Name)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[2].Name)
+				require.Equal(t, "CACHE_BUCKET", container.Env[3].Name)
+				require.Equal(t, "CACHE_SECRET", container.Env[4].Name)
+				require.Equal(t, "NATS_URL", container.Env[5].Name)
+				require.Equal(t, "NATS_CREDS", container.Env[6].Name)
 			},
 		},
 		{
@@ -1532,7 +1533,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 2)
+				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 			},
 		},
@@ -1547,7 +1548,7 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 2)
+				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 			},
 		},
@@ -1566,9 +1567,9 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 4)
-				require.Equal(t, "CACHE_ENDPOINT", container.Env[1].Name)
-				require.Equal(t, "CACHE_BUCKET", container.Env[2].Name)
+				require.Len(t, container.Env, 5)
+				require.Equal(t, "CACHE_ENDPOINT", container.Env[2].Name)
+				require.Equal(t, "CACHE_BUCKET", container.Env[3].Name)
 			},
 		},
 		{
@@ -1585,9 +1586,9 @@ func TestWorkerContainer(t *testing.T) {
 			threads:   4,
 			resources: corev1.ResourceRequirements{},
 			validate: func(t *testing.T, container corev1.Container) {
-				require.Len(t, container.Env, 3)
+				require.Len(t, container.Env, 4)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
-				require.Equal(t, "NATS_URL", container.Env[1].Name)
+				require.Equal(t, "NATS_URL", container.Env[2].Name)
 			},
 		},
 		{

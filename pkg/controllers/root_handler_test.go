@@ -664,6 +664,7 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Equal(t, "root", rootContainer.Name)
 	require.Equal(t, "koldun-controller", sts.Spec.Template.Spec.ServiceAccountName)
 	require.Equal(t, "1200", envVarValue(rootContainer.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
+	require.Equal(t, "64", envVarValue(rootContainer.Env, "DLLAMA_N_BATCHES").Value)
 	require.Contains(t, rootContainer.Args, "--workers")
 	require.Contains(t, rootContainer.Args, "mistral-workers-0.mistral-workers.models.svc.cluster.local:9999")
 	require.Equal(t, "llm", sts.Spec.Template.Spec.Containers[1].Name)
