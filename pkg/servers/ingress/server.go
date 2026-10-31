@@ -93,6 +93,10 @@ const (
 	errConversationQueueMisconfigured = "conversation queue misconfigured"
 )
 
+// errResponseSubscriptionClosed mirrors the old non-stream behaviour: a closed
+// response subscription is reported as a gateway timeout.
+var errResponseSubscriptionClosed = errors.New("subscription closed")
+
 // Config drives the behaviour of the ingress worker that bridges HTTP chat requests to NATS.
 type Config struct {
 	ListenAddress string
@@ -178,7 +182,8 @@ type Server struct {
 
 	afterResponseSubscribe  func() // test hook invoked after response subscription is created
 	ensureConversationHook  func(context.Context, string, *registry.Model, int32) (*conversation.Record, error)
-	streamHeartbeatInterval time.Duration // test hook; defaults to 10s
+	dedupeKeyHook           func(string, []byte) (string, error) // test hook for digest failures
+	streamHeartbeatInterval time.Duration                        // test hook; defaults to 10s
 
 	// dedupeState lazily builds the in-memory coalescing coordinator so a
 	// zero-value Server behaves like a configured one.
@@ -753,7 +758,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// Coalesce identical retries before touching session load: cache hits and
 	// attaches must not create a second backlog request or bump the scaler.
-	dedupeKey, err := requestDedupeKey(hash, canonical)
+	keyForRequest := requestDedupeKey
+	if hook := s.dedupeKeyHook; hook != nil {
+		keyForRequest = hook
+	}
+	dedupeKey, err := keyForRequest(hash, canonical)
 	if err != nil {
 		s.log.WithError(err).Warn("derive request dedupe key")
 		writeError(w, http.StatusBadRequest, "invalid chat completion payload")
@@ -764,7 +773,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	switch handle.Kind() {
 	case dedupeRejected:
-		w.Header().Set("Retry-After", "1")
+		w.Header().Set("Retry-After", "5")
 		writeError(w, http.StatusServiceUnavailable, "request coalescing capacity exhausted; retry shortly")
 		return
 	case dedupeCacheHit, dedupeAttach:
@@ -928,6 +937,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	s.touchConversationRecord(hash, messageCount, prefixHash, time.Now())
 
+	// The pump deadline starts here, when the ingress admits the request, but
+	// the sidecar only starts its own dispatch clock after the backlog message
+	// is consumed. There is deliberately no extra grace: ResponseTimeout is the
+	// end-to-end budget and the sidecar timeout mirrors it.
 	pumpTimeout := s.cfg.ResponseTimeout
 	if pumpTimeout <= 0 {
 		pumpTimeout = 2 * time.Minute
@@ -950,7 +963,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) observeDedupe(handle *dedupeHandle, stream bool) {
 	result := handle.Kind().String()
 	metrics.IngressDedupTotal.WithLabelValues(result).Inc()
-	metrics.IngressDedupWaiters.Observe(float64(handle.Waiters()))
+	// The histogram describes fan-out pressure: only attaches add a waiter to
+	// an existing entry.
+	if handle.Kind() == dedupeAttach {
+		metrics.IngressDedupWaiters.Observe(float64(handle.Waiters()))
+	}
 
 	if s.log == nil {
 		return
@@ -962,7 +979,7 @@ func (s *Server) observeDedupe(handle *dedupeHandle, stream bool) {
 		"age":          handle.EntryAge().String(),
 		"buffer_bytes": handle.BufferBytes(),
 		"waiters":      handle.Waiters(),
-	}).Info("ingress dedupe")
+	}).Debug("ingress dedupe")
 }
 
 // serveDedupe serves a cache hit, attach, or the owner's own entry. The
@@ -1583,9 +1600,9 @@ func (s *Server) refreshConversationTTL(hash string) {
 	}
 }
 
-// serveStream writes the replay snapshot and then follows live events until
-// the entry terminates. Every waiter has its own SSE keepalive; the client's
-// request context only detaches this waiter from the shared entry.
+// serveStream writes the replay snapshot and then follows live chunks until
+// the entry terminates. Termination is read from the entry's done channel, so
+// it is delivered even when this waiter's 64-slot chunk buffer is full.
 func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle *dedupeHandle) {
 	defer handle.Close()
 
@@ -1623,6 +1640,8 @@ func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle 
 		writeChunk(string(payload))
 	}
 
+	// Replay the prefix captured when this waiter joined. The live pump only
+	// starts writing after the snapshot, so the order is gap-free.
 	for _, payload := range handle.Snapshot() {
 		writeChunk(payload)
 	}
@@ -1631,6 +1650,9 @@ func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle 
 		return
 	}
 
+	events := handle.Events()
+	done := handle.Done()
+	dropped := handle.Dropped()
 	keepalive := time.NewTicker(s.streamHeartbeat())
 	defer keepalive.Stop()
 
@@ -1640,23 +1662,36 @@ func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle 
 			errorChunk(ctx.Err().Error())
 			writeChunk("[DONE]")
 			return
-		case event, ok := <-handle.Events():
-			if !ok {
-				// The waiter was dropped because the client could not keep up;
-				// the pump keeps running for the other waiters and the cache.
-				return
+		case <-done:
+			drainStreamChunks(events, writeChunk)
+			if err := handle.TerminalError(); err != nil {
+				errorChunk(err.Error())
 			}
-			if event.terminal {
-				if event.err != nil {
-					errorChunk(event.err.Error())
-				}
-				writeChunk("[DONE]")
-				return
-			}
-			writeChunk(event.payload)
+			writeChunk("[DONE]")
+			return
+		case <-dropped:
+			// Never end a 200 SSE response silently: tell the client why.
+			errorChunk("client too slow to consume the stream")
+			writeChunk("[DONE]")
+			return
+		case payload := <-events:
+			writeChunk(payload)
 		case <-keepalive.C:
 			_, _ = fmt.Fprint(w, ": \n\n")
 			flusher.Flush()
+		}
+	}
+}
+
+// drainStreamChunks flushes chunks that were queued before the entry became
+// terminal. After done closes no further publishes can occur.
+func drainStreamChunks(events <-chan string, write func(string)) {
+	for {
+		select {
+		case payload := <-events:
+			write(payload)
+		default:
+			return
 		}
 	}
 }
@@ -1676,6 +1711,10 @@ func (s *Server) serveJSON(ctx context.Context, w http.ResponseWriter, handle *d
 		return
 	}
 
+	events := handle.Events()
+	done := handle.Done()
+	dropped := handle.Dropped()
+
 	var body string
 	if snapshot := handle.Snapshot(); len(snapshot) > 0 {
 		body = snapshot[len(snapshot)-1]
@@ -1686,28 +1725,42 @@ func (s *Server) serveJSON(ctx context.Context, w http.ResponseWriter, handle *d
 		case <-ctx.Done():
 			writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
 			return
-		case event, ok := <-handle.Events():
-			if !ok {
+		case <-done:
+			drainJSONBody(events, &body)
+			if err := handle.TerminalError(); err != nil {
+				// Preserve the historical non-stream status for a closed
+				// subscription or a pump deadline.
+				if errors.Is(err, context.DeadlineExceeded) ||
+					errors.Is(err, context.Canceled) ||
+					errors.Is(err, errResponseSubscriptionClosed) {
+					writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
+					return
+				}
 				writeError(w, http.StatusBadGateway, "failed to receive response")
 				return
 			}
-			if event.terminal {
-				if event.err != nil {
-					if errors.Is(event.err, context.DeadlineExceeded) || errors.Is(event.err, context.Canceled) {
-						writeError(w, http.StatusGatewayTimeout, "timeout waiting for response")
-						return
-					}
-					writeError(w, http.StatusBadGateway, "failed to receive response")
-					return
-				}
-				if body == "" {
-					writeError(w, http.StatusBadGateway, "failed to receive response")
-					return
-				}
-				writeJSONPayload(w, []byte(body))
+			if body == "" {
+				writeError(w, http.StatusBadGateway, "failed to receive response")
 				return
 			}
-			body = event.payload
+			writeJSONPayload(w, []byte(body))
+			return
+		case <-dropped:
+			writeError(w, http.StatusBadGateway, "failed to receive response")
+			return
+		case payload := <-events:
+			body = payload
+		}
+	}
+}
+
+func drainJSONBody(events <-chan string, body *string) {
+	for {
+		select {
+		case payload := <-events:
+			*body = payload
+		default:
+			return
 		}
 	}
 }
@@ -1749,24 +1802,46 @@ func (s *Server) pumpResponse(ctx context.Context, cancel context.CancelFunc, ha
 	s.pumpJSON(ctx, handle, hash, msgs)
 }
 
+// startActivityHeartbeat refreshes conversation activity off the chunk path.
+// Ticks are dropped while a KV update is already in flight.
+func (s *Server) startActivityHeartbeat(ctx context.Context, hash string) chan<- struct{} {
+	ticks := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticks:
+				s.touchConversationActivity(hash, time.Now())
+			}
+		}
+	}()
+	return ticks
+}
+
 // pumpStream normalises each upstream chunk exactly once and republishes the
 // result to every waiter. Terminal detection: [DONE], a structured error
-// payload, a closed subscription, or the pump deadline.
+// payload, a closed subscription, or the pump deadline. Error payloads are
+// never cached, so a retry re-enqueues instead of replaying a sticky failure.
 func (s *Server) pumpStream(ctx context.Context, handle *dedupeHandle, hash string, msgs <-chan *nats.Msg) {
 	state := streamingNormaliserState{disableThink: s.cfg.DisableThinkFilter}
-	keepalive := time.NewTicker(s.streamHeartbeat())
-	defer keepalive.Stop()
+	heartbeatTicks := s.startActivityHeartbeat(ctx, hash)
+	ticker := time.NewTicker(s.streamHeartbeat())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			handle.Fail(ctx.Err())
 			return
-		case <-keepalive.C:
-			s.touchConversationActivity(hash, time.Now())
+		case <-ticker.C:
+			select {
+			case heartbeatTicks <- struct{}{}:
+			default:
+			}
 		case msg, ok := <-msgs:
 			if !ok || msg == nil {
-				handle.Fail(errors.New("subscription closed"))
+				handle.Fail(errResponseSubscriptionClosed)
 				return
 			}
 			line := strings.TrimSpace(string(msg.Data))
@@ -1782,6 +1857,9 @@ func (s *Server) pumpStream(ctx context.Context, handle *dedupeHandle, hash stri
 			if err != nil {
 				// Preserve raw tokens rather than dropping them on a
 				// normalisation hiccup.
+				if s.log != nil {
+					s.log.WithError(err).Debug("normalise chunk")
+				}
 				normalised = line
 			}
 			if isEmptyDeltaChunk(normalised) {
@@ -1789,7 +1867,7 @@ func (s *Server) pumpStream(ctx context.Context, handle *dedupeHandle, hash stri
 			}
 			handle.Publish(normalised)
 			if hasErrorField([]byte(normalised)) {
-				handle.Complete()
+				handle.CompleteUncached()
 				return
 			}
 		}
@@ -1799,19 +1877,23 @@ func (s *Server) pumpStream(ctx context.Context, handle *dedupeHandle, hash stri
 // pumpJSON waits for the single non-stream body. The heartbeat keeps the
 // conversation record alive for slow generations.
 func (s *Server) pumpJSON(ctx context.Context, handle *dedupeHandle, hash string, msgs <-chan *nats.Msg) {
-	keepalive := time.NewTicker(s.streamHeartbeat())
-	defer keepalive.Stop()
+	heartbeatTicks := s.startActivityHeartbeat(ctx, hash)
+	ticker := time.NewTicker(s.streamHeartbeat())
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			handle.Fail(ctx.Err())
 			return
-		case <-keepalive.C:
-			s.touchConversationActivity(hash, time.Now())
+		case <-ticker.C:
+			select {
+			case heartbeatTicks <- struct{}{}:
+			default:
+			}
 		case msg, ok := <-msgs:
 			if !ok || msg == nil {
-				handle.Fail(errors.New("subscription closed"))
+				handle.Fail(errResponseSubscriptionClosed)
 				return
 			}
 			line := strings.TrimSpace(string(msg.Data))
@@ -1819,6 +1901,10 @@ func (s *Server) pumpJSON(ctx context.Context, handle *dedupeHandle, hash string
 				continue
 			}
 			handle.Publish(line)
+			if errorResponseStatus([]byte(line)) != 0 || hasErrorField([]byte(line)) {
+				handle.CompleteUncached()
+				return
+			}
 			handle.Complete()
 			return
 		}
@@ -1830,18 +1916,6 @@ func (s *Server) streamHeartbeat() time.Duration {
 		return s.streamHeartbeatInterval
 	}
 	return 10 * time.Second
-}
-
-func waitForMessage(ctx context.Context, msgs <-chan *nats.Msg) (*nats.Msg, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case msg := <-msgs:
-		if msg == nil {
-			return nil, errors.New("subscription closed")
-		}
-		return msg, nil
-	}
 }
 
 func (s *Server) waitForIdleWorker(ctx context.Context, prefix string) error {

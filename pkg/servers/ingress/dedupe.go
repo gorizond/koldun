@@ -110,29 +110,30 @@ func (k dedupeBeginKind) String() string {
 	}
 }
 
-type dedupeEvent struct {
-	payload  string
-	terminal bool
-	err      error
-}
-
+// dedupeWaiter receives chunks only. Termination is signalled through the
+// entry's done channel so it can never be lost when the chunk buffer is full.
 type dedupeWaiter struct {
-	ch     chan dedupeEvent
-	closed bool
+	ch      chan string
+	dropped chan struct{}
+	closed  bool
 }
 
 func newDedupeWaiter() *dedupeWaiter {
-	return &dedupeWaiter{ch: make(chan dedupeEvent, dedupeWaiterBuffer)}
+	return &dedupeWaiter{
+		ch:      make(chan string, dedupeWaiterBuffer),
+		dropped: make(chan struct{}),
+	}
 }
 
 type dedupeEntry struct {
 	key    string
 	stream bool
 
-	state     dedupeEntryState
-	startedAt time.Time
-	expiresAt time.Time
-	terminal  bool
+	state       dedupeEntryState
+	startedAt   time.Time
+	expiresAt   time.Time
+	terminal    bool
+	terminalErr error
 
 	// buffer holds normalised SSE payload strings (stream) or the single JSON
 	// body (non-stream). It is the replay prefix for attach and cache hits.
@@ -159,8 +160,9 @@ type dedupeCoordinator struct {
 	entries map[string]*dedupeEntry
 	lru     *list.List // front = most recently used cached entry
 
-	cachedCount int
-	cachedBytes int64
+	cachedCount   int
+	cachedBytes   int64
+	inflightBytes int64
 
 	ttl         time.Duration
 	maxEntries  int
@@ -287,7 +289,8 @@ func (c *dedupeCoordinator) removeLocked(entry *dedupeEntry) {
 		c.lru.Remove(entry.lruElem)
 		entry.lruElem = nil
 	}
-	if entry.state == dedupeStateCached {
+	switch entry.state {
+	case dedupeStateCached:
 		c.cachedCount--
 		c.cachedBytes -= entry.bufferBytes
 		if c.cachedCount < 0 {
@@ -295,6 +298,11 @@ func (c *dedupeCoordinator) removeLocked(entry *dedupeEntry) {
 		}
 		if c.cachedBytes < 0 {
 			c.cachedBytes = 0
+		}
+	case dedupeStateInflight:
+		c.inflightBytes -= entry.bufferBytes
+		if c.inflightBytes < 0 {
+			c.inflightBytes = 0
 		}
 	}
 	c.syncGaugeLocked()
@@ -322,32 +330,57 @@ func (c *dedupeCoordinator) publish(entry *dedupeEntry, payload string) {
 		return
 	}
 
+	size := int64(len(payload))
+	// Replay buffers are bounded per entry and against the same global byte
+	// budget as the cache. Cached entries are evicted LRU-first to make room;
+	// if in-flight bytes alone exceed the budget the entry stops buffering
+	// (attaches are rejected), while live waiters keep streaming.
 	if entry.stream {
 		if !entry.truncated {
-			if entry.bufferBytes+int64(len(payload)) > dedupeStreamBufferBytes {
+			if entry.bufferBytes+size > dedupeStreamBufferBytes || !c.reserveLocked(size) {
 				entry.truncated = true
 				entry.cacheable = false
 			} else {
 				entry.buffer = append(entry.buffer, payload)
-				entry.bufferBytes += int64(len(payload))
+				entry.bufferBytes += size
+				c.inflightBytes += size
 			}
 		}
 	} else if len(entry.buffer) == 0 {
-		entry.buffer = append(entry.buffer, payload)
-		entry.bufferBytes += int64(len(payload))
-		if entry.bufferBytes > dedupeJSONBodyBytes {
+		if !c.reserveLocked(size) {
+			entry.truncated = true
 			entry.cacheable = false
+		} else {
+			entry.buffer = append(entry.buffer, payload)
+			entry.bufferBytes += size
+			c.inflightBytes += size
+			if entry.bufferBytes > dedupeJSONBodyBytes {
+				entry.cacheable = false
+			}
 		}
 	}
 
-	event := dedupeEvent{payload: payload}
 	for waiter := range entry.waiters {
 		select {
-		case waiter.ch <- event:
+		case waiter.ch <- payload:
 		default:
 			c.dropWaiterLocked(entry, waiter)
 		}
 	}
+}
+
+// reserveLocked makes room in the global byte budget for size in-flight bytes.
+// Cached entries are evicted LRU-first; false means the in-flight set alone
+// would exceed the budget and the caller must stop buffering.
+func (c *dedupeCoordinator) reserveLocked(size int64) bool {
+	for c.cachedBytes+c.inflightBytes+size > c.maxBytes && c.lru.Len() > 0 {
+		oldest := c.lru.Back()
+		if oldest == nil {
+			break
+		}
+		c.removeLocked(oldest.Value.(*dedupeEntry))
+	}
+	return c.inflightBytes+size <= c.maxBytes
 }
 
 func (c *dedupeCoordinator) dropWaiterLocked(entry *dedupeEntry, waiter *dedupeWaiter) {
@@ -356,10 +389,13 @@ func (c *dedupeCoordinator) dropWaiterLocked(entry *dedupeEntry, waiter *dedupeW
 	}
 	waiter.closed = true
 	delete(entry.waiters, waiter)
-	close(waiter.ch)
+	close(waiter.dropped)
 }
 
-func (c *dedupeCoordinator) complete(entry *dedupeEntry) {
+// complete marks the entry terminal and optionally publishes it to the short
+// cache. cacheable=false is used for error payloads: a retry must enqueue a
+// fresh request instead of replaying a sticky failure.
+func (c *dedupeCoordinator) complete(entry *dedupeEntry, cacheable bool) {
 	if entry == nil {
 		return
 	}
@@ -369,16 +405,17 @@ func (c *dedupeCoordinator) complete(entry *dedupeEntry) {
 		return
 	}
 	entry.terminal = true
+	entry.terminalErr = nil
 	close(entry.done)
-
-	for waiter := range entry.waiters {
-		c.terminateWaiterLocked(entry, waiter, dedupeEvent{terminal: true})
-	}
 	entry.waiters = nil
 
 	onTerminal := entry.onTerminal
 
-	if entry.cacheable && !entry.truncated {
+	if cacheable && entry.cacheable && !entry.truncated {
+		c.inflightBytes -= entry.bufferBytes
+		if c.inflightBytes < 0 {
+			c.inflightBytes = 0
+		}
 		entry.state = dedupeStateCached
 		entry.expiresAt = time.Now().Add(c.ttl)
 		entry.lruElem = c.lru.PushFront(entry)
@@ -405,12 +442,8 @@ func (c *dedupeCoordinator) fail(entry *dedupeEntry, err error) {
 		return
 	}
 	entry.terminal = true
+	entry.terminalErr = err
 	close(entry.done)
-
-	event := dedupeEvent{terminal: true, err: err}
-	for waiter := range entry.waiters {
-		c.terminateWaiterLocked(entry, waiter, event)
-	}
 	entry.waiters = nil
 
 	onTerminal := entry.onTerminal
@@ -420,19 +453,6 @@ func (c *dedupeCoordinator) fail(entry *dedupeEntry, err error) {
 	if onTerminal != nil {
 		onTerminal()
 	}
-}
-
-func (c *dedupeCoordinator) terminateWaiterLocked(entry *dedupeEntry, waiter *dedupeWaiter, event dedupeEvent) {
-	if waiter.closed {
-		return
-	}
-	select {
-	case waiter.ch <- event:
-	default:
-	}
-	waiter.closed = true
-	delete(entry.waiters, waiter)
-	close(waiter.ch)
 }
 
 // evictLocked drops least-recently-used cached entries until the count and
@@ -467,10 +487,6 @@ func (h *dedupeHandle) Kind() dedupeBeginKind {
 	return h.kind
 }
 
-func (h *dedupeHandle) IsOwner() bool {
-	return h != nil && h.kind == dedupeMiss
-}
-
 // Snapshot returns the replay prefix captured atomically when the caller
 // joined the entry (attach) or the full cached result (hit).
 func (h *dedupeHandle) Snapshot() []string {
@@ -480,11 +496,43 @@ func (h *dedupeHandle) Snapshot() []string {
 	return append([]string(nil), h.snapshot...)
 }
 
-func (h *dedupeHandle) Events() <-chan dedupeEvent {
+// Events carries replay chunks for this waiter. Completion is signalled by
+// Done, never by closing this channel, so a full buffer cannot hide the
+// terminal frame.
+func (h *dedupeHandle) Events() <-chan string {
 	if h == nil || h.waiter == nil {
 		return nil
 	}
 	return h.waiter.ch
+}
+
+// Dropped is closed when this waiter fell behind and was removed from the
+// fan-out. The handler must emit an explicit error terminator.
+func (h *dedupeHandle) Dropped() <-chan struct{} {
+	if h == nil || h.waiter == nil {
+		return nil
+	}
+	return h.waiter.dropped
+}
+
+// Done is closed exactly once when the entry completes or fails, independent
+// of waiter buffer space.
+func (h *dedupeHandle) Done() <-chan struct{} {
+	if h == nil || h.entry == nil {
+		return nil
+	}
+	return h.entry.done
+}
+
+// TerminalError reports why the entry failed. It is safe to call only after
+// Done is closed.
+func (h *dedupeHandle) TerminalError() error {
+	if h == nil || h.coord == nil || h.entry == nil {
+		return nil
+	}
+	h.coord.mu.Lock()
+	defer h.coord.mu.Unlock()
+	return h.entry.terminalErr
 }
 
 // Publish is called by the owner's pump with already-normalised payloads.
@@ -499,7 +547,16 @@ func (h *dedupeHandle) Complete() {
 	if h == nil || h.entry == nil || h.kind != dedupeMiss {
 		return
 	}
-	h.coord.complete(h.entry)
+	h.coord.complete(h.entry, true)
+}
+
+// CompleteUncached terminates the entry without caching it. Used for error
+// payloads so retries do not replay a sticky failure for the whole TTL.
+func (h *dedupeHandle) CompleteUncached() {
+	if h == nil || h.entry == nil || h.kind != dedupeMiss {
+		return
+	}
+	h.coord.complete(h.entry, false)
 }
 
 func (h *dedupeHandle) Fail(err error) {
@@ -525,7 +582,6 @@ func (h *dedupeHandle) Close() {
 	if h.entry != nil && h.entry.waiters != nil {
 		delete(h.entry.waiters, h.waiter)
 	}
-	close(h.waiter.ch)
 }
 
 // SetOnTerminal registers the owner's completion callback (session load and
@@ -538,7 +594,9 @@ func (h *dedupeHandle) SetOnTerminal(fn func()) {
 	h.coord.mu.Lock()
 	if h.entry.terminal {
 		h.coord.mu.Unlock()
-		fn()
+		if fn != nil {
+			fn()
+		}
 		return
 	}
 	h.entry.onTerminal = fn

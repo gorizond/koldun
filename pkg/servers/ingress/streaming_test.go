@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -207,6 +208,198 @@ func TestEventTimestamp(t *testing.T) {
 
 	past := time.Now().Add(-2 * time.Hour).Unix()
 	require.Equal(t, time.Unix(past, 0), eventTimestamp(past))
+}
+
+func TestConsumeStateEvent(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	subject := "sessions.demo.dllama.worker-1.state"
+	event := conversation.WorkerStateEvent{
+		State:     "Idle",
+		Active:    0,
+		Timestamp: time.Now().Unix(),
+	}
+	payload, err := json.Marshal(event)
+	require.NoError(t, err)
+
+	srv.consumeStateEvent(subject, payload)
+	srv.consumeStateEvent(subject, []byte("not-json"))
+
+	srv.stateCache.mu.RLock()
+	defer srv.stateCache.mu.RUnlock()
+
+	prefix := "sessions.demo.dllama."
+	workers := srv.stateCache.workers[prefix]
+	require.NotNil(t, workers)
+	entry, ok := workers["worker-1"]
+	require.True(t, ok)
+	require.Equal(t, "Idle", entry.state)
+	require.Equal(t, int32(0), entry.active)
+}
+
+type mockFlusherWriter struct {
+	http.ResponseWriter
+	flushed bool
+}
+
+func (m *mockFlusherWriter) Flush() {
+	m.flushed = true
+}
+
+func TestResponseWriterWrapperDelegatesFlush(t *testing.T) {
+	t.Parallel()
+
+	inner := &mockFlusherWriter{ResponseWriter: httptest.NewRecorder()}
+	wrapper := &responseWriterWrapper{ResponseWriter: inner, statusCode: http.StatusOK}
+
+	// Verify wrapper implements http.Flusher
+	var rw http.ResponseWriter = wrapper
+	flusher, ok := rw.(http.Flusher)
+	require.True(t, ok, "responseWriterWrapper should implement http.Flusher")
+
+	// Verify Flush delegates to inner writer
+	flusher.Flush()
+	require.True(t, inner.flushed, "Flush should be delegated to inner ResponseWriter")
+}
+
+func TestIsEmptyDeltaChunk(t *testing.T) {
+	t.Parallel()
+
+	// Empty delta (no role, no content, no finish_reason)
+	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{}}]}`))
+	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"","content":""}}]}`))
+
+	// Has content
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"content":"hello"}}]}`))
+
+	// Has role
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"assistant"}}]}`))
+
+	// Has finish_reason
+	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
+
+	// Invalid JSON should not be considered empty (pass through)
+	require.False(t, isEmptyDeltaChunk(`not-json`))
+}
+
+const (
+	// Hex escapes keep the tags unambiguous in generated sources.
+	testThinkOpen  = "\x3cthink\x3e"
+	testThinkClose = "\x3c/think\x3e"
+)
+
+func TestThinkRedactorUnicodeExpansionNoPanic(t *testing.T) {
+	t.Parallel()
+
+	// U+023A lowercases to a 3-byte rune in Go, so offsets taken from a
+	// lowercased copy can exceed len(buffer): these cases used to panic with
+	// "slice bounds out of range" while streaming.
+	t.Run("stray close tag after expanding runes", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.NotPanics(t, func() {
+			require.Equal(t, "", redactor.filter("\u023a\u023a\u023a"+testThinkClose))
+		})
+	})
+
+	t.Run("answer after close tag", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.NotPanics(t, func() {
+			require.Equal(t, "answer", redactor.filter("x\u023a\u023a\u023a"+testThinkClose+"answer"))
+		})
+	})
+
+	t.Run("dotted capital I", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.NotPanics(t, func() {
+			require.Equal(t, "answer", redactor.filter("\u0130\u0130\u0130"+testThinkClose+"answer"))
+		})
+	})
+
+	t.Run("think block with expanding runes", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.NotPanics(t, func() {
+			require.Equal(t, "visible", redactor.filter(testThinkOpen+"secret\u023a\u023a\u023a"+testThinkClose+"visible"))
+		})
+	})
+
+	t.Run("split chunks with expanding runes", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.Equal(t, "prefix ", redactor.filter("prefix "+testThinkOpen+"\u023a"))
+		require.Equal(t, "", redactor.filter("\u023a"))
+		require.Equal(t, "visible", redactor.filter("\u023a"+testThinkClose+"visible"))
+	})
+}
+
+func TestThinkRedactorSplitTags(t *testing.T) {
+	t.Parallel()
+
+	t.Run("open and close tags split across chunks", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+
+		var out strings.Builder
+		out.WriteString(redactor.filter("\x3cthi"))
+		out.WriteString(redactor.filter("nk\x3esecret\x3c/thi"))
+		out.WriteString(redactor.filter("nk\x3eanswer"))
+
+		require.Equal(t, "answer", out.String())
+		require.NotContains(t, out.String(), "secret")
+	})
+
+	t.Run("stray close tag split across chunks", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+
+		var out strings.Builder
+		out.WriteString(redactor.filter("\x3c/thi"))
+		out.WriteString(redactor.filter("nk\x3epayload"))
+
+		require.Equal(t, "payload", out.String())
+	})
+
+	t.Run("answer preserved after think", func(t *testing.T) {
+		t.Parallel()
+		var redactor thinkRedactor
+		require.Equal(t, "a c", redactor.filter("a "+testThinkOpen+"b"+testThinkClose+"c"))
+	})
+}
+
+func TestLongestThinkSuffixShortBuffers(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 0, longestThinkSuffix(""))
+	require.Equal(t, 1, longestThinkSuffix("\x3c"))
+	require.Equal(t, 2, longestThinkSuffix("\x3c/"))
+	require.Equal(t, 0, longestThinkSuffix(" think"))
+	require.Equal(t, 6, longestThinkSuffix("\x3c/THIN"))
+	require.Equal(t, 0, longestThinkSuffix("\u023a\u023a"))
+}
+
+func TestDetailsRedactorUnicodeNoPanic(t *testing.T) {
+	t.Parallel()
+
+	var redactor detailsRedactor
+	require.NotPanics(t, func() {
+		require.Equal(t, "visible", redactor.filter("\x3cdetails type=\"reasoning\"\x3e\u023a\u023a\u023a\x3c/details\x3evisible"))
+	})
+}
+
+func TestNormaliseStreamingChunkScrubsExpandingRunes(t *testing.T) {
+	t.Parallel()
+
+	state := &streamingNormaliserState{}
+	raw := `{"choices":[{"delta":{"role":"assistant","content":"\u023a\u023a\u023a` + testThinkClose + `answer"}}]}`
+
+	normalised, err := normaliseStreamingChunk(raw, state)
+	require.NoError(t, err)
+	require.NotContains(t, normalised, "response")
+	require.Contains(t, normalised, "answer")
 }
 
 func TestServeStreamRequiresFlusher(t *testing.T) {

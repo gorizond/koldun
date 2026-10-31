@@ -89,6 +89,11 @@ const dedupeTestModel = "tenant/chat-1"
 
 func newDedupeHarness(t *testing.T) *dedupeHarness {
 	t.Helper()
+	return newDedupeHarnessWithConfig(t, nil)
+}
+
+func newDedupeHarnessWithConfig(t *testing.T, mutate func(*Config)) *dedupeHarness {
+	t.Helper()
 
 	ns := startIngressJetStream(t)
 	logger := logrus.New()
@@ -103,6 +108,9 @@ func newDedupeHarness(t *testing.T) *dedupeHarness {
 		AllowAnonymous:  true,
 		ResponseTimeout: 5 * time.Second,
 		Logger:          logrus.NewEntry(logger),
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 
 	srv, err := New(cfg)
@@ -223,6 +231,29 @@ func (h *dedupeHarness) waitForCached(key string) {
 	h.t.Fatal("dedupe entry was not cached in time")
 }
 
+// waitForWaiters replaces timing sleeps: the test proceeds only once the
+// expected number of requests have actually joined the in-flight entry.
+func (h *dedupeHarness) waitForWaiters(key string, want int) {
+	h.t.Helper()
+
+	coord := h.srv.dedupeCoordinator()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		coord.mu.Lock()
+		entry, ok := coord.entries[key]
+		waiters := 0
+		if ok {
+			waiters = len(entry.waiters)
+		}
+		coord.mu.Unlock()
+		if waiters == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	h.t.Fatalf("dedupe entry never reached %d waiters", want)
+}
+
 func ssePayloads(body string) []string {
 	var payloads []string
 	for _, chunk := range strings.Split(strings.TrimSpace(body), "\n\n") {
@@ -255,8 +286,7 @@ func TestDedupeIntegrationNonStreamConcurrentRetry(t *testing.T) {
 	}
 
 	_, responseSubject := h.nextBacklog(5 * time.Second)
-	// Give the second handler time to attach before the first response lands.
-	time.Sleep(100 * time.Millisecond)
+	h.waitForWaiters(h.dedupeKey(body), 2)
 
 	response := `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"pong"}}]}`
 	h.publish(responseSubject, response)
@@ -300,7 +330,7 @@ func TestDedupeIntegrationStreamRetryMidStream(t *testing.T) {
 		defer close(secondDone)
 		h.srv.handleChatCompletions(second, h.request(body, context.Background()))
 	}()
-	time.Sleep(100 * time.Millisecond)
+	h.waitForWaiters(h.dedupeKey(body), 2)
 
 	h.publish(responseSubject,
 		`{"choices":[{"delta":{"content":"two"}}]}`,
@@ -427,5 +457,124 @@ func TestDedupeIntegrationDifferentNextTurnMisses(t *testing.T) {
 
 	require.Equal(t, firstResponse, first.bodyString())
 	require.Equal(t, secondResponse, second.bodyString())
+	h.requireNoBacklog(300 * time.Millisecond)
+}
+
+func TestDedupeIntegrationStreamErrorNotCached(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	h := newDedupeHarness(t)
+	body := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}],"stream":true}`
+
+	first := newSyncRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		h.srv.handleChatCompletions(first, h.request(body, context.Background()))
+	}()
+	_, responseSubject := h.nextBacklog(5 * time.Second)
+	h.publish(responseSubject,
+		`{"choices":[{"delta":{"role":"assistant","content":"partial"}}]}`,
+		`{"error":{"message":"upstream stream interrupted","type":"server_error","code":"stream_interrupted"}}`,
+	)
+	<-firstDone
+
+	firstPayloads := ssePayloads(first.bodyString())
+	require.Len(t, firstPayloads, 3)
+	require.Contains(t, firstPayloads[0], `"partial"`)
+	require.Contains(t, firstPayloads[1], `"stream_interrupted"`)
+	require.Equal(t, "[DONE]", firstPayloads[2])
+
+	// The error result must not be cached: the retry enqueues a new request.
+	second := newSyncRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		h.srv.handleChatCompletions(second, h.request(body, context.Background()))
+	}()
+	_, retrySubject := h.nextBacklog(5 * time.Second)
+	h.publish(retrySubject, "[DONE]")
+	<-secondDone
+
+	require.Equal(t, []string{"[DONE]"}, ssePayloads(second.bodyString()))
+	h.requireNoBacklog(300 * time.Millisecond)
+}
+
+func TestDedupeIntegrationJSONErrorNotCached(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	h := newDedupeHarness(t)
+	body := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}]}`
+	errorResponse := `{"error":{"message":"inference failed","type":"server_error","code":"inference_failed"}}`
+
+	first := newSyncRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		h.srv.handleChatCompletions(first, h.request(body, context.Background()))
+	}()
+	_, responseSubject := h.nextBacklog(5 * time.Second)
+	h.publish(responseSubject, errorResponse)
+	<-firstDone
+
+	require.Equal(t, http.StatusBadGateway, first.statusCode())
+	require.Equal(t, errorResponse, first.bodyString())
+
+	// No sticky failure: the retry enqueues again and can succeed.
+	second := newSyncRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		h.srv.handleChatCompletions(second, h.request(body, context.Background()))
+	}()
+	_, retrySubject := h.nextBacklog(5 * time.Second)
+	success := `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}`
+	h.publish(retrySubject, success)
+	<-secondDone
+
+	require.Equal(t, http.StatusOK, second.statusCode())
+	require.Equal(t, success, second.bodyString())
+	h.requireNoBacklog(300 * time.Millisecond)
+}
+
+func TestDedupeIntegrationTTLExpiry(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping JetStream dependent test in short mode")
+	}
+
+	h := newDedupeHarnessWithConfig(t, func(cfg *Config) {
+		cfg.DedupeTTL = 50 * time.Millisecond
+	})
+	body := `{"model":"tenant/chat-1","messages":[{"role":"user","content":"ping"}]}`
+	response := `{"object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"pong"}}]}`
+
+	first := newSyncRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		h.srv.handleChatCompletions(first, h.request(body, context.Background()))
+	}()
+	_, responseSubject := h.nextBacklog(5 * time.Second)
+	h.publish(responseSubject, response)
+	<-firstDone
+
+	time.Sleep(80 * time.Millisecond)
+
+	second := newSyncRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		h.srv.handleChatCompletions(second, h.request(body, context.Background()))
+	}()
+	_, retrySubject := h.nextBacklog(5 * time.Second)
+	h.publish(retrySubject, response)
+	<-secondDone
+
+	require.Equal(t, http.StatusOK, second.statusCode())
+	require.Equal(t, response, second.bodyString())
 	h.requireNoBacklog(300 * time.Millisecond)
 }
