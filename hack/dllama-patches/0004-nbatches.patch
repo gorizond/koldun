@@ -1,0 +1,31 @@
+diff --git a/src/app.cpp b/src/app.cpp
+index 6822892..7202381 100644
+--- a/src/app.cpp
++++ b/src/app.cpp
+@@ -18,6 +18,17 @@ static NnFloatType parseFloatType(char *val) {
+     throw std::runtime_error("Invalid float type: " + std::string(val));
+ }
+ 
++static NnUint parseNBatches() {
++    const char *raw = std::getenv("DLLAMA_N_BATCHES");
++    if (raw == nullptr)
++        return 32;
++    char *end = nullptr;
++    long value = std::strtol(raw, &end, 10);
++    if (end == raw || value < 1 || value > 256)
++        return 32;
++    return (NnUint)value;
++}
++
+ static ChatTemplateType parseChatTemplateType(char *val) {
+     if (std::strcmp(val, "llama2") == 0) return TEMPLATE_LLAMA2;
+     if (std::strcmp(val, "llama3") == 0) return TEMPLATE_LLAMA3;
+@@ -30,7 +41,7 @@ AppCliArgs AppCliArgs::parse(int argc, char* *argv, bool requireMode) {
+     args.info = true;
+     args.help = false;
+     args.mode = nullptr;
+-    args.nBatches = 32;
++    args.nBatches = parseNBatches();
+     args.nThreads = 1;
+     args.modelPath = nullptr;
+     args.tokenizerPath = nullptr;

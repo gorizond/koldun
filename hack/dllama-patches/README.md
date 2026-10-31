@@ -1,8 +1,8 @@
 # distributed-llama patches
 
 `Dockerfile` builds dllama from the fork `gorizond/distributed-llama`, pinned by
-the annotated tag `v0.16.5-koldun.2` (commit `f462749`). That tag already
-contains both patches below, so the `Dockerfile` no longer clones upstream or
+the annotated tag `v0.16.5-koldun.3` (commit `163d705`). That tag already
+contains all patches below, so the `Dockerfile` no longer clones upstream or
 applies `*.patch`. This directory is kept as the source of truth for the patches
 and their history.
 
@@ -16,8 +16,12 @@ and their history.
     tok/s, so long prompts/answers are observable;
   - env-gated: `DLLAMA_PROGRESS_EVERY` (prefill, tokens) and
     `DLLAMA_GEN_PROGRESS_EVERY` (generation, tokens); `0`/unset disables each.
+- `0004-nbatches.patch`:
+  - prefill batch size is configurable via `DLLAMA_N_BATCHES` (1..256, default
+    32); parsed once in the shared CLI args, so root and workers agree;
+  - used by the experiment that sets `DLLAMA_N_BATCHES=64` on root and workers.
 
-Both patches are already in fork tag `v0.16.5-koldun.2`, so the `Dockerfile`
+All patches are already in fork tag `v0.16.5-koldun.3`, so the `Dockerfile`
 does not apply them.
 
 When bumping `DL_VERSION`, re-apply the patches to a clean upstream checkout,
