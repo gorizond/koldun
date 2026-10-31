@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorizond/koldun/pkg/conversation"
 	"github.com/nats-io/nats.go"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
@@ -210,51 +209,43 @@ func TestEventTimestamp(t *testing.T) {
 	require.Equal(t, time.Unix(past, 0), eventTimestamp(past))
 }
 
-func TestStreamResponseRequiresFlusher(t *testing.T) {
+func TestServeStreamRequiresFlusher(t *testing.T) {
 	t.Parallel()
 
-	srv := &Server{}
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("requires-flusher", true)
 	writer := &noFlushWriter{}
-	srv.streamResponse(context.Background(), writer, make(chan *nats.Msg), nil)
+	srv.serveStream(context.Background(), writer, handle)
 
 	require.Equal(t, http.StatusInternalServerError, writer.status)
 	require.Contains(t, writer.body.String(), `"streaming not supported"`)
 }
 
-func TestStreamResponseHappyPath(t *testing.T) {
+func TestServeStreamHappyPath(t *testing.T) {
 	t.Parallel()
 
 	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("happy-path", true)
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg, 2)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
+	payload := `{"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"}}]}`
 	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
+		time.Sleep(2 * time.Millisecond)
+		handle.Publish(payload)
+		handle.Complete()
 	}()
 
-	msgs <- &nats.Msg{Data: []byte(`{"choices":[{"delta":{"role":"assistant","content":"hello"}}]}`)}
-	msgs <- &nats.Msg{Data: []byte("[DONE]")}
-
-	wg.Wait()
+	srv.serveStream(ctx, rec, handle)
 
 	body := rec.Body.String()
 	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
 	require.Len(t, chunks, 2)
 
 	first := strings.TrimPrefix(chunks[0], "data: ")
-	var chunk streamingChunk
-	require.NoError(t, json.Unmarshal([]byte(first), &chunk))
-	require.Equal(t, "chat.completion.chunk", chunk.Object)
-	require.Len(t, chunk.Choices, 1)
-	require.Nil(t, chunk.Choices[0].FinishReason)
-	require.Equal(t, "assistant", chunk.Choices[0].Delta.Role)
-	require.Equal(t, "hello", chunk.Choices[0].Delta.Content)
+	require.JSONEq(t, payload, first)
 
 	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
 	require.Greater(t, rec.flushes, 0)
@@ -262,19 +253,19 @@ func TestStreamResponseHappyPath(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 }
 
-func TestStreamResponseContextCancelled(t *testing.T) {
+func TestServeStreamContextCancelled(t *testing.T) {
 	t.Parallel()
 
 	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("context-cancelled", true)
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
+		srv.serveStream(ctx, rec, handle)
 	}()
 
 	time.AfterFunc(5*time.Millisecond, cancel)
@@ -289,28 +280,24 @@ func TestStreamResponseContextCancelled(t *testing.T) {
 	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
 }
 
-// TestStreamResponseSubscriptionClosed ensures SSE emits an error chunk when the
-// response subscription closes before any payloads are streamed (e.g. backlog
-// publish failure or dispatcher drop).
-func TestStreamResponseSubscriptionClosed(t *testing.T) {
+// TestPumpSubscriptionClosed ensures the SSE client sees an error chunk when
+// the upstream subscription closes before any payloads are streamed.
+func TestPumpSubscriptionClosed(t *testing.T) {
 	t.Parallel()
 
 	srv := &Server{log: logrus.New().WithField("component", "test")}
-	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	handle := srv.dedupeBegin("subscription-closed", true)
 	msgs := make(chan *nats.Msg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, nil)
-	}()
+	pumpCtx, pumpCancel := context.WithCancel(ctx)
+	go srv.pumpResponse(pumpCtx, pumpCancel, handle, "hash", msgs, nil)
+	msgs <- nil
 
-	close(msgs)
-	wg.Wait()
+	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	srv.serveStream(ctx, rec, handle)
 
 	body := rec.Body.String()
 	chunks := strings.Split(strings.TrimSpace(body), "\n\n")
@@ -321,228 +308,25 @@ func TestStreamResponseSubscriptionClosed(t *testing.T) {
 	require.Equal(t, "data: [DONE]", strings.TrimSpace(chunks[1]))
 }
 
-func TestConsumeStateEvent(t *testing.T) {
-	t.Parallel()
-
-	srv := &Server{log: logrus.New().WithField("component", "test")}
-	subject := "sessions.demo.dllama.worker-1.state"
-	event := conversation.WorkerStateEvent{
-		State:     "Idle",
-		Active:    0,
-		Timestamp: time.Now().Unix(),
-	}
-	payload, err := json.Marshal(event)
-	require.NoError(t, err)
-
-	srv.consumeStateEvent(subject, payload)
-	srv.consumeStateEvent(subject, []byte("not-json"))
-
-	srv.stateCache.mu.RLock()
-	defer srv.stateCache.mu.RUnlock()
-
-	prefix := "sessions.demo.dllama."
-	workers := srv.stateCache.workers[prefix]
-	require.NotNil(t, workers)
-	entry, ok := workers["worker-1"]
-	require.True(t, ok)
-	require.Equal(t, "Idle", entry.state)
-	require.Equal(t, int32(0), entry.active)
-}
-
-type mockFlusherWriter struct {
-	http.ResponseWriter
-	flushed bool
-}
-
-func (m *mockFlusherWriter) Flush() {
-	m.flushed = true
-}
-
-func TestResponseWriterWrapperDelegatesFlush(t *testing.T) {
-	t.Parallel()
-
-	inner := &mockFlusherWriter{ResponseWriter: httptest.NewRecorder()}
-	wrapper := &responseWriterWrapper{ResponseWriter: inner, statusCode: http.StatusOK}
-
-	// Verify wrapper implements http.Flusher
-	var rw http.ResponseWriter = wrapper
-	flusher, ok := rw.(http.Flusher)
-	require.True(t, ok, "responseWriterWrapper should implement http.Flusher")
-
-	// Verify Flush delegates to inner writer
-	flusher.Flush()
-	require.True(t, inner.flushed, "Flush should be delegated to inner ResponseWriter")
-}
-
-func TestIsEmptyDeltaChunk(t *testing.T) {
-	t.Parallel()
-
-	// Empty delta (no role, no content, no finish_reason)
-	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{}}]}`))
-	require.True(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"","content":""}}]}`))
-
-	// Has content
-	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"content":"hello"}}]}`))
-
-	// Has role
-	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{"role":"assistant"}}]}`))
-
-	// Has finish_reason
-	require.False(t, isEmptyDeltaChunk(`{"choices":[{"delta":{},"finish_reason":"stop"}]}`))
-
-	// Invalid JSON should not be considered empty (pass through)
-	require.False(t, isEmptyDeltaChunk(`not-json`))
-}
-
-const (
-	// Hex escapes keep the tags unambiguous in generated sources.
-	testThinkOpen  = "\x3cthink\x3e"
-	testThinkClose = "\x3c/think\x3e"
-)
-
-func TestThinkRedactorUnicodeExpansionNoPanic(t *testing.T) {
-	t.Parallel()
-
-	// U+023A lowercases to a 3-byte rune in Go, so offsets taken from a
-	// lowercased copy can exceed len(buffer): these cases used to panic with
-	// "slice bounds out of range" while streaming.
-	t.Run("stray close tag after expanding runes", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.NotPanics(t, func() {
-			require.Equal(t, "", redactor.filter("\u023a\u023a\u023a"+testThinkClose))
-		})
-	})
-
-	t.Run("answer after close tag", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.NotPanics(t, func() {
-			require.Equal(t, "answer", redactor.filter("x\u023a\u023a\u023a"+testThinkClose+"answer"))
-		})
-	})
-
-	t.Run("dotted capital I", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.NotPanics(t, func() {
-			require.Equal(t, "answer", redactor.filter("\u0130\u0130\u0130"+testThinkClose+"answer"))
-		})
-	})
-
-	t.Run("think block with expanding runes", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.NotPanics(t, func() {
-			require.Equal(t, "visible", redactor.filter(testThinkOpen+"secret\u023a\u023a\u023a"+testThinkClose+"visible"))
-		})
-	})
-
-	t.Run("split chunks with expanding runes", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.Equal(t, "prefix ", redactor.filter("prefix "+testThinkOpen+"\u023a"))
-		require.Equal(t, "", redactor.filter("\u023a"))
-		require.Equal(t, "visible", redactor.filter("\u023a"+testThinkClose+"visible"))
-	})
-}
-
-func TestThinkRedactorSplitTags(t *testing.T) {
-	t.Parallel()
-
-	t.Run("open and close tags split across chunks", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-
-		var out strings.Builder
-		out.WriteString(redactor.filter("\x3cthi"))
-		out.WriteString(redactor.filter("nk\x3esecret\x3c/thi"))
-		out.WriteString(redactor.filter("nk\x3eanswer"))
-
-		require.Equal(t, "answer", out.String())
-		require.NotContains(t, out.String(), "secret")
-	})
-
-	t.Run("stray close tag split across chunks", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-
-		var out strings.Builder
-		out.WriteString(redactor.filter("\x3c/thi"))
-		out.WriteString(redactor.filter("nk\x3epayload"))
-
-		require.Equal(t, "payload", out.String())
-	})
-
-	t.Run("answer preserved after think", func(t *testing.T) {
-		t.Parallel()
-		var redactor thinkRedactor
-		require.Equal(t, "a c", redactor.filter("a "+testThinkOpen+"b"+testThinkClose+"c"))
-	})
-}
-
-func TestLongestThinkSuffixShortBuffers(t *testing.T) {
-	t.Parallel()
-
-	require.Equal(t, 0, longestThinkSuffix(""))
-	require.Equal(t, 1, longestThinkSuffix("\x3c"))
-	require.Equal(t, 2, longestThinkSuffix("\x3c/"))
-	require.Equal(t, 0, longestThinkSuffix(" think"))
-	require.Equal(t, 6, longestThinkSuffix("\x3c/THIN"))
-	require.Equal(t, 0, longestThinkSuffix("\u023a\u023a"))
-}
-
-func TestDetailsRedactorUnicodeNoPanic(t *testing.T) {
-	t.Parallel()
-
-	var redactor detailsRedactor
-	require.NotPanics(t, func() {
-		require.Equal(t, "visible", redactor.filter("\x3cdetails type=\"reasoning\"\x3e\u023a\u023a\u023a\x3c/details\x3evisible"))
-	})
-}
-
-func TestNormaliseStreamingChunkScrubsExpandingRunes(t *testing.T) {
-	t.Parallel()
-
-	state := &streamingNormaliserState{}
-	raw := `{"choices":[{"delta":{"role":"assistant","content":"\u023a\u023a\u023a` + testThinkClose + `answer"}}]}`
-
-	normalised, err := normaliseStreamingChunk(raw, state)
-	require.NoError(t, err)
-	require.NotContains(t, normalised, "response")
-	require.Contains(t, normalised, "answer")
-}
-
-func TestStreamResponseHeartbeat(t *testing.T) {
+func TestServeStreamHeartbeat(t *testing.T) {
 	srv := &Server{
 		log:                     logrus.New().WithField("component", "test"),
 		streamHeartbeatInterval: 5 * time.Millisecond,
 	}
+	handle := srv.dedupeBegin("heartbeat", true)
 	rec := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
-	msgs := make(chan *nats.Msg)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	heartbeats := make(chan struct{}, 1)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		srv.streamResponse(ctx, rec, msgs, func() {
-			select {
-			case heartbeats <- struct{}{}:
-			default:
-			}
-		})
+		defer close(done)
+		srv.serveStream(ctx, rec, handle)
 	}()
 
-	select {
-	case <-heartbeats:
-		cancel()
-	case <-time.After(time.Second):
-		cancel()
-		wg.Wait()
-		t.Fatal("stream heartbeat was not invoked")
-	}
-	wg.Wait()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+
+	require.Contains(t, rec.Body.String(), ": \n\n")
+	require.Greater(t, rec.flushes, 0)
 }

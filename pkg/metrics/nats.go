@@ -149,6 +149,52 @@ var (
 		[]string{"method", "path"},
 	)
 
+	// IngressDedupTotal tracks ingress request coalescing outcomes
+	// (miss, attach, cache_hit, rejected).
+	IngressDedupTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "ingress",
+			Name:      "dedup_total",
+			Help:      "Ingress request coalescing outcomes",
+		},
+		[]string{"result"},
+	)
+
+	// IngressDedupWaiters tracks the number of waiters attached to a deduped
+	// request when the request joins or creates an entry.
+	IngressDedupWaiters = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "koldun",
+			Subsystem: "ingress",
+			Name:      "dedup_waiters",
+			Help:      "Waiters attached to a deduped ingress entry",
+			Buckets:   []float64{0, 1, 2, 3, 4, 8, 16, 32},
+		},
+	)
+
+	// IngressDedupReplayBytesTotal tracks bytes replayed from an in-flight
+	// buffer or a cached result.
+	IngressDedupReplayBytesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "koldun",
+			Subsystem: "ingress",
+			Name:      "dedup_replay_bytes_total",
+			Help:      "Bytes replayed from ingress dedupe buffers",
+		},
+	)
+
+	// IngressDedupEntries tracks entries currently held by the dedupe
+	// coordinator (in-flight and cached).
+	IngressDedupEntries = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "koldun",
+			Subsystem: "ingress",
+			Name:      "dedup_entries",
+			Help:      "Entries held by the ingress dedupe coordinator",
+		},
+	)
+
 	// LLMRequestsActive tracks active LLM requests
 	LLMRequestsActive = promauto.NewGauge(
 		prometheus.GaugeOpts{
