@@ -161,8 +161,8 @@ var (
 		[]string{"result"},
 	)
 
-	// IngressDedupWaiters tracks the number of waiters attached to a deduped
-	// request when the request joins or creates an entry.
+	// IngressDedupWaiters tracks how many waiters were already attached to an
+	// in-flight entry when a retry joined it (attach outcomes only).
 	IngressDedupWaiters = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "koldun",

@@ -26,6 +26,11 @@ import (
 // ingress is ever scaled out, this cache becomes per-replica and both
 // coalescing and cache hits only apply to requests that land on the same pod
 // (the cache key is still tenant-safe, so misses are the only consequence).
+//
+// Tenant caveat: the key includes the existing conversation hash, which is
+// scoped by the authenticated principal. With AllowAnonymous enabled there is
+// no principal, so two callers that share the same stable chat headers and
+// model are already the same conversation and will also coalesce.
 
 const (
 	defaultDedupeTTL        = 10 * time.Minute
@@ -160,6 +165,9 @@ type dedupeCoordinator struct {
 	entries map[string]*dedupeEntry
 	lru     *list.List // front = most recently used cached entry
 
+	// cachedCount/cachedBytes are bounded by maxEntries/maxBytes. In-flight
+	// entries are deliberately exempt from maxEntries: they are bounded by
+	// request concurrency, maxWaiters per entry and the global byte budget.
 	cachedCount   int
 	cachedBytes   int64
 	inflightBytes int64
@@ -411,6 +419,9 @@ func (c *dedupeCoordinator) complete(entry *dedupeEntry, cacheable bool) {
 
 	onTerminal := entry.onTerminal
 
+	// A stream that produced no chunks is not a useful replay: do not cache it
+	// (an immediate retry should enqueue instead of replaying an empty SSE).
+	cacheable = cacheable && !(entry.stream && entry.bufferBytes == 0)
 	if cacheable && entry.cacheable && !entry.truncated {
 		c.inflightBytes -= entry.bufferBytes
 		if c.inflightBytes < 0 {

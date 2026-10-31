@@ -587,3 +587,307 @@ func TestHandleChatCompletionsDigestErrorReturns400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	require.Contains(t, rec.Body.String(), "invalid chat completion payload")
 }
+
+func TestDedupeNilHandleIsSafe(t *testing.T) {
+	t.Parallel()
+
+	var handle *dedupeHandle
+	require.Equal(t, dedupeRejected, handle.Kind())
+	require.Nil(t, handle.Snapshot())
+	require.Nil(t, handle.Events())
+	require.Nil(t, handle.Dropped())
+	require.Nil(t, handle.Done())
+	require.NoError(t, handle.TerminalError())
+	require.Empty(t, handle.KeyPrefix())
+	require.Zero(t, handle.EntryAge())
+	require.Zero(t, handle.BufferBytes())
+	require.Zero(t, handle.Waiters())
+	require.False(t, handle.dedupeStream())
+
+	handle.Publish("chunk")
+	handle.Complete()
+	handle.CompleteUncached()
+	handle.Fail(errors.New("boom"))
+	handle.Close()
+	handle.SetOnTerminal(nil)
+}
+
+func TestDedupeCoordinatorNilAndTerminalGuards(t *testing.T) {
+	t.Parallel()
+
+	coord := newDedupeCoordinator(time.Minute, 16, 1<<20, 4)
+	coord.publish(nil, "chunk")
+	coord.complete(nil, true)
+	coord.fail(nil, errors.New("boom"))
+
+	owner := coord.begin("terminal-guards", true)
+	owner.Publish("chunk")
+	owner.Complete()
+
+	// Publishing, completing and failing after the terminal transition are
+	// no-ops, and SetOnTerminal still runs.
+	owner.Publish("after")
+	owner.Complete()
+	owner.Fail(errors.New("after"))
+	called := false
+	owner.SetOnTerminal(func() { called = true })
+	require.True(t, called)
+
+	failed := coord.begin("fail-twice", false)
+	failed.Fail(errors.New("first"))
+	failed.Fail(errors.New("second"))
+}
+
+func TestDedupeJSONReserveAndOversize(t *testing.T) {
+	t.Parallel()
+
+	// In-flight bytes exceed the budget: the JSON body cannot be buffered.
+	coord := newDedupeCoordinator(time.Minute, 16, 4, 4)
+	owner := coord.begin("json-budget", false)
+	owner.Publish("12345")
+	require.Equal(t, dedupeRejected, coord.begin("json-budget", false).Kind())
+
+	// A body over the per-entry cap completes but is not cached.
+	bigCoord := newDedupeCoordinator(time.Minute, 16, 1<<24, 4)
+	big := bigCoord.begin("json-big", false)
+	big.Publish(strings.Repeat("x", dedupeJSONBodyBytes+1))
+	big.Complete()
+	require.Equal(t, dedupeMiss, bigCoord.begin("json-big", false).Kind())
+}
+
+func TestRequestDedupeKeyPropagatesDigestError(t *testing.T) {
+	t.Parallel()
+
+	_, err := requestDedupeKey("conversation", []byte("not-json"))
+	require.Error(t, err)
+}
+
+func TestDedupeZeroContentStreamNotCached(t *testing.T) {
+	t.Parallel()
+
+	coord := newDedupeCoordinator(time.Minute, 16, 1<<20, 4)
+	owner := coord.begin("empty-stream", true)
+	owner.Complete()
+	require.Equal(t, dedupeMiss, coord.begin("empty-stream", true).Kind())
+}
+
+func TestPumpResponseRecoversPanic(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	handle := srv.dedupeBegin("pump-panic", false)
+	msgs := make(chan *nats.Msg, 1)
+	_, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer srv.finishPump(handle, nil, msgs, cancel)
+		panic("boom")
+	}()
+	<-done
+
+	require.ErrorContains(t, handle.TerminalError(), "response pump panic")
+}
+
+func TestPumpStreamDeadlineAndHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log:                     logrus.New().WithField("component", "test"),
+		streamHeartbeatInterval: time.Millisecond,
+	}
+	handle := srv.dedupeBegin("pump-stream-deadline", true)
+	msgs := make(chan *nats.Msg, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.pumpStream(ctx, handle, "hash", msgs)
+	}()
+	<-done
+
+	require.ErrorIs(t, handle.TerminalError(), context.DeadlineExceeded)
+}
+
+func TestPumpStreamEmptyLineAndEmptyDelta(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log:                     logrus.New().WithField("component", "test"),
+		streamHeartbeatInterval: time.Millisecond,
+	}
+	handle := srv.dedupeBegin("pump-stream-empty", true)
+	msgs := make(chan *nats.Msg, 3)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	msgs <- &nats.Msg{Data: []byte("   ")}
+	msgs <- &nats.Msg{Data: []byte(`{"choices":[{"delta":{}}]}`)}
+	msgs <- &nats.Msg{Data: []byte("[DONE]")}
+	srv.pumpStream(ctx, handle, "hash", msgs)
+
+	// No content chunks were produced, so the entry is not cached.
+	require.Equal(t, dedupeMiss, srv.dedupeBegin("pump-stream-empty", true).Kind())
+}
+
+func TestPumpJSONDeadlineAndEmptyLine(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{
+		log:                     logrus.New().WithField("component", "test"),
+		streamHeartbeatInterval: time.Millisecond,
+	}
+	handle := srv.dedupeBegin("pump-json-deadline", false)
+	msgs := make(chan *nats.Msg, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.pumpJSON(ctx, handle, "hash", msgs)
+	}()
+	<-done
+	require.ErrorIs(t, handle.TerminalError(), context.DeadlineExceeded)
+
+	emptyLine := srv.dedupeBegin("pump-json-empty-line", false)
+	bodyMsgs := make(chan *nats.Msg, 2)
+	bodyCtx, bodyCancel := context.WithCancel(context.Background())
+	defer bodyCancel()
+	go func() {
+		bodyMsgs <- &nats.Msg{Data: []byte("   ")}
+		bodyMsgs <- &nats.Msg{Data: []byte(`{"object":"chat.completion"}`)}
+	}()
+	srv.pumpJSON(bodyCtx, emptyLine, "hash", bodyMsgs)
+	require.Equal(t, dedupeCacheHit, srv.dedupeBegin("pump-json-empty-line", false).Kind())
+}
+
+func TestServeJSONCacheHitEmptySnapshot(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-empty-hit", false)
+	owner.Complete()
+
+	hit := srv.dedupeBegin("json-empty-hit", false)
+	require.Equal(t, dedupeCacheHit, hit.Kind())
+	require.Empty(t, hit.Snapshot())
+
+	rec := newSyncRecorder()
+	srv.serveJSON(context.Background(), rec, hit)
+	require.Equal(t, http.StatusBadGateway, rec.statusCode())
+}
+
+func TestServeJSONAttachSnapshotBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-attach-body", false)
+	payload := `{"object":"chat.completion","choices":[]}`
+	owner.Publish(payload)
+
+	attach := srv.dedupeBegin("json-attach-body", false)
+	require.Equal(t, dedupeAttach, attach.Kind())
+	require.Equal(t, []string{payload}, attach.Snapshot())
+	owner.Complete()
+
+	rec := newSyncRecorder()
+	srv.serveJSON(context.Background(), rec, attach)
+	require.Equal(t, http.StatusOK, rec.statusCode())
+	require.Equal(t, payload, rec.bodyString())
+}
+
+func TestServeJSONContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-context", false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rec := newSyncRecorder()
+	srv.serveJSON(ctx, rec, owner)
+	require.Equal(t, http.StatusGatewayTimeout, rec.statusCode())
+	owner.CompleteUncached()
+}
+
+func TestServeJSONTerminalErrorWithoutBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-boom", false)
+	owner.Fail(errors.New("boom"))
+
+	rec := newSyncRecorder()
+	srv.serveJSON(context.Background(), rec, owner)
+	require.Equal(t, http.StatusBadGateway, rec.statusCode())
+}
+
+func TestServeJSONEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-empty-body", false)
+	owner.CompleteUncached()
+
+	rec := newSyncRecorder()
+	srv.serveJSON(context.Background(), rec, owner)
+	require.Equal(t, http.StatusBadGateway, rec.statusCode())
+}
+
+func TestServeJSONDroppedWaiter(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+	owner := srv.dedupeBegin("json-dropped", false)
+	_ = srv.dedupeBegin("json-dropped", false)
+	attach := srv.dedupeBegin("json-dropped", false)
+
+	for i := 0; i < dedupeWaiterBuffer; i++ {
+		owner.Publish("chunk")
+	}
+	owner.Publish("overflow")
+
+	rec := newSyncRecorder()
+	srv.serveJSON(context.Background(), rec, attach)
+	require.Equal(t, http.StatusBadGateway, rec.statusCode())
+	owner.Fail(errors.New("cleanup"))
+}
+
+func TestDrainJSONBody(t *testing.T) {
+	t.Parallel()
+
+	events := make(chan string, 1)
+	events <- `{"object":"chat.completion"}`
+	var body string
+	drainJSONBody(events, &body)
+	require.Equal(t, `{"object":"chat.completion"}`, body)
+}
+
+func TestServeStreamEmptyChunkAndEmptyError(t *testing.T) {
+	t.Parallel()
+
+	srv := &Server{log: logrus.New().WithField("component", "test")}
+
+	emptyChunk := srv.dedupeBegin("stream-empty-chunk", true)
+	emptyChunk.Publish("")
+	emptyChunk.Complete()
+	rec := newSyncRecorder()
+	srv.serveStream(context.Background(), rec, emptyChunk)
+	require.Contains(t, rec.bodyString(), "data: \n\n")
+	require.Contains(t, rec.bodyString(), "data: [DONE]")
+
+	emptyError := srv.dedupeBegin("stream-empty-error", true)
+	emptyError.Fail(errors.New(""))
+	errorRec := newSyncRecorder()
+	srv.serveStream(context.Background(), errorRec, emptyError)
+	require.Contains(t, errorRec.bodyString(), "stream cancelled")
+	require.Contains(t, errorRec.bodyString(), "data: [DONE]")
+}

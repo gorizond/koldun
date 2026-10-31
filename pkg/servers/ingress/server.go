@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -810,7 +811,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	handle.SetOnTerminal(func() {
 		s.touchConversationActivity(hash, time.Now())
 		remaining := s.decrementSessionLoad(hash)
-		if _, err := s.ensureConversation(context.Background(), hash, model, remaining); err != nil {
+
+		timeout := s.cfg.ResponseTimeout
+		if timeout <= 0 {
+			timeout = 2 * time.Minute
+		}
+		updateCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if _, err := s.ensureConversation(updateCtx, hash, model, remaining); err != nil {
 			s.log.WithError(err).Warn("update conversation record after completion")
 		}
 	})
@@ -1688,7 +1696,10 @@ func (s *Server) serveStream(ctx context.Context, w http.ResponseWriter, handle 
 func drainStreamChunks(events <-chan string, write func(string)) {
 	for {
 		select {
-		case payload := <-events:
+		case payload, ok := <-events:
+			if !ok {
+				return
+			}
 			write(payload)
 		default:
 			return
@@ -1757,7 +1768,10 @@ func (s *Server) serveJSON(ctx context.Context, w http.ResponseWriter, handle *d
 func drainJSONBody(events <-chan string, body *string) {
 	for {
 		select {
-		case payload := <-events:
+		case payload, ok := <-events:
+			if !ok {
+				return
+			}
 			*body = payload
 		default:
 			return
@@ -1781,25 +1795,30 @@ func writeJSONPayload(w http.ResponseWriter, body []byte) {
 // is detached from the HTTP handler so a client disconnect never cancels the
 // upstream generation: the pump keeps feeding waiters and the short cache.
 func (s *Server) pumpResponse(ctx context.Context, cancel context.CancelFunc, handle *dedupeHandle, hash string, msgs chan *nats.Msg, sub *nats.Subscription) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			if s.log != nil {
-				s.log.WithField("panic", recovered).Error("response pump panic")
-			}
-			handle.Fail(fmt.Errorf("response pump panic: %v", recovered))
-		}
-		if sub != nil {
-			_ = sub.Unsubscribe()
-		}
-		close(msgs)
-		cancel()
-	}()
+	defer s.finishPump(handle, sub, msgs, cancel)
 
 	if handle.dedupeStream() {
 		s.pumpStream(ctx, handle, hash, msgs)
 		return
 	}
 	s.pumpJSON(ctx, handle, hash, msgs)
+}
+
+// finishPump releases the subscription and channel even when the pump panics.
+// A panic fails the entry so attached waiters receive an explicit terminal
+// frame instead of hanging.
+func (s *Server) finishPump(handle *dedupeHandle, sub *nats.Subscription, msgs chan *nats.Msg, cancel context.CancelFunc) {
+	if recovered := recover(); recovered != nil {
+		if s.log != nil {
+			s.log.WithField("panic", recovered).Error("response pump panic")
+		}
+		handle.Fail(fmt.Errorf("response pump panic: %v", recovered))
+	}
+	if sub != nil {
+		_ = sub.Unsubscribe()
+	}
+	close(msgs)
+	cancel()
 }
 
 // startActivityHeartbeat refreshes conversation activity off the chunk path.
@@ -1901,7 +1920,7 @@ func (s *Server) pumpJSON(ctx context.Context, handle *dedupeHandle, hash string
 				continue
 			}
 			handle.Publish(line)
-			if errorResponseStatus([]byte(line)) != 0 || hasErrorField([]byte(line)) {
+			if hasErrorField([]byte(line)) {
 				handle.CompleteUncached()
 				return
 			}
@@ -2405,6 +2424,11 @@ func isEmptyDeltaChunk(payload string) bool {
 
 // hasErrorField reports whether the JSON object carries a non-empty error.
 func hasErrorField(raw []byte) bool {
+	// Most chunks have no error field at all; skip the JSON decode entirely
+	// instead of paying it in normalise, empty-delta and terminal checks.
+	if !bytes.Contains(raw, []byte(`"error"`)) {
+		return false
+	}
 	var envelope struct {
 		Error json.RawMessage `json:"error"`
 	}
