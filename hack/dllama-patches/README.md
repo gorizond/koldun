@@ -1,13 +1,24 @@
 # distributed-llama patches
 
-`Dockerfile` clones upstream `b4rtaz/distributed-llama` at `DL_VERSION`
-(currently v0.16.5) and applies `*.patch` from this directory.
+`Dockerfile` builds dllama from the fork `gorizond/distributed-llama`, pinned by
+the annotated tag `v0.16.5-koldun.2` (commit `f462749`). That tag already
+contains both patches below, so the `Dockerfile` no longer clones upstream or
+applies `*.patch`. This directory is kept as the source of truth for the patches
+and their history.
 
 - `0001-worker-readiness-and-http-resilience.patch`:
   - worker writes `$DLLAMA_READY_FILE` after `weightReader.read()` (and removes
     it on reload), backing the Kubernetes readiness probe;
   - `dllama-api` catches HTTP client exceptions, answers 503 and keeps serving;
   - HTTP client sockets get a 20m (configurable) `SO_RCVTIMEO`.
+- `0002-progress-logging.patch`:
+  - `dllama-api` logs prefill and generation progress with elapsed time and
+    tok/s, so long prompts/answers are observable;
+  - env-gated: `DLLAMA_PROGRESS_EVERY` (prefill, tokens) and
+    `DLLAMA_GEN_PROGRESS_EVERY` (generation, tokens); `0`/unset disables each.
+
+Both patches are already in fork tag `v0.16.5-koldun.2`, so the `Dockerfile`
+does not apply them.
 
 When bumping `DL_VERSION`, re-apply the patches to a clean upstream checkout,
 resolve conflicts, and regenerate:

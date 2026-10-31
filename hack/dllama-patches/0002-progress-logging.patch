@@ -1,0 +1,96 @@
+diff --git a/src/dllama-api.cpp b/src/dllama-api.cpp
+index 712ce10..9a3ee5f 100644
+--- a/src/dllama-api.cpp
++++ b/src/dllama-api.cpp
+@@ -411,6 +411,18 @@ public:
+     }
+ };
+ 
++// Reads a positive token cadence from the environment; 0 (disabled) when unset or invalid.
++static unsigned long long readProgressEvery(const char *name) {
++    const char *raw = std::getenv(name);
++    if (raw == nullptr)
++        return 0;
++    char *end = nullptr;
++    long long value = std::strtoll(raw, &end, 10);
++    if (end == raw || value <= 0)
++        return 0;
++    return (unsigned long long)value;
++}
++
+ class ApiServer {
+ private:
+     RootLlmInference *inference;
+@@ -485,6 +497,13 @@ public:
+ 
+         NnUint pos = startPos;
+         int token;
++
++        const unsigned long long prefillEvery = readProgressEvery("DLLAMA_PROGRESS_EVERY");
++        const unsigned long long genEvery = readProgressEvery("DLLAMA_GEN_PROGRESS_EVERY");
++        const unsigned long long prefillTotal = (unsigned long long)(promptEndPos - startPos);
++        const std::chrono::steady_clock::time_point prefillStart = std::chrono::steady_clock::now();
++        unsigned long long prefillBucket = 0;
++
+         for (NnUint i = 0; ;) {
+             long remainingTokens = promptEndPos - pos;
+             if (remainingTokens <= 0)
+@@ -504,12 +523,34 @@ public:
+             i += batchSize;
+             pos += batchSize;
+             token = promptTokens[i + 1];
++
++            if (prefillEvery > 0) {
++                unsigned long long bucket = (unsigned long long)i / prefillEvery;
++                if (bucket != prefillBucket) {
++                    prefillBucket = bucket;
++                    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefillStart).count();
++                    double rate = elapsed > 0.0 ? (double)i / elapsed : 0.0;
++                    printf("⏳ prefill %u/%llu pos=%u elapsed=%.3fs %.1f tok/s\n",
++                        (unsigned)i, prefillTotal, (unsigned)pos, elapsed, rate);
++                    fflush(stdout);
++                }
++            }
++        }
++
++        if (prefillEvery > 0) {
++            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - prefillStart).count();
++            double rate = elapsed > 0.0 ? (double)prefillTotal / elapsed : 0.0;
++            printf("⏳ prefill done: %llu tokens in %.3fs (%.1f tok/s)\n", prefillTotal, elapsed, rate);
++            fflush(stdout);
+         }
+ 
+         inference->setBatchSize(1);
+         tokenizer->resetDecoder();
+         eosDetector->reset();
+ 
++        const std::chrono::steady_clock::time_point genStart = std::chrono::steady_clock::now();
++        unsigned long long genCount = 0;
++
+         for (; pos < maxPredPos;) {
+             inference->setPosition(pos);
+             inference->setToken(0, token);
+@@ -536,9 +577,23 @@ public:
+                 eosDetector->reset();
+             }
+             pos++;
++            genCount++;
++            if (genEvery > 0 && genCount % genEvery == 0) {
++                double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - genStart).count();
++                double rate = elapsed > 0.0 ? (double)genCount / elapsed : 0.0;
++                printf("⏱ gen %llu tokens elapsed=%.3fs %.1f tok/s\n", genCount, elapsed, rate);
++                fflush(stdout);
++            }
+             if (eosType == EOS) break;
+         }
+ 
++        if (genEvery > 0) {
++            double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - genStart).count();
++            double rate = elapsed > 0.0 ? (double)genCount / elapsed : 0.0;
++            printf("⏱ gen done: %llu tokens in %.3fs (%.1f tok/s)\n", genCount, elapsed, rate);
++            fflush(stdout);
++        }
++
+         ChatMessage reply("assistant", buffer);
+         if (pos == header->seqLen) {
+             naiveCache.clear();

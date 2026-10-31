@@ -1,5 +1,5 @@
-ARG DL_REPOSITORY=https://github.com/b4rtaz/distributed-llama.git
-ARG DL_VERSION=v0.16.5
+ARG DL_REPOSITORY=https://github.com/gorizond/distributed-llama.git
+ARG DL_VERSION=v0.16.5-koldun.2
 
 FROM alpine:3.20 AS dllama-builder
 ARG TARGETARCH
@@ -7,9 +7,7 @@ ARG DL_REPOSITORY
 ARG DL_VERSION
 RUN apk add --no-cache git make build-base
 WORKDIR /src
-COPY hack/dllama-patches /tmp/dllama-patches
-RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" . && \
-    git apply /tmp/dllama-patches/*.patch
+RUN git clone --depth 1 --branch "${DL_VERSION}" "${DL_REPOSITORY}" .
 RUN if [ "${TARGETARCH}" = "amd64" ]; then \
       sed -i 's/-march=native -mtune=native/-march=x86-64-v3 -mno-abm -mtune=generic/' Makefile; \
     fi && \
