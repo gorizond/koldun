@@ -16,9 +16,13 @@ nats:
     cluster:
       enabled: false
 
-# Enable MinIO subchart
+# MinIO subchart. Disabled here because credentials must never be committed:
+# hack/dev-values.sh generates a temporary values file with random credentials
+# and enables MinIO + the CSI S3 driver.
+#   helm install koldun charts/koldun -n koldun \
+#     -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
 minio:
-  enabled: true
+  enabled: false
   mode: standalone
   replicas: 1
   persistence:
@@ -27,9 +31,6 @@ minio:
     requests:
       cpu: 50m
       memory: 256Mi
-  # Local development only. Override these for any shared environment.
-  rootUser: "koldun-dev"
-  rootPassword: "koldun-dev-local"
   buckets:
     - name: koldun-models
       policy: none
@@ -50,13 +51,11 @@ operator:
   health:
     port: 8080
 
-# Enable CSI S3 driver for model conversion
+# CSI S3 driver for model conversion. Enabled (with credentials) by
+# hack/dev-values.sh; the credentials live under csi-s3.secret.*.
 csi-s3:
-  enabled: true
+  enabled: false
   storageClass:
     name: csi-s3
     singleBucket: koldun-models
     mounter: geesefs
-    endpoint: "http://koldun-minio:9000"
-    accessKey: "koldun-dev"
-    secretKey: "koldun-dev-local"

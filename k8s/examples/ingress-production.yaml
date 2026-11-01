@@ -18,7 +18,7 @@ spec:
 
     # NATS configuration (update with your cluster)
     nats:
-      url: nats://koldun:k0ldun@nats.koldun.svc:4222
+      url: nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.koldun.svc:4222
       kvBucket: koldun_ttl
       modelsBucket: koldun_models
       tokensBucket: koldun_tokens
