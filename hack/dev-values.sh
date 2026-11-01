@@ -37,4 +37,7 @@ csi-s3:
     endpoint: "http://koldun-minio:9000"
 EOF
 
+# umask only applies when the file is created; enforce it for reused paths too.
+chmod 600 "$OUT_FILE"
+
 echo "$OUT_FILE"

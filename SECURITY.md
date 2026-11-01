@@ -47,6 +47,8 @@ The following files intentionally contain fixed, low-entropy credentials:
 
 They exist to boot a loopback-only compose stack (`127.0.0.1`) for integration
 tests. They are **non-production**: never deployed to a cluster, never referenced
-by the Helm chart, `k8s/` manifests or release workflows, and are excluded from
-the SC-013 credential scan. Production values and manifests carry no default
+by the Helm chart, `k8s/` manifests or release workflows. They are excluded
+from the credential acceptance check, which greps the tree for
+`minioadmin`, `passw0rd`, `changeme`, `k0ldun` and for credentialed NATS URLs
+that do not point at loopback. Production values and manifests carry no default
 credentials — only placeholders or values supplied at install time.

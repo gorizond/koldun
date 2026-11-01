@@ -255,12 +255,17 @@ if ! helm test "$RELEASE_NAME" \
     --namespace "$NAMESPACE" \
     --filter "name=${RBAC_NAME}" \
     --filter "name=${FULLNAME}-test-crds" \
-    --timeout 300s \
-    --logs; then
+    --timeout 300s; then
     err "helm test failed"
     kubectl get pods -n "$NAMESPACE" -o wide || true
+    # The pod is kept (hook-delete-policy before-hook-creation), so its logs
+    # are still available for diagnosis.
+    kubectl logs -n "$NAMESPACE" "${FULLNAME}-test-crds" --tail=-1 || true
     exit 1
 fi
+# --logs would make Helm call GetPodLogs for every selected hook, including the
+# RBAC objects, so dump the pod log ourselves.
+kubectl logs -n "$NAMESPACE" "${FULLNAME}-test-crds" --tail=-1 || true
 log "helm test passed"
 
 if [[ "$SKIP_OPERATOR" != "true" ]]; then

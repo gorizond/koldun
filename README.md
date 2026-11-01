@@ -212,6 +212,8 @@ kubectl get pods -n koldun
 > `helm uninstall` leaves them (and every CR) in place. Reinstalling under a
 > different release name therefore needs `helm install ... --take-ownership`,
 > otherwise Helm refuses to adopt resources it did not create.
+> `--take-ownership` requires **Helm >= 3.17**; the repo CI still pins 3.14, so
+> reinstall under the same release name there, or upgrade the local Helm first.
 
 ### E2E Test Flow (Proven Working)
 
