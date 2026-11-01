@@ -1293,7 +1293,7 @@ func TestWorkerContainer(t *testing.T) {
 				require.Len(t, container.Env, 3)
 				require.Equal(t, "DLLAMA_ROLE", container.Env[0].Name)
 				require.Equal(t, "worker", container.Env[0].Value)
-				require.Equal(t, "64", envVarValue(container.Env, "DLLAMA_N_BATCHES").Value)
+				require.Equal(t, "128", envVarValue(container.Env, "DLLAMA_N_BATCHES").Value)
 				require.Len(t, container.Ports, 1)
 				require.Equal(t, int32(9999), container.Ports[0].ContainerPort)
 				require.Empty(t, container.Resources.Requests)

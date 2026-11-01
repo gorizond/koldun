@@ -316,8 +316,8 @@ func (h *workerHandler) workerContainer(worker *v1.Worker, threads int32, resour
 
 	env := []corev1.EnvVar{
 		{Name: "DLLAMA_ROLE", Value: "worker"},
-		// Experiment: prefill batch 64 (fork patch 0004; default 32).
-		{Name: "DLLAMA_N_BATCHES", Value: "64"},
+		// Experiment: prefill batch 128 (fork patch 0004; default 32).
+		{Name: "DLLAMA_N_BATCHES", Value: "128"},
 	}
 
 	if worker.Spec.CacheSpec != nil {
