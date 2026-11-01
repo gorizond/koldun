@@ -258,6 +258,8 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	} else {
 		root.Spec.NThreads = 1
 	}
+	// Prefill batch size from Ingress CR; 0 keeps the dllama default (32).
+	root.Spec.NBatches = h.getIngressNBatches(dllama)
 	root.Spec.SidecarTimeout = h.getIngressSidecarTimeout(dllama)
 	// The context window belongs to the model, not to whichever Ingress
 	// happened to be listed first.
@@ -412,6 +414,35 @@ func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float
 		}
 	}
 	return nil
+}
+
+// getIngressNBatches retrieves the NBatches (prefill batch size) value from Ingress CR.
+// It first checks ingresses in the same namespace, then falls back to cluster-wide.
+// Returns 0 if no Ingress has NBatches configured (use dllama default).
+func (h *dllamaHandler) getIngressNBatches(dllama *v1.Dllama) int32 {
+	if h.ingresses == nil {
+		return 0
+	}
+	lookup := func(ings []*v1.Ingress) int32 {
+		for _, ing := range ings {
+			if ing.Spec.Backend.NBatches > 0 {
+				return ing.Spec.Backend.NBatches
+			}
+		}
+		return 0
+	}
+
+	if ingresses, err := h.cachedIngresses(dllama.Namespace); err == nil {
+		if v := lookup(ingresses); v > 0 {
+			return v
+		}
+	}
+	if allIngresses, err := h.cachedIngresses(""); err == nil {
+		if v := lookup(allIngresses); v > 0 {
+			return v
+		}
+	}
+	return 0
 }
 
 // getIngressNThreads retrieves the NThreads value from Ingress CR.

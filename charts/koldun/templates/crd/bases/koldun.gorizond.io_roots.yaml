@@ -91,6 +91,12 @@ spec:
                 type: object
               modelRef:
                 type: string
+              nBatches:
+                description: |-
+                  NBatches configures the dllama prefill batch size (DLLAMA_N_BATCHES).
+                  Zero keeps the distributed-llama default (32).
+                format: int32
+                type: integer
               nThreads:
                 description: |-
                   NThreads configures the number of threads for dllama-api.

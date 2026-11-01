@@ -1153,6 +1153,40 @@ func TestDesiredRootInheritsIngressResponseTimeout(t *testing.T) {
 	require.Equal(t, 15*time.Minute, root.Spec.SidecarTimeout.Duration)
 }
 
+func TestDesiredRootInheritsIngressNBatches(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+	ingressCache.EXPECT().List("models", gomock.Any()).Return([]*v1.Ingress{{
+		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{NBatches: 128}},
+	}}, nil).AnyTimes()
+	ingressCache.EXPECT().List("", gomock.Any()).Return([]*v1.Ingress{}, nil).AnyTimes()
+
+	handler := &dllamaHandler{ingresses: ingressController}
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+		Spec: v1.DllamaSpec{
+			ModelRef:    v1.ModelReference{Kind: "Model", Name: "demo-model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+		},
+	}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-model", Namespace: "models"},
+		Status:     v1.ModelStatus{OutputPVCName: "model-pvc"},
+	}
+
+	root := handler.desiredRoot(dllama, model)
+	require.Equal(t, int32(128), root.Spec.NBatches)
+
+	handler = &dllamaHandler{}
+	root = handler.desiredRoot(dllama, model)
+	require.Zero(t, root.Spec.NBatches, "no Ingress keeps the dllama default")
+}
+
 func TestDesiredRootLeavesSidecarTimeoutUnsetWithoutIngressValue(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
