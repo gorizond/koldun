@@ -177,20 +177,25 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Bump charts/koldun/fleet.yaml image tag
+      - name: Bump chart image references
         env:
           TAG: v0.0.${{ github.run_number }}
         run: |
           set -euo pipefail
+          # fleet.yaml drives the deployed image tag.
           sed -i -E "s|^([[:space:]]*tag: )v0\.0\.[0-9]+\$|\1${TAG}|" charts/koldun/fleet.yaml
           grep -qE "^[[:space:]]*tag: ${TAG}\$" charts/koldun/fleet.yaml \
             || { echo "fleet.yaml image tag was not updated to ${TAG}"; exit 1; }
-          if git diff --quiet -- charts/koldun/fleet.yaml; then
-            echo "Fleet image tag already at ${TAG}; nothing to commit."
+          # Chart.yaml appVersion is the default tag when image.tag is empty.
+          sed -i -E "s|^appVersion: .*\$|appVersion: \"${TAG}\"|" charts/koldun/Chart.yaml
+          grep -qF "appVersion: \"${TAG}\"" charts/koldun/Chart.yaml \
+            || { echo "Chart.yaml appVersion was not updated to ${TAG}"; exit 1; }
+          if git diff --quiet -- charts/koldun/fleet.yaml charts/koldun/Chart.yaml; then
+            echo "Image references already at ${TAG}; nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add charts/koldun/fleet.yaml
+          git add charts/koldun/fleet.yaml charts/koldun/Chart.yaml
           git commit -m "chore: bump koldun image to ${TAG} [skip ci]"
           git push

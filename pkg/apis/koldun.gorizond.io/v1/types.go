@@ -48,6 +48,7 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=dll
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
@@ -193,6 +194,7 @@ type DllamaList struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=mdl
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
@@ -294,6 +296,7 @@ type ModelList struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=rt
 
@@ -372,6 +375,7 @@ type RootList struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=wrk
 
@@ -890,6 +894,7 @@ func (in *WorkerList) DeepCopyObject() runtime.Object {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=sess
 
@@ -1175,6 +1180,7 @@ func (in *WorkerStatus) DeepCopy() *WorkerStatus {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:metadata:annotations=helm.sh/resource-policy=keep
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=ing
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`

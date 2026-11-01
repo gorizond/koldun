@@ -90,6 +90,8 @@ jobs:
           # Ephemeral per-run credentials for the throwaway k3d cluster.
           MINIO_ACCESS_KEY="koldun-ci-$(openssl rand -hex 8)"
           MINIO_SECRET_KEY="$(openssl rand -hex 24)"
+          echo "::add-mask::$MINIO_ACCESS_KEY"
+          echo "::add-mask::$MINIO_SECRET_KEY"
           echo "MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" >> "$GITHUB_ENV"
           echo "MINIO_SECRET_KEY=$MINIO_SECRET_KEY" >> "$GITHUB_ENV"
 
