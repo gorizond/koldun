@@ -28,7 +28,7 @@ def stream_completion(messages: List[Dict[str, str]]) -> str:
             try:
                 raw_line = raw_line_bytes.decode("utf-8")
             except UnicodeDecodeError:
-                print("[WARN] не удалось декодировать строку ответа")
+                print("[WARN] failed to decode response line")
                 continue
 
             if raw_line == "":
@@ -52,7 +52,7 @@ def stream_completion(messages: List[Dict[str, str]]) -> str:
             try:
                 payload = json.loads(data)
             except json.JSONDecodeError:
-                print(f"[WARN] не удалось разобрать JSON: {data}")
+                print(f"[WARN] failed to parse JSON: {data}")
                 continue
 
             for choice in payload.get("choices", []):
@@ -68,7 +68,7 @@ def stream_completion(messages: List[Dict[str, str]]) -> str:
 
 def chat_loop():
     messages: List[Dict[str, str]] = []
-    print("Введите сообщение. Команда /exit чтобы выйти.")
+    print("Enter a message. Use /exit to quit.")
 
     while True:
         try:

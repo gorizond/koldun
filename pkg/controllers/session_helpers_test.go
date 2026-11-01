@@ -75,7 +75,7 @@ func TestSanitizeIdentifier(t *testing.T) {
 		{name: "empty", in: "   ", want: ""},
 		{name: "alphanumeric", in: "Model-123", want: "Model-123"},
 		{name: "spaces and dots", in: "model name.v1", want: "model-name-v1"},
-		{name: "unicode fallback", in: "модель", want: strings.Repeat("-", len([]rune("модель")))},
+		{name: "unicode fallback", in: "モデルテスト", want: strings.Repeat("-", len([]rune("モデルテスト")))},
 		{name: "mixed punctuation", in: "a/b?c*d", want: "a-b-c-d"},
 		{name: "underscores preserved", in: "demo_value", want: "demo_value"},
 	}
