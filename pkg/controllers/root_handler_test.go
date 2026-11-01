@@ -664,7 +664,7 @@ func TestRootHandlerEnsureStatefulSetCreatesResources(t *testing.T) {
 	require.Equal(t, "root", rootContainer.Name)
 	require.Equal(t, "koldun-controller", sts.Spec.Template.Spec.ServiceAccountName)
 	require.Equal(t, "1200", envVarValue(rootContainer.Env, "DLLAMA_HTTP_READ_TIMEOUT_SECONDS").Value)
-	require.Equal(t, "64", envVarValue(rootContainer.Env, "DLLAMA_N_BATCHES").Value)
+	require.Nil(t, envVarValue(rootContainer.Env, "DLLAMA_N_BATCHES"), "nBatches is unset by default")
 	require.Contains(t, rootContainer.Args, "--workers")
 	require.Contains(t, rootContainer.Args, "mistral-workers-0.mistral-workers.models.svc.cluster.local:9999")
 	require.Equal(t, "llm", sts.Spec.Template.Spec.Containers[1].Name)
@@ -1787,6 +1787,18 @@ func TestRootWorkerPodsStartedEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, started)
 	})
+}
+
+func TestRootContainerNBatchesEnv(t *testing.T) {
+	handler := &rootHandler{}
+	root := &v1.Root{Spec: v1.RootSpec{Image: "ghcr.io/gorizond/root:latest"}}
+
+	container := handler.rootContainer(root, "model", "tokenizer", "q4_0", 1, nil, corev1.ResourceRequirements{})
+	require.Nil(t, envVarValue(container.Env, "DLLAMA_N_BATCHES"), "unset nBatches must leave the dllama default")
+
+	root.Spec.NBatches = 128
+	container = handler.rootContainer(root, "model", "tokenizer", "q4_0", 1, nil, corev1.ResourceRequirements{})
+	require.Equal(t, "128", envVarValue(container.Env, "DLLAMA_N_BATCHES").Value)
 }
 
 func TestRootContainerHTTPReadTimeoutTracksSidecarTimeout(t *testing.T) {
