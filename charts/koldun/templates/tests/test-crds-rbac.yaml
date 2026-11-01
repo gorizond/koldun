@@ -1,0 +1,56 @@
+{{- /*
+Test-scoped identity for the CRD test hook.
+
+The operator ServiceAccount has no cluster-level permissions, so the test pod
+cannot read CustomResourceDefinitions with it. These hook-scoped objects grant
+exactly what the test needs (read CRDs, list the Koldun resources) and are
+removed with the release.
+*/}}
+{{- $rbacName := include "koldun.testRBACName" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $rbacName }}
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $rbacName }}
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get"]
+  - apiGroups: ["koldun.gorizond.io"]
+    resources: ["models", "ingresses", "sessions"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $rbacName }}
+  labels:
+    {{- include "koldun.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $rbacName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $rbacName }}
+    namespace: {{ .Release.Namespace }}

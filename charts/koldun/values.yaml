@@ -214,9 +214,13 @@ minio:
     requests:
       cpu: 100m
       memory: 512Mi
-  # Default credentials (override in production!)
-  rootUser: "minioadmin"
-  rootPassword: "minioadmin"
+  # MinIO root credentials. No defaults on purpose: rendering fails when
+  # minio.enabled=true and neither these nor minio.existingSecret are set.
+  rootUser: ""
+  rootPassword: ""
+  # Reuse an existing Secret instead of letting the subchart create one.
+  # It must contain the rootUser and rootPassword keys.
+  existingSecret: ""
   buckets:
     - name: koldun-models
       policy: none
@@ -228,15 +232,19 @@ minio:
 # -------------------------------------------------------------------
 csi-s3:
   enabled: false
-  # S3 endpoint configuration (auto-configured when minio.enabled=true)
+  # The driver consumes credentials from csi-s3.secret.* (the subchart's own
+  # keys); the storage class only references that secret. Supply them when
+  # csi-s3.enabled=true, e.g.
+  #   --set csi-s3.secret.accessKey=... --set csi-s3.secret.secretKey=...
+  #   --set csi-s3.secret.endpoint=http://<release>-minio:9000
+  # endpoint is left at the subchart default (Yandex Object Storage) unless set.
+  secret:
+    accessKey: ""
+    secretKey: ""
   storageClass:
     name: csi-s3
     singleBucket: koldun-models
     mounter: geesefs
-    # Will be overridden by template if minio.enabled
-    endpoint: ""
-    accessKey: ""
-    secretKey: ""
 
 ingresses: []
 # Pair ingress resources with the dispatcher sample manifest in k8s/dispatcher-deploy.yaml
@@ -256,9 +264,9 @@ ingressDefaults:
 #   dispatcherMetricsListen: ":9090" # override per-ingress or set to "" to disable while leaving defaults intact.
 #   spec:
 #     backend:
-#       image: ghcr.io/gorizond/koldun:latest
-#       rootImage: ghcr.io/gorizond/koldun-root:latest
-#       workerImage: ghcr.io/gorizond/koldun-worker:latest
+#       image: ghcr.io/gorizond/koldun:v0.0.193
+#       rootImage: ghcr.io/gorizond/koldun-root:v0.0.193
+#       workerImage: ghcr.io/gorizond/koldun-worker:v0.0.193
 #       replicaPower: 3
 #       nats:
 #         url: nats://nats:4222

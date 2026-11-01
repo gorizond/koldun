@@ -1,0 +1,13 @@
+{{- /*
+Fail fast instead of rendering a broken release.
+
+MinIO credentials have no defaults on purpose (see SECURITY.md). When the
+subchart is enabled the caller must provide either rootUser/rootPassword or
+reference an existing secret via minio.existingSecret.
+*/}}
+{{- if .Values.minio.enabled }}
+{{- if not .Values.minio.existingSecret }}
+{{- $_ := required "minio.rootUser is required when minio.enabled=true (set minio.rootUser or minio.existingSecret)" .Values.minio.rootUser }}
+{{- $_ := required "minio.rootPassword is required when minio.enabled=true (set minio.rootPassword or minio.existingSecret)" .Values.minio.rootPassword }}
+{{- end }}
+{{- end }}

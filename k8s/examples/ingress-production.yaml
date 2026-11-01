@@ -8,17 +8,17 @@ metadata:
 spec:
   backend:
     # Production images from registry
-    image: ghcr.io/gorizond/koldun:latest
-    rootImage: ghcr.io/gorizond/koldun:latest
-    workerImage: ghcr.io/gorizond/koldun:latest
-    dispatcherImage: ghcr.io/gorizond/koldun:latest
+    image: ghcr.io/gorizond/koldun:v0.0.193
+    rootImage: ghcr.io/gorizond/koldun:v0.0.193
+    workerImage: ghcr.io/gorizond/koldun:v0.0.193
+    dispatcherImage: ghcr.io/gorizond/koldun:v0.0.193
 
     # replicaPower=2 means 4 workers (2^2=4)
     replicaPower: 2
 
     # NATS configuration (update with your cluster)
     nats:
-      url: nats://koldun:k0ldun@nats.koldun.svc:4222
+      url: nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.koldun.svc:4222
       kvBucket: koldun_ttl
       modelsBucket: koldun_models
       tokensBucket: koldun_tokens

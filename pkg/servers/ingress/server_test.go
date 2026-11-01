@@ -4270,9 +4270,9 @@ func TestNormaliseStreamingChunkPreservesErrorPayload(t *testing.T) {
 func TestEstimatePromptTokensCountsBytesAndTools(t *testing.T) {
 	t.Parallel()
 
-	// "привет" is 12 UTF-8 bytes, not 6 runes.
+	// "δοκιμή" is 12 UTF-8 bytes, not 6 runes.
 	req := &openai.ChatCompletionRequest{
-		Messages: []openai.ChatMessage{{Role: "user", Content: "привет"}},
+		Messages: []openai.ChatMessage{{Role: "user", Content: "δοκιμή"}},
 	}
 	require.Equal(t, (4+12+4)/4+2, estimatePromptTokens(req))
 

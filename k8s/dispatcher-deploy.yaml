@@ -19,12 +19,12 @@ spec:
     spec:
       containers:
         - name: dispatcher
-          image: ghcr.io/gorizond/koldun:latest
+          image: ghcr.io/gorizond/koldun:v0.0.193
           imagePullPolicy: IfNotPresent
           args:
             - '--mode=dispatcher'
             - '--dispatcher-hash=conversation-hash'
-            - '--dispatcher-nats-url=nats://koldun:k0ldun@nats.default:4222'
+            - '--dispatcher-nats-url=nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.default:4222'
             - '--dispatcher-backlog-subject=sessions.conversation-hash.requests'
             - '--dispatcher-assignments-bucket=koldun_assignments'
             - '--dispatcher-dllama-prefix=sessions.conversation-hash.dllama.'

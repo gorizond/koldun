@@ -8,10 +8,10 @@ metadata:
 spec:
   backend:
     # Use same images as local ingress
-    image: ghcr.io/gorizond/koldun:latest
-    rootImage: ghcr.io/gorizond/koldun:latest
-    workerImage: ghcr.io/gorizond/koldun:latest
-    dispatcherImage: ghcr.io/gorizond/koldun:latest
+    image: ghcr.io/gorizond/koldun:v0.0.193
+    rootImage: ghcr.io/gorizond/koldun:v0.0.193
+    workerImage: ghcr.io/gorizond/koldun:v0.0.193
+    dispatcherImage: ghcr.io/gorizond/koldun:v0.0.193
 
     # Single worker (replicaPower=0 means 1 worker)
     replicaPower: 0

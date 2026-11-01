@@ -7,19 +7,28 @@ spec:
   chart: koldun
   repo: https://gorizond.github.io/koldun
   targetNamespace: koldun
-  version: 0.1.9
+  version: 0.1.10
   valuesContent: |
     image:
-      tag: v0.1.9
+      tag: v0.0.193
     nats:
       enabled: true
     minio:
       enabled: true
+      # Required: the chart refuses to render minio.enabled=true without them.
+      rootUser: REPLACE_WITH_ACCESS_KEY
+      rootPassword: REPLACE_WITH_SECRET_KEY
       persistence:
         enabled: true
         size: 50Gi
     csi-s3:
       enabled: true
+      # Credentials are read from the subchart's secret keys; fill them in
+      # (or point at an existing secret) before applying this manifest.
+      secret:
+        accessKey: REPLACE_WITH_ACCESS_KEY
+        secretKey: REPLACE_WITH_SECRET_KEY
+        endpoint: http://koldun-minio:9000
     operator:
       conversation:
         natsUrl: nats://koldun-nats:4222

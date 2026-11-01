@@ -24,6 +24,32 @@ If release name contains chart name it will be used as a full name.
 {{- end }}
 
 {{/*
+Name of the MinIO subchart resources (service and default secret). Mirrors
+minio.fullname from the subchart, which the parent chart cannot call directly
+because the subchart resolves .Chart.Name against the parent.
+*/}}
+{{- define "koldun.minioFullname" -}}
+{{- if .Values.minio.fullnameOverride }}
+{{- .Values.minio.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default "minio" .Values.minio.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Name for the hook-scoped RBAC objects used by the CRD test.
+Cluster-scoped objects include the namespace so several releases can coexist.
+*/}}
+{{- define "koldun.testRBACName" -}}
+{{- printf "%s-%s-test-crds" (include "koldun.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "koldun.chart" -}}

@@ -6,11 +6,13 @@ metadata:
     {{- include "koldun.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
-  serviceAccountName: {{ include "koldun.serviceAccountName" . }}
+  serviceAccountName: {{ include "koldun.testRBACName" . }}
   containers:
     - name: kubectl
-      image: bitnami/kubectl:latest
+      # Needs a shell for the script below; alpine/k8s bundles kubectl.
+      image: alpine/k8s:1.31.0
       command:
         - /bin/sh
         - -c
@@ -26,6 +28,14 @@ spec:
               echo "✓ $crd installed"
             else
               echo "✗ $crd MISSING"
+              exit 1
+            fi
+
+            policy=$(kubectl get crd "$crd" -o jsonpath='{.metadata.annotations.helm\.sh/resource-policy}')
+            if [ "$policy" = "keep" ]; then
+              echo "✓ $crd has helm.sh/resource-policy=keep"
+            else
+              echo "✗ $crd is missing annotation helm.sh/resource-policy=keep (got: ${policy:-<empty>})"
               exit 1
             fi
           done

@@ -68,7 +68,6 @@ jobs:
           tags: |
             type=raw,value=v0.0.${{ github.run_number }}
             type=raw,value=sha-${{ github.sha }}
-            type=raw,value=latest
             type=raw,value=amd64-v0.0.${{ github.run_number }}
             type=raw,value=amd64-sha-${{ github.sha }}
 
@@ -161,13 +160,6 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:temp-${{ github.run_number }}-arm64
 
-      - name: Create and push multi-platform manifest for latest tag
-        run: |
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:temp-${{ github.run_number }}-arm64
-
       - name: Clean up temporary images
         run: |
           docker buildx imagetools rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:temp-${{ github.run_number }}-arm64 || true
@@ -185,20 +177,37 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      - name: Bump charts/koldun/fleet.yaml image tag
+      - name: Bump chart image references
         env:
           TAG: v0.0.${{ github.run_number }}
         run: |
           set -euo pipefail
+          # fleet.yaml drives the deployed image tag.
           sed -i -E "s|^([[:space:]]*tag: )v0\.0\.[0-9]+\$|\1${TAG}|" charts/koldun/fleet.yaml
           grep -qE "^[[:space:]]*tag: ${TAG}\$" charts/koldun/fleet.yaml \
             || { echo "fleet.yaml image tag was not updated to ${TAG}"; exit 1; }
-          if git diff --quiet -- charts/koldun/fleet.yaml; then
-            echo "Fleet image tag already at ${TAG}; nothing to commit."
+          # Chart.yaml appVersion is the default tag when image.tag is empty.
+          sed -i -E "s|^appVersion: .*\$|appVersion: \"${TAG}\"|" charts/koldun/Chart.yaml
+          grep -qF "appVersion: \"${TAG}\"" charts/koldun/Chart.yaml \
+            || { echo "Chart.yaml appVersion was not updated to ${TAG}"; exit 1; }
+          # chart-releaser skips versions that already exist in the index, so
+          # every release needs a fresh chart version (patch increment).
+          CURRENT_VERSION=$(awk '/^version: /{print $2}' charts/koldun/Chart.yaml)
+          NEW_VERSION=$(printf '%s\n' "$CURRENT_VERSION" | awk -F. 'NF == 3 { printf "%s.%s.%d", $1, $2, $3 + 1 }')
+          if [ -z "$NEW_VERSION" ]; then
+            echo "Chart.yaml version is not semver (major.minor.patch): ${CURRENT_VERSION}"
+            exit 1
+          fi
+          sed -i -E "s|^version: .*\$|version: ${NEW_VERSION}|" charts/koldun/Chart.yaml
+          grep -qE "^version: ${NEW_VERSION}\$" charts/koldun/Chart.yaml \
+            || { echo "Chart.yaml version was not updated to ${NEW_VERSION}"; exit 1; }
+          echo "Chart version ${CURRENT_VERSION} -> ${NEW_VERSION}, appVersion ${TAG}"
+          if git diff --quiet -- charts/koldun/fleet.yaml charts/koldun/Chart.yaml; then
+            echo "Image references already at ${TAG}; nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add charts/koldun/fleet.yaml
+          git add charts/koldun/fleet.yaml charts/koldun/Chart.yaml
           git commit -m "chore: bump koldun image to ${TAG} [skip ci]"
           git push

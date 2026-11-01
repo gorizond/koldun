@@ -60,7 +60,7 @@ go run ./cmd/operator --mode=operator --kubeconfig ~/.kube/config
 KOLDUN_API_TOKEN=... \
 go run ./cmd/operator --mode=ingress \
   --backend-namespace default \
-  --backend-nats-url nats://user:pass@nats.default:4222
+  --backend-nats-url nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.default:4222
 
 # Launch a standalone worker connected to an existing dispatcher
 HASH_KOLDUN=... \
@@ -72,7 +72,7 @@ go run ./cmd/operator --mode=llm \
 HASH_KOLDUN=... \
 go run ./cmd/operator --mode=dispatcher \
   --dispatcher-hash "${HASH_KOLDUN}" \
-  --dispatcher-nats-url nats://koldun:k0ldun@nats.default:4222 \
+  --dispatcher-nats-url nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.default:4222 \
   --dispatcher-backlog-subject "sessions.${HASH_KOLDUN}.requests" \
   --dispatcher-assignments-bucket koldun_assignments \
   --dispatcher-dllama-prefix "sessions.${HASH_KOLDUN}.dllama." \
@@ -144,13 +144,13 @@ metadata:
   namespace: default
 spec:
   backend:
-    image: ghcr.io/gorizond/koldun:latest
-    rootImage: ghcr.io/gorizond/koldun:latest
-    workerImage: ghcr.io/gorizond/koldun:latest
-    dispatcherImage: ghcr.io/gorizond/koldun:latest
+    image: ghcr.io/gorizond/koldun:v0.0.193
+    rootImage: ghcr.io/gorizond/koldun:v0.0.193
+    workerImage: ghcr.io/gorizond/koldun:v0.0.193
+    dispatcherImage: ghcr.io/gorizond/koldun:v0.0.193
     replicaPower: 2
     nats:
-      url: nats://koldun:k0ldun@nats.default:4222
+      url: nats://REPLACE_WITH_NATS_USER:REPLACE_WITH_NATS_PASSWORD@nats.default:4222
       kvBucket: koldun_ttl
       modelsBucket: koldun_models
       tokensBucket: koldun_tokens
@@ -200,12 +200,20 @@ docker build -t koldun:dev .
 make helm-deps
 
 # 5. Install with local values
-helm install koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+helm install koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
 
 # 6. Verify all components
 kubectl get pods -n koldun
 # Expected: operator, nats, minio all Running
 ```
+
+> **CRDs outlive the release.** The CRDs carry `helm.sh/resource-policy: keep`, so
+> `helm uninstall` leaves them (and every CR) in place. Reinstalling under a
+> different release name therefore needs `helm install ... --take-ownership`,
+> otherwise Helm refuses to adopt resources it did not create.
+> `--take-ownership` requires **Helm >= 3.17**; the repo CI still pins 3.14, so
+> reinstall under the same release name there, or upgrade the local Helm first.
 
 ### E2E Test Flow (Proven Working)
 
@@ -224,8 +232,8 @@ metadata:
   namespace: koldun
 type: Opaque
 stringData:
-  accessKey: minioadmin
-  secretKey: minioadmin
+  accessKey: REPLACE_WITH_ACCESS_KEY
+  secretKey: REPLACE_WITH_SECRET_KEY
 ```
 
 **2. Create Model CR (TinyLlama example):**
@@ -303,7 +311,8 @@ curl -X POST http://localhost:8082/v1/chat/completions \
 docker build -t koldun:dev .
 
 # Upgrade Helm release
-helm upgrade koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+helm upgrade koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
 
 # Watch operator logs (may timeout due to Rancher Desktop TLS issue)
 kubectl logs -f deployment/koldun -n koldun
@@ -401,8 +410,11 @@ nats:
         pvc:
           size: 1Gi
 
+# MinIO and the CSI S3 driver stay disabled in the committed overlay:
+# their credentials must never live in git. hack/dev-values.sh generates a
+# temporary values file (mode 0600) that enables both with random values.
 minio:
-  enabled: true
+  enabled: false
   mode: standalone
   persistence:
     enabled: false
@@ -416,12 +428,23 @@ operator:
     tokensBucket: "koldun_tokens"
 
 csi-s3:
-  enabled: true
+  enabled: false
   storageClass:
-    endpoint: "http://koldun-minio:9000"
-    accessKey: "minioadmin"
-    secretKey: "minioadmin"
+    name: csi-s3
+    singleBucket: koldun-models
+    mounter: geesefs
 ```
+
+Combine the overlay with the generated credentials file:
+
+```bash
+helm install koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
+```
+
+MinIO credentials are read by the subchart from `minio.rootUser`/`minio.rootPassword`
+(or `minio.existingSecret`); the CSI S3 driver reads `csi-s3.secret.accessKey`,
+`csi-s3.secret.secretKey` and `csi-s3.secret.endpoint` (not the storage class keys).
 
 ## CI/CD End-to-End Testing (GitHub Actions)
 
@@ -479,6 +502,10 @@ helm install koldun-nats nats/nats \
   --wait
 
 # 4. Install MinIO
+# Ephemeral credentials for this local run; never commit them.
+export MINIO_ACCESS_KEY="$(openssl rand -base64 32)"
+export MINIO_SECRET_KEY="$(openssl rand -base64 32)"
+
 kubectl apply -n koldun -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -499,9 +526,9 @@ spec:
         args: [server, /data]
         env:
         - name: MINIO_ROOT_USER
-          value: minioadmin
+          value: ${MINIO_ACCESS_KEY}
         - name: MINIO_ROOT_PASSWORD
-          value: minioadmin
+          value: ${MINIO_SECRET_KEY}
         ports:
         - containerPort: 9000
 ---
@@ -518,9 +545,17 @@ EOF
 
 kubectl wait --for=condition=available deployment/koldun-minio -n koldun --timeout=2m
 
-# 5. Create MinIO bucket
-kubectl run minio-mc -n koldun --rm -i --restart=Never --image=minio/mc -- \
-  /bin/sh -c "mc alias set local http://koldun-minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/koldun-models"
+# 5. Create MinIO bucket (reuses the credentials exported before step 4)
+kubectl run minio-client -n koldun --rm -i --restart=Never \
+  --image=amazon/aws-cli:2.17.0 \
+  --env=AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" \
+  --env=AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+  --env=AWS_DEFAULT_REGION=us-east-1 \
+  --command -- /bin/sh -c '
+    set -e
+    aws --endpoint-url http://koldun-minio:9000 s3api create-bucket --bucket koldun-models
+    aws --endpoint-url http://koldun-minio:9000 s3api head-bucket --bucket koldun-models
+  '
 
 # 6. Install Koldun operator (split CRD install)
 cd charts/koldun/
@@ -739,6 +774,8 @@ export KOLDUN_MINIO_SECRET_KEY=minio123
 ```
 
 Bring the stack down with `docker compose down -v` when finished. See `hack/localstack/README.md` for full details on the services, health checks, and bucket/bootstrap logic.
+
+> The credentials in this local compose section (`docker-compose.test.yml`, `hack/localstack/nats.conf`, `.github/workflows/compose-ingress.yaml` and these snippets) are development fixtures only: they never reach a cluster and are excluded from the credential scan. See `SECURITY.md` for the exception and for production guidance.
 
 ### Automated Usage
 - **Local**: `make compose-test` spins the stack up, waits for NATS/MinIO, and runs `go test` for both `pkg/servers/ingress` and `pkg/servers/dispatcher` against the same compose JetStream before tearing everything down. The target exports `KOLDUN_NATS_URL` (default `nats://koldun:koldun@127.0.0.1:4222`) and mirrors it into `KOLDUN_DISPATCHER_NATS_URL`, so dispatcher helpers automatically point at the compose stack. Each run emits `compose.coverprofile` (merged ingress+dispatcher coverage) and `artifacts/compose-logs.txt` with the full `docker compose logs` dump for easy upload/debugging.

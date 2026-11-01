@@ -123,7 +123,8 @@ HTTP Request → Backend → NATS KV → Operator → Session/Dllama/Root/Worker
 kubectl create namespace koldun
 
 # Install Koldun with Helm
-helm upgrade --install koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+helm upgrade --install koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
 ```
 
 ### E2E Test Workflow
@@ -467,7 +468,8 @@ s envtest for controllers
 docker build -t koldun:dev .
 
 # 2. Deploy/upgrade with Helm
-helm upgrade koldun charts/koldun/ -n koldun -f values-dev.yaml --wait
+helm upgrade koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)" --wait
 
 # 3. Run unit tests
 go test ./...
@@ -583,7 +585,8 @@ kubectl delete namespace koldun
 
 # Reinstall
 kubectl create namespace koldun
-helm install koldun charts/koldun/ -n koldun -f values-dev.yaml
+helm install koldun charts/koldun/ -n koldun \
+  -f values-dev.yaml -f "$(hack/dev-values.sh)"
 ```
 
 ## References
