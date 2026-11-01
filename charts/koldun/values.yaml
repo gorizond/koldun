@@ -214,9 +214,11 @@ minio:
     requests:
       cpu: 100m
       memory: 512Mi
-  # Default credentials (override in production!)
-  rootUser: "minioadmin"
-  rootPassword: "minioadmin"
+  # MinIO root credentials. No defaults are provided on purpose:
+  # when minio.enabled=true they must be supplied explicitly via
+  # values (e.g. --set or a secret-backed values file).
+  rootUser: ""
+  rootPassword: ""
   buckets:
     - name: koldun-models
       policy: none

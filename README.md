@@ -224,8 +224,8 @@ metadata:
   namespace: koldun
 type: Opaque
 stringData:
-  accessKey: minioadmin
-  secretKey: minioadmin
+  accessKey: REPLACE_WITH_ACCESS_KEY
+  secretKey: REPLACE_WITH_SECRET_KEY
 ```
 
 **2. Create Model CR (TinyLlama example):**
@@ -419,8 +419,8 @@ csi-s3:
   enabled: true
   storageClass:
     endpoint: "http://koldun-minio:9000"
-    accessKey: "minioadmin"
-    secretKey: "minioadmin"
+    accessKey: "REPLACE_WITH_ACCESS_KEY"
+    secretKey: "REPLACE_WITH_SECRET_KEY"
 ```
 
 ## CI/CD End-to-End Testing (GitHub Actions)
@@ -499,9 +499,9 @@ spec:
         args: [server, /data]
         env:
         - name: MINIO_ROOT_USER
-          value: minioadmin
+          value: REPLACE_WITH_ACCESS_KEY
         - name: MINIO_ROOT_PASSWORD
-          value: minioadmin
+          value: REPLACE_WITH_SECRET_KEY
         ports:
         - containerPort: 9000
 ---
@@ -520,7 +520,7 @@ kubectl wait --for=condition=available deployment/koldun-minio -n koldun --timeo
 
 # 5. Create MinIO bucket
 kubectl run minio-mc -n koldun --rm -i --restart=Never --image=minio/mc -- \
-  /bin/sh -c "mc alias set local http://koldun-minio:9000 minioadmin minioadmin && mc mb --ignore-existing local/koldun-models"
+  /bin/sh -c "mc alias set local http://koldun-minio:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" && mc mb --ignore-existing local/koldun-models"
 
 # 6. Install Koldun operator (split CRD install)
 cd charts/koldun/

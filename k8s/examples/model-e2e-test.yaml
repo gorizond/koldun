@@ -34,9 +34,13 @@ metadata:
   name: minio-credentials
   namespace: koldun
 type: Opaque
+# Placeholders only: replace with real credentials, e.g.
+#   kubectl -n koldun create secret generic minio-credentials \
+#     --from-literal=accessKey="$(openssl rand -base64 32)" \
+#     --from-literal=secretKey="$(openssl rand -base64 32)"
 stringData:
-  accessKey: minioadmin
-  secretKey: minioadmin
+  accessKey: REPLACE_WITH_ACCESS_KEY
+  secretKey: REPLACE_WITH_SECRET_KEY
 ---
 apiVersion: koldun.gorizond.io/v1
 kind: Model

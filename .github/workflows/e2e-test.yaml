@@ -87,6 +87,12 @@ jobs:
 
       - name: Install MinIO (minimal setup)
         run: |
+          # Ephemeral per-run credentials for the throwaway k3d cluster.
+          MINIO_ACCESS_KEY="koldun-ci-$(openssl rand -hex 8)"
+          MINIO_SECRET_KEY="$(openssl rand -hex 24)"
+          echo "MINIO_ACCESS_KEY=$MINIO_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "MINIO_SECRET_KEY=$MINIO_SECRET_KEY" >> "$GITHUB_ENV"
+
           kubectl apply -n koldun -f - <<EOF
           apiVersion: v1
           kind: Secret
@@ -94,8 +100,8 @@ jobs:
             name: minio-credentials
           type: Opaque
           stringData:
-            accessKey: minioadmin
-            secretKey: minioadmin
+            accessKey: ${MINIO_ACCESS_KEY}
+            secretKey: ${MINIO_SECRET_KEY}
           ---
           apiVersion: apps/v1
           kind: Deployment
@@ -118,9 +124,9 @@ jobs:
                   - /data
                   env:
                   - name: MINIO_ROOT_USER
-                    value: minioadmin
+                    value: ${MINIO_ACCESS_KEY}
                   - name: MINIO_ROOT_PASSWORD
-                    value: minioadmin
+                    value: ${MINIO_SECRET_KEY}
                   ports:
                   - containerPort: 9000
                   readinessProbe:
@@ -149,11 +155,12 @@ jobs:
           # minio/mc no longer exists on Docker Hub, so use aws-cli against the in-cluster
           # MinIO. One pod: create the bucket idempotently, then prove it is really there.
           kubectl run minio-bucket -n koldun --rm -i --restart=Never \
-            --image=amazon/aws-cli:2.17.0 --command -- /bin/sh -c '
+            --image=amazon/aws-cli:2.17.0 \
+            --env=AWS_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" \
+            --env=AWS_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
+            --env=AWS_DEFAULT_REGION=us-east-1 \
+            --command -- /bin/sh -c '
               set -e
-              export AWS_ACCESS_KEY_ID=minioadmin
-              export AWS_SECRET_ACCESS_KEY=minioadmin
-              export AWS_DEFAULT_REGION=us-east-1
               S3=http://koldun-minio:9000
               if out=$(aws --endpoint-url "$S3" s3api create-bucket --bucket koldun-models 2>&1); then
                 echo "$out"

@@ -27,8 +27,9 @@ minio:
     requests:
       cpu: 50m
       memory: 256Mi
-  rootUser: "minioadmin"
-  rootPassword: "minioadmin"
+  # Local development only. Override these for any shared environment.
+  rootUser: "koldun-dev"
+  rootPassword: "koldun-dev-local"
   buckets:
     - name: koldun-models
       policy: none
@@ -57,5 +58,5 @@ csi-s3:
     singleBucket: koldun-models
     mounter: geesefs
     endpoint: "http://koldun-minio:9000"
-    accessKey: "minioadmin"
-    secretKey: "minioadmin"
+    accessKey: "koldun-dev"
+    secretKey: "koldun-dev-local"
