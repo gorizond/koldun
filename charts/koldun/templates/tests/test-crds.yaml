@@ -6,11 +6,12 @@ metadata:
     {{- include "koldun.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
-  serviceAccountName: {{ include "koldun.serviceAccountName" . }}
+  serviceAccountName: {{ include "koldun.testRBACName" . }}
   containers:
     - name: kubectl
-      image: bitnami/kubectl:latest
+      image: registry.k8s.io/kubectl:v1.31.0
       command:
         - /bin/sh
         - -c

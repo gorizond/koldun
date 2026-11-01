@@ -7,10 +7,11 @@ metadata:
     {{- include "koldun.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   containers:
     - name: minio-test
-      image: minio/mc:latest
+      image: amazon/aws-cli:2.17.0
       command:
         - /bin/sh
         - -c
@@ -18,25 +19,34 @@ spec:
           set -e
           echo "Testing MinIO connection..."
 
-          # Configure mc alias
-          mc alias set koldun http://{{ include "koldun.fullname" . }}-minio:9000 {{ .Values.minio.rootUser }} {{ .Values.minio.rootPassword }} || exit 1
+          aws --endpoint-url "$MINIO_ENDPOINT" s3api list-buckets > /dev/null
+          echo "MinIO is reachable"
 
-          # Check if MinIO is accessible
-          mc admin info koldun || exit 1
-          echo "MinIO admin info OK"
-
-          # List buckets
-          mc ls koldun/ || exit 1
-          echo "MinIO buckets accessible"
-
-          # Check for koldun-models bucket
-          if mc ls koldun/koldun-models/ 2>/dev/null; then
+          if aws --endpoint-url "$MINIO_ENDPOINT" s3api head-bucket --bucket koldun-models 2>/dev/null; then
             echo "koldun-models bucket exists"
           else
             echo "Creating koldun-models bucket..."
-            mc mb koldun/koldun-models/ || exit 1
+            aws --endpoint-url "$MINIO_ENDPOINT" s3api create-bucket --bucket koldun-models > /dev/null
           fi
 
+          aws --endpoint-url "$MINIO_ENDPOINT" s3api head-bucket --bucket koldun-models
           echo "MinIO test PASSED"
+      env:
+        - name: MINIO_ENDPOINT
+          value: "http://{{ include "koldun.minioFullname" . }}:9000"
+        - name: AWS_DEFAULT_REGION
+          value: us-east-1
+        # Credentials come from the MinIO secret managed by the subchart, or
+        # from minio.existingSecret when the subchart is told to reuse one.
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: {{ default (include "koldun.minioFullname" .) .Values.minio.existingSecret }}
+              key: rootUser
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ default (include "koldun.minioFullname" .) .Values.minio.existingSecret }}
+              key: rootPassword
   restartPolicy: Never
 {{- end }}

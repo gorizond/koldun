@@ -7,10 +7,11 @@ metadata:
     {{- include "koldun.labels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   containers:
     - name: nats-test
-      image: natsio/nats-box:latest
+      image: natsio/nats-box:0.20.1
       command:
         - /bin/sh
         - -c

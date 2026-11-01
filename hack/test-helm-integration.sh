@@ -88,6 +88,11 @@ kubectl get storageclass
 log "Updating helm dependencies..."
 helm dependency update "$CHART_DIR"
 
+# The chart refuses to render minio.enabled=true without credentials. Generate
+# throwaway ones for this disposable cluster.
+MINIO_ROOT_USER="${MINIO_ROOT_USER:-koldun-test-$(openssl rand -hex 8)}"
+MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(openssl rand -hex 24)}"
+
 # Build helm install command with test-friendly settings
 HELM_ARGS=(
     --namespace "$NAMESPACE"
@@ -99,6 +104,8 @@ HELM_ARGS=(
     # Disable nats-box to reduce image pulls
     --set nats.natsBox.enabled=false
     --set minio.enabled=true
+    --set minio.rootUser="$MINIO_ROOT_USER"
+    --set minio.rootPassword="$MINIO_ROOT_PASSWORD"
     # Public mirror of the official MinIO image: docker.io/minio/minio is empty and
     # quay.io/minio/minio answers anonymous pulls with 401 UNAUTHORIZED
     --set minio.image.repository=coollabsio/minio
@@ -118,7 +125,12 @@ HELM_ARGS=(
 # CSI S3 requires privileged mode, skip by default
 if [[ "$TEST_CSI_S3" == "true" ]]; then
     log "Enabling CSI S3 driver (TEST_CSI_S3=true)"
-    HELM_ARGS+=(--set csi-s3.enabled=true)
+    HELM_ARGS+=(
+        --set csi-s3.enabled=true
+        --set csi-s3.secret.accessKey="$MINIO_ROOT_USER"
+        --set csi-s3.secret.secretKey="$MINIO_ROOT_PASSWORD"
+        --set csi-s3.secret.endpoint="http://${RELEASE_NAME}-minio:9000"
+    )
 else
     log "Skipping CSI S3 driver (TEST_CSI_S3=false)"
     HELM_ARGS+=(--set csi-s3.enabled=false)
@@ -227,6 +239,29 @@ for crd in dllamas ingresses models roots sessions workers; do
         exit 1
     fi
 done
+
+# The CRD hook has its own hook-scoped ServiceAccount/ClusterRole, so it works
+# even when the operator itself is skipped. Only the CRD test is selected: the
+# operator connectivity test needs a running operator.
+FULLNAME="$RELEASE_NAME"
+if [[ "$RELEASE_NAME" != *koldun* ]]; then
+    FULLNAME="${RELEASE_NAME}-koldun"
+fi
+# --filter keeps only the listed hooks, so the RBAC hooks that back the CRD test
+# must be selected as well (they run first thanks to their lower hook weight).
+RBAC_NAME="${FULLNAME}-${NAMESPACE}-test-crds"
+log "Running helm test (CRD hook)..."
+if ! helm test "$RELEASE_NAME" \
+    --namespace "$NAMESPACE" \
+    --filter "name=${RBAC_NAME}" \
+    --filter "name=${FULLNAME}-test-crds" \
+    --timeout 300s \
+    --logs; then
+    err "helm test failed"
+    kubectl get pods -n "$NAMESPACE" -o wide || true
+    exit 1
+fi
+log "helm test passed"
 
 if [[ "$SKIP_OPERATOR" != "true" ]]; then
     log "Verifying Koldun operator deployment..."
