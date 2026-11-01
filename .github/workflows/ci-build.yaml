@@ -68,7 +68,6 @@ jobs:
           tags: |
             type=raw,value=v0.0.${{ github.run_number }}
             type=raw,value=sha-${{ github.sha }}
-            type=raw,value=latest
             type=raw,value=amd64-v0.0.${{ github.run_number }}
             type=raw,value=amd64-sha-${{ github.sha }}
 
@@ -159,13 +158,6 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }} \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:temp-${{ github.run_number }}-arm64
-
-      - name: Create and push multi-platform manifest for latest tag
-        run: |
-          docker buildx imagetools create \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:temp-${{ github.run_number }}-arm64
 
       - name: Clean up temporary images

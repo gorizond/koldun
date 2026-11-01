@@ -8,10 +8,10 @@ metadata:
 spec:
   backend:
     # Use local dev image
-    image: ghcr.io/gorizond/koldun:latest
-    rootImage: ghcr.io/gorizond/koldun:latest
-    workerImage: ghcr.io/gorizond/koldun:latest
-    dispatcherImage: ghcr.io/gorizond/koldun:latest
+    image: ghcr.io/gorizond/koldun:v0.0.193
+    rootImage: ghcr.io/gorizond/koldun:v0.0.193
+    workerImage: ghcr.io/gorizond/koldun:v0.0.193
+    dispatcherImage: ghcr.io/gorizond/koldun:v0.0.193
 
     # replicaPower=0 means 1 worker (2^0=1)
     # Use 0 for stability on ARM64/Lima VM

@@ -258,9 +258,9 @@ ingressDefaults:
 #   dispatcherMetricsListen: ":9090" # override per-ingress or set to "" to disable while leaving defaults intact.
 #   spec:
 #     backend:
-#       image: ghcr.io/gorizond/koldun:latest
-#       rootImage: ghcr.io/gorizond/koldun-root:latest
-#       workerImage: ghcr.io/gorizond/koldun-worker:latest
+#       image: ghcr.io/gorizond/koldun:v0.0.193
+#       rootImage: ghcr.io/gorizond/koldun-root:v0.0.193
+#       workerImage: ghcr.io/gorizond/koldun-worker:v0.0.193
 #       replicaPower: 3
 #       nats:
 #         url: nats://nats:4222
