@@ -75,6 +75,14 @@ spec:
                 type: object
               image:
                 type: string
+              memory:
+                description: Memory allows overriding worker memory planning parameters.
+                properties:
+                  overheadRatio:
+                    description: OverheadRatio overrides the memory multiplier applied
+                      to each worker.
+                    type: number
+                type: object
               modelRef:
                 type: string
               nThreads:

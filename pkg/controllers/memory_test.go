@@ -113,6 +113,54 @@ func TestRootMemoryOverheadRatio(t *testing.T) {
 	}
 }
 
+func TestWorkerOverheadRatio(t *testing.T) {
+	tests := []struct {
+		name     string
+		override *float64
+		want     float64
+	}{
+		{
+			name:     "unset override uses default ratio",
+			override: nil,
+			want:     workerMemoryOverheadRatio,
+		},
+		{
+			name:     "override above default is used",
+			override: floatPtr(3.5),
+			want:     3.5,
+		},
+		{
+			name:     "override at minimum is used",
+			override: floatPtr(1.0),
+			want:     1.0,
+		},
+		{
+			name:     "override below minimum gets clamped",
+			override: floatPtr(0.5),
+			want:     workerOverheadMinRatio,
+		},
+		{
+			name:     "override zero is ignored",
+			override: floatPtr(0.0),
+			want:     workerMemoryOverheadRatio,
+		},
+		{
+			name:     "override negative is ignored",
+			override: floatPtr(-1.0),
+			want:     workerMemoryOverheadRatio,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ratio := workerOverheadRatio(tt.override)
+			if ratio != tt.want {
+				t.Errorf("workerOverheadRatio(%s) = %v, want %v", formatFloatPtr(tt.override), ratio, tt.want)
+			}
+		})
+	}
+}
+
 func TestRootMemoryOverheadRatioDecayCurve(t *testing.T) {
 
 	ratioTwo := rootMemoryOverheadRatio(2, nil)
@@ -296,7 +344,7 @@ func TestCalculateMemoryRequests(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			root, worker, ok := calculateMemoryRequests(tt.conversionSizeBytes, tt.workerReplicas, tt.override)
+			root, worker, ok := calculateMemoryRequests(tt.conversionSizeBytes, tt.workerReplicas, tt.override, nil)
 
 			if ok != tt.wantOk {
 				t.Errorf("calculateMemoryRequests() ok = %v, want %v", ok, tt.wantOk)
@@ -332,7 +380,7 @@ func TestCalculateMemoryRequests(t *testing.T) {
 func TestCalculateMemoryRequestsRounding(t *testing.T) {
 	conversionSizeBytes := int64(5 * 1024 * 1024) // 5 MiB model snapshot
 
-	root, worker, ok := calculateMemoryRequests(conversionSizeBytes, 1, nil)
+	root, worker, ok := calculateMemoryRequests(conversionSizeBytes, 1, nil, nil)
 	if !ok {
 		t.Fatal("calculateMemoryRequests() returned not ok for positive size")
 	}
@@ -359,7 +407,7 @@ func TestCalculateMemoryRequests_Format(t *testing.T) {
 	conversionSize := int64(4 * 1024 * 1024 * 1024) // 4 GiB
 	workerReplicas := int32(2)
 
-	root, worker, ok := calculateMemoryRequests(conversionSize, workerReplicas, nil)
+	root, worker, ok := calculateMemoryRequests(conversionSize, workerReplicas, nil, nil)
 	if !ok {
 		t.Fatal("calculateMemoryRequests() returned not ok")
 	}

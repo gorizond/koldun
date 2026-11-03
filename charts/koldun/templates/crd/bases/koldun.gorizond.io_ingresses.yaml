@@ -230,6 +230,13 @@ spec:
                       type: object
                     workerImage:
                       type: string
+                    workerMemory:
+                      description: IngressWorkerMemorySpec customises worker memory calculation.
+                      properties:
+                        overheadRatio:
+                          description: OverheadRatio overrides the memory multiplier applied to each worker.
+                          type: number
+                      type: object
                   required:
                     - image
                     - nats

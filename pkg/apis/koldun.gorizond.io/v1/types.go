@@ -403,6 +403,28 @@ type WorkerSpec struct {
 	// NThreads configures the number of threads for dllama-api worker.
 	// Defaults to 1. This controls the --nthreads flag.
 	NThreads int32 `json:"nThreads,omitempty"`
+	// Memory allows overriding worker memory planning parameters.
+	Memory *WorkerMemorySpec `json:"memory,omitempty"`
+}
+
+// WorkerMemorySpec customizes worker memory calculations.
+type WorkerMemorySpec struct {
+	// OverheadRatio overrides the memory multiplier applied to each worker.
+	OverheadRatio *float64 `json:"overheadRatio,omitempty"`
+}
+
+// DeepCopy for WorkerMemorySpec.
+func (in *WorkerMemorySpec) DeepCopy() *WorkerMemorySpec {
+	if in == nil {
+		return nil
+	}
+	out := new(WorkerMemorySpec)
+	*out = *in
+	if in.OverheadRatio != nil {
+		value := *in.OverheadRatio
+		out.OverheadRatio = &value
+	}
+	return out
 }
 
 // WorkerNATSConfig configures NATS connectivity for worker pods.
@@ -430,6 +452,10 @@ func (in *WorkerSpec) DeepCopy() *WorkerSpec {
 	if in.NATS != nil {
 		natsCopy := *in.NATS.DeepCopy()
 		out.NATS = &natsCopy
+	}
+	if in.Memory != nil {
+		memCopy := *in.Memory.DeepCopy()
+		out.Memory = &memCopy
 	}
 	return out
 }
@@ -1224,6 +1250,7 @@ type IngressBackendSpec struct {
 	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
 	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
 	RootMemory      *IngressRootMemorySpec      `json:"rootMemory,omitempty"`
+	WorkerMemory    *IngressWorkerMemorySpec    `json:"workerMemory,omitempty"`
 	// NThreads configures the number of threads for dllama-api root and worker containers.
 	// Default is 1. This controls the --nthreads flag passed to distributed-llama.
 	NThreads int32 `json:"nThreads,omitempty"`
@@ -1253,6 +1280,26 @@ func (in *IngressRootMemorySpec) DeepCopy() *IngressRootMemorySpec {
 	if in.OverheadMaxRatio != nil {
 		value := *in.OverheadMaxRatio
 		out.OverheadMaxRatio = &value
+	}
+	return out
+}
+
+// IngressWorkerMemorySpec customises worker memory calculation.
+type IngressWorkerMemorySpec struct {
+	// OverheadRatio overrides the memory multiplier applied to each worker.
+	OverheadRatio *float64 `json:"overheadRatio,omitempty"`
+}
+
+// DeepCopy for IngressWorkerMemorySpec.
+func (in *IngressWorkerMemorySpec) DeepCopy() *IngressWorkerMemorySpec {
+	if in == nil {
+		return nil
+	}
+	out := new(IngressWorkerMemorySpec)
+	*out = *in
+	if in.OverheadRatio != nil {
+		value := *in.OverheadRatio
+		out.OverheadRatio = &value
 	}
 	return out
 }
@@ -1382,6 +1429,10 @@ func (in *IngressBackendSpec) DeepCopy() *IngressBackendSpec {
 	if in.RootMemory != nil {
 		memCopy := *in.RootMemory.DeepCopy()
 		out.RootMemory = &memCopy
+	}
+	if in.WorkerMemory != nil {
+		memCopy := *in.WorkerMemory.DeepCopy()
+		out.WorkerMemory = &memCopy
 	}
 	return out
 }
