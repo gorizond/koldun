@@ -330,6 +330,9 @@ func (h *dllamaHandler) desiredWorkers(dllama *v1.Dllama, model *v1.Model) []*v1
 			NThreads: nthreads,
 		},
 	}
+	if ratio := h.getIngressWorkerOverheadRatio(dllama); ratio != nil {
+		worker.Spec.Memory = &v1.WorkerMemorySpec{OverheadRatio: pointer.Float64(*ratio)}
+	}
 
 	return []*v1.Worker{worker}
 }
@@ -397,6 +400,33 @@ func (h *dllamaHandler) getIngressRootOverheadMaxRatio(dllama *v1.Dllama) *float
 		for _, ing := range ings {
 			if ing.Spec.Backend.RootMemory != nil && ing.Spec.Backend.RootMemory.OverheadMaxRatio != nil {
 				val := *ing.Spec.Backend.RootMemory.OverheadMaxRatio
+				return &val
+			}
+		}
+		return nil
+	}
+
+	if ingresses, err := h.cachedIngresses(dllama.Namespace); err == nil {
+		if v := lookup(ingresses); v != nil {
+			return v
+		}
+	}
+	if allIngresses, err := h.cachedIngresses(""); err == nil {
+		if v := lookup(allIngresses); v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+// getIngressWorkerOverheadRatio retrieves the worker memory overhead ratio from Ingress CR.
+// It first checks ingresses in the same namespace, then falls back to cluster-wide.
+// Returns nil if no Ingress configures the ratio (use the default worker ratio).
+func (h *dllamaHandler) getIngressWorkerOverheadRatio(dllama *v1.Dllama) *float64 {
+	lookup := func(ings []*v1.Ingress) *float64 {
+		for _, ing := range ings {
+			if ing.Spec.Backend.WorkerMemory != nil && ing.Spec.Backend.WorkerMemory.OverheadRatio != nil {
+				val := *ing.Spec.Backend.WorkerMemory.OverheadRatio
 				return &val
 			}
 		}

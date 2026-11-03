@@ -239,7 +239,7 @@ func (h *rootHandler) ensureStatefulSet(root *v1.Root) error {
 	if root.Spec.Memory != nil && root.Spec.Memory.OverheadMaxRatio != nil {
 		override = root.Spec.Memory.OverheadMaxRatio
 	}
-	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas, override)
+	rootMemory, workerMemory, haveMemoryPlan := calculateMemoryRequests(model.Status.ConversionSizeBytes, workerReplicas, override, nil)
 
 	quantType := ""
 	if model.Spec.Conversion != nil {

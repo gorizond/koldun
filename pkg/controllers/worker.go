@@ -192,7 +192,11 @@ func (h *workerHandler) ensureStatefulSet(worker *v1.Worker) error {
 
 	workerResources := corev1.ResourceRequirements{}
 	if model != nil {
-		if rootMemory, workerMemory, ok := calculateMemoryRequests(model.Status.ConversionSizeBytes, replicas, nil); ok {
+		var workerMemoryOverride *float64
+		if worker.Spec.Memory != nil {
+			workerMemoryOverride = worker.Spec.Memory.OverheadRatio
+		}
+		if rootMemory, workerMemory, ok := calculateMemoryRequests(model.Status.ConversionSizeBytes, replicas, nil, workerMemoryOverride); ok {
 			workerResources = corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceMemory: workerMemory},
 				Limits:   corev1.ResourceList{corev1.ResourceMemory: workerMemory},
