@@ -199,17 +199,21 @@ func TestSidecarStartupTimeout(t *testing.T) {
 	tests := []struct {
 		name       string
 		configured time.Duration
+		startup    time.Duration
 		want       time.Duration
 	}{
 		{name: "zero falls back to default", configured: 0, want: defaultSidecarStartupTimeout},
 		{name: "shorter request timeout kept", configured: 30 * time.Second, want: 30 * time.Second},
 		{name: "default kept", configured: 2 * time.Minute, want: 2 * time.Minute},
-		{name: "long request timeout capped", configured: 15 * time.Minute, want: defaultSidecarStartupTimeout},
+		{name: "long request timeout capped without opt-in", configured: 45 * time.Minute, want: defaultSidecarStartupTimeout},
+		{name: "opt-in below request timeout is used", configured: 45 * time.Minute, startup: 10 * time.Minute, want: 10 * time.Minute},
+		{name: "opt-in capped by worker load budget", configured: 45 * time.Minute, startup: 45 * time.Minute, want: defaultWorkerLoadTimeout},
+		{name: "opt-in shorter than default is used", configured: 45 * time.Minute, startup: 30 * time.Second, want: 30 * time.Second},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, sidecarStartupTimeout(tt.configured))
+			require.Equal(t, tt.want, sidecarStartupTimeout(tt.configured, tt.startup))
 		})
 	}
 }

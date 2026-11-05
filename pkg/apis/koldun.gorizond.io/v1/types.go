@@ -334,6 +334,10 @@ type RootSpec struct {
 	// (--llm-sidecar-timeout). Inherited from the Ingress responseTimeout.
 	// When unset the sidecar keeps its 2m default.
 	SidecarTimeout *metav1.Duration `json:"sidecarTimeout,omitempty"`
+	// StartupTimeout bounds how long the llm sidecar waits for dllama-api to
+	// answer /v1/models before evicting (--llm-startup-timeout). Inherited from
+	// the Ingress startupTimeout. When unset the sidecar keeps its 2m default.
+	StartupTimeout *metav1.Duration `json:"startupTimeout,omitempty"`
 }
 
 // RootMemorySpec customizes root memory calculations.
@@ -825,6 +829,10 @@ func (in *RootSpec) DeepCopy() *RootSpec {
 		timeoutCopy := *in.SidecarTimeout
 		out.SidecarTimeout = &timeoutCopy
 	}
+	if in.StartupTimeout != nil {
+		timeoutCopy := *in.StartupTimeout
+		out.StartupTimeout = &timeoutCopy
+	}
 	return out
 }
 
@@ -1240,17 +1248,20 @@ type IngressBackendSpec struct {
 	// DispatcherMetricsListen configures --dispatcher-metrics-listen for session-managed dispatchers.
 	DispatcherMetricsListen string `json:"dispatcherMetricsListen,omitempty"`
 	// ReplicaPower overrides the replica power configured on models when ensuring Sessions.
-	ReplicaPower    int32                       `json:"replicaPower,omitempty"`
-	HashSecret      string                      `json:"hashSecret,omitempty"`
-	AllowAnonymous  bool                        `json:"allowAnonymous,omitempty"`
-	NATS            IngressNATSConfig           `json:"nats"`
-	ConversationTTL *metav1.Duration            `json:"conversationTTL,omitempty"`
-	ResponseTimeout *metav1.Duration            `json:"responseTimeout,omitempty"`
-	SessionScaling  *IngressSessionScalingSpec  `json:"sessionScaling,omitempty"`
-	ExtraArgs       []string                    `json:"extraArgs,omitempty"`
-	Resources       corev1.ResourceRequirements `json:"resources,omitempty"`
-	RootMemory      *IngressRootMemorySpec      `json:"rootMemory,omitempty"`
-	WorkerMemory    *IngressWorkerMemorySpec    `json:"workerMemory,omitempty"`
+	ReplicaPower    int32             `json:"replicaPower,omitempty"`
+	HashSecret      string            `json:"hashSecret,omitempty"`
+	AllowAnonymous  bool              `json:"allowAnonymous,omitempty"`
+	NATS            IngressNATSConfig `json:"nats"`
+	ConversationTTL *metav1.Duration  `json:"conversationTTL,omitempty"`
+	ResponseTimeout *metav1.Duration  `json:"responseTimeout,omitempty"`
+	// StartupTimeout bounds how long the llm sidecar may wait for dllama-api to
+	// answer /v1/models before evicting. Unset keeps the 2m default.
+	StartupTimeout *metav1.Duration            `json:"startupTimeout,omitempty"`
+	SessionScaling *IngressSessionScalingSpec  `json:"sessionScaling,omitempty"`
+	ExtraArgs      []string                    `json:"extraArgs,omitempty"`
+	Resources      corev1.ResourceRequirements `json:"resources,omitempty"`
+	RootMemory     *IngressRootMemorySpec      `json:"rootMemory,omitempty"`
+	WorkerMemory   *IngressWorkerMemorySpec    `json:"workerMemory,omitempty"`
 	// NThreads configures the number of threads for dllama-api root and worker containers.
 	// Default is 1. This controls the --nthreads flag passed to distributed-llama.
 	NThreads int32 `json:"nThreads,omitempty"`
@@ -1416,6 +1427,10 @@ func (in *IngressBackendSpec) DeepCopy() *IngressBackendSpec {
 	if in.ResponseTimeout != nil {
 		d := *in.ResponseTimeout
 		out.ResponseTimeout = &d
+	}
+	if in.StartupTimeout != nil {
+		d := *in.StartupTimeout
+		out.StartupTimeout = &d
 	}
 	if in.SessionScaling != nil {
 		scalingCopy := *in.SessionScaling.DeepCopy()

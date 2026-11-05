@@ -695,6 +695,9 @@ func (h *rootHandler) llmSidecarContainer(root *v1.Root) corev1.Container {
 	if root.Spec.SidecarTimeout != nil && root.Spec.SidecarTimeout.Duration > 0 {
 		args = append(args, fmt.Sprintf("--llm-sidecar-timeout=%s", root.Spec.SidecarTimeout.Duration))
 	}
+	if root.Spec.StartupTimeout != nil && root.Spec.StartupTimeout.Duration > 0 {
+		args = append(args, fmt.Sprintf("--llm-startup-timeout=%s", root.Spec.StartupTimeout.Duration))
+	}
 
 	env := []corev1.EnvVar{
 		{Name: "HASH_KOLDUN", Value: hash},
