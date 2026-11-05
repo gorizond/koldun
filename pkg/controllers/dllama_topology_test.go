@@ -1309,3 +1309,124 @@ func TestGetIngressSidecarTimeoutHandlesMissingOrInvalidInput(t *testing.T) {
 		require.Nil(t, handler.getIngressSidecarTimeout(dllama))
 	})
 }
+
+func TestGetIngressStartupTimeoutPicksMaxDeterministically(t *testing.T) {
+	short := &v1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "short", Namespace: "models"},
+		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{
+			StartupTimeout: &metav1.Duration{Duration: 3 * time.Minute},
+		}},
+	}
+	long := &v1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Name: "long", Namespace: "models"},
+		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{
+			StartupTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+		}},
+	}
+	dllama := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"}}
+
+	for name, ingresses := range map[string][]*v1.Ingress{
+		"short-first": {short, long},
+		"long-first":  {long, short},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+			ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+			ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+			ingressCache.EXPECT().List("models", gomock.Any()).Return(ingresses, nil).AnyTimes()
+
+			handler := &dllamaHandler{ingresses: ingressController}
+			timeout := handler.getIngressStartupTimeout(dllama)
+			require.NotNil(t, timeout)
+			require.Equal(t, 10*time.Minute, timeout.Duration)
+		})
+	}
+}
+
+func TestGetIngressStartupTimeoutHandlesMissingOrInvalidInput(t *testing.T) {
+	dllama := &v1.Dllama{ObjectMeta: metav1.ObjectMeta{Namespace: "models"}}
+
+	t.Run("nil controller", func(t *testing.T) {
+		handler := &dllamaHandler{}
+		require.Nil(t, handler.getIngressStartupTimeout(dllama))
+	})
+
+	t.Run("cache error", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+		ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+		ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+		ingressCache.EXPECT().List("models", gomock.Any()).Return(nil, errors.New("boom"))
+
+		handler := &dllamaHandler{ingresses: ingressController}
+		require.Nil(t, handler.getIngressStartupTimeout(dllama))
+	})
+
+	t.Run("no positive value", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+		ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+		ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+		ingressCache.EXPECT().List("models", gomock.Any()).Return([]*v1.Ingress{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "unset", Namespace: "models"},
+				Spec:       v1.IngressSpec{Backend: v1.IngressBackendSpec{}},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "zero", Namespace: "models"},
+				Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{
+					StartupTimeout: &metav1.Duration{Duration: 0},
+				}},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "negative", Namespace: "models"},
+				Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{
+					StartupTimeout: &metav1.Duration{Duration: -time.Minute},
+				}},
+			},
+		}, nil).AnyTimes()
+
+		handler := &dllamaHandler{ingresses: ingressController}
+		require.Nil(t, handler.getIngressStartupTimeout(dllama))
+	})
+}
+
+func TestDesiredRootPropagatesStartupTimeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ingressCache := genericfake.NewMockCacheInterface[*v1.Ingress](ctrl)
+	ingressController := genericfake.NewMockControllerInterface[*v1.Ingress, *v1.IngressList](ctrl)
+	ingressController.EXPECT().Cache().Return(ingressCache).AnyTimes()
+	ingressCache.EXPECT().List(gomock.Any(), gomock.Any()).Return([]*v1.Ingress{{
+		ObjectMeta: metav1.ObjectMeta{Name: "koldun-api", Namespace: "models"},
+		Spec: v1.IngressSpec{Backend: v1.IngressBackendSpec{
+			StartupTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+		}},
+	}}, nil).AnyTimes()
+
+	handler := &dllamaHandler{ingresses: ingressController}
+	dllama := &v1.Dllama{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "models"},
+		Spec: v1.DllamaSpec{
+			ModelRef:    v1.ModelReference{Kind: "Model", Name: "demo-model"},
+			RootImage:   "root:latest",
+			WorkerImage: "worker:latest",
+		},
+	}
+	model := &v1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo-model", Namespace: "models"},
+		Status:     v1.ModelStatus{OutputPVCName: "model-pvc"},
+	}
+
+	root := handler.desiredRoot(dllama, model)
+	require.NotNil(t, root.Spec.StartupTimeout)
+	require.Equal(t, 10*time.Minute, root.Spec.StartupTimeout.Duration)
+}

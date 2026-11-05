@@ -98,6 +98,7 @@ type Config struct {
 
 	SidecarURL              string
 	SidecarTimeout          time.Duration
+	StartupTimeout          time.Duration
 	WorkerLoadTimeout       time.Duration
 	SidecarMonitorInterval  time.Duration
 	SidecarFailureThreshold int
@@ -300,7 +301,7 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancel()
 	s.cancel = cancel
 
-	if err := s.waitForSidecarWithin(runCtx, sidecarStartupTimeout(s.cfg.SidecarTimeout)); err != nil {
+	if err := s.waitForSidecarWithin(runCtx, sidecarStartupTimeout(s.cfg.SidecarTimeout, s.cfg.StartupTimeout)); err != nil {
 		reason := fmt.Sprintf("dllama sidecar failed to become ready: %v", err)
 		s.triggerEviction(reason)
 		return fmt.Errorf("wait for dllama sidecar: %w", err)
@@ -494,8 +495,13 @@ func (s *Server) waitForSidecar(ctx context.Context) error {
 }
 
 // sidecarStartupTimeout bounds the readiness wait independently of the request
-// timeout. A misconfigured or crashed dllama-api should not take 15m to evict.
-func sidecarStartupTimeout(configured time.Duration) time.Duration {
+// timeout. A misconfigured or crashed dllama-api should not take 15m to evict,
+// so the default stays short; a positive startup value is an explicit opt-in
+// for slow weight loads and is capped by the worker load budget.
+func sidecarStartupTimeout(configured, startup time.Duration) time.Duration {
+	if startup > 0 {
+		return min(startup, defaultWorkerLoadTimeout)
+	}
 	if configured <= 0 || configured > defaultSidecarStartupTimeout {
 		return defaultSidecarStartupTimeout
 	}

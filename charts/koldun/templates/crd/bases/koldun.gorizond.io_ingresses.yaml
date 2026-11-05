@@ -228,6 +228,11 @@ spec:
                           format: int32
                           type: integer
                       type: object
+                    startupTimeout:
+                      description: |-
+                        StartupTimeout bounds how long the llm sidecar may wait for dllama-api to
+                        answer /v1/models before evicting. Unset keeps the 2m default.
+                      type: string
                     workerImage:
                       type: string
                     workerMemory:

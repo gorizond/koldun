@@ -261,6 +261,7 @@ func (h *dllamaHandler) desiredRoot(dllama *v1.Dllama, model *v1.Model) *v1.Root
 	// Prefill batch size from Ingress CR; 0 keeps the dllama default (32).
 	root.Spec.NBatches = h.getIngressNBatches(dllama)
 	root.Spec.SidecarTimeout = h.getIngressSidecarTimeout(dllama)
+	root.Spec.StartupTimeout = h.getIngressStartupTimeout(dllama)
 	// The context window belongs to the model, not to whichever Ingress
 	// happened to be listed first.
 	if model.Spec.MaxSeqLen > 0 {
@@ -548,6 +549,34 @@ func (h *dllamaHandler) getIngressSidecarTimeout(dllama *v1.Dllama) *metav1.Dura
 		duration = minimumSidecarTimeout
 	}
 	return &metav1.Duration{Duration: duration}
+}
+
+// getIngressStartupTimeout mirrors Ingress backend.startupTimeout so the llm
+// sidecar can opt into a longer /v1/models readiness wait. It picks the largest
+// positive value and breaks ties by the lexicographically smallest Ingress name.
+func (h *dllamaHandler) getIngressStartupTimeout(dllama *v1.Dllama) *metav1.Duration {
+	ingresses, err := h.cachedIngresses(dllama.Namespace)
+	if err != nil {
+		return nil
+	}
+
+	var selected *v1.Ingress
+	for _, ing := range ingresses {
+		timeout := ing.Spec.Backend.StartupTimeout
+		if timeout == nil || timeout.Duration <= 0 {
+			continue
+		}
+		if selected == nil ||
+			timeout.Duration > selected.Spec.Backend.StartupTimeout.Duration ||
+			(timeout.Duration == selected.Spec.Backend.StartupTimeout.Duration && ing.Name < selected.Name) {
+			selected = ing
+		}
+	}
+	if selected == nil {
+		return nil
+	}
+
+	return &metav1.Duration{Duration: selected.Spec.Backend.StartupTimeout.Duration}
 }
 
 // cachedIngresses centralises informer lookups. A nil controller yields no

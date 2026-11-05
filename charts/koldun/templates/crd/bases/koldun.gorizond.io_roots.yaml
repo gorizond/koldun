@@ -131,6 +131,12 @@ spec:
                   (--llm-sidecar-timeout). Inherited from the Ingress responseTimeout.
                   When unset the sidecar keeps its 2m default.
                 type: string
+              startupTimeout:
+                description: |-
+                  StartupTimeout bounds how long the llm sidecar waits for dllama-api to
+                  answer /v1/models before evicting (--llm-startup-timeout). Inherited from
+                  the Ingress startupTimeout. When unset the sidecar keeps its 2m default.
+                type: string
               workerSelector:
                 additionalProperties:
                   type: string
