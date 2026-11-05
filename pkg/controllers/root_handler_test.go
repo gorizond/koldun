@@ -159,6 +159,7 @@ func TestLLMSidecarContainer(t *testing.T) {
 				CredentialsSecret: &v1.SecretReference{Name: "nats-creds"},
 			},
 			SidecarTimeout: &metav1.Duration{Duration: 15 * time.Minute},
+			StartupTimeout: &metav1.Duration{Duration: 10 * time.Minute},
 		},
 	}
 
@@ -179,6 +180,7 @@ func TestLLMSidecarContainer(t *testing.T) {
 	require.Contains(t, container.Args, "--llm-dllama-name")
 	require.Contains(t, container.Args, "demo")
 	require.Contains(t, container.Args, "--llm-sidecar-timeout=15m0s")
+	require.Contains(t, container.Args, "--llm-startup-timeout=10m0s")
 
 	envMap := map[string]corev1.EnvVar{}
 	for _, env := range container.Env {
@@ -199,6 +201,17 @@ func TestLLMSidecarContainerKeepsDefaultTimeoutWhenUnset(t *testing.T) {
 		container := h.llmSidecarContainer(root)
 		for _, arg := range container.Args {
 			require.NotContains(t, arg, "--llm-sidecar-timeout")
+		}
+	}
+
+	for _, startup := range []*metav1.Duration{
+		nil,
+		{Duration: 0},
+	} {
+		root := &v1.Root{Spec: v1.RootSpec{Image: "root:latest", StartupTimeout: startup}}
+		container := h.llmSidecarContainer(root)
+		for _, arg := range container.Args {
+			require.NotContains(t, arg, "--llm-startup-timeout")
 		}
 	}
 }
